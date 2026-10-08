@@ -141,7 +141,7 @@ let mentionsOpen = false;
 function getActiveMembersForChat() {
   const t = cur();
   if(!t) return [];
-  return (t.members || []).filter(m => m.status !== 'shut down').map(m => m.name);
+  return (t.members || []).filter(m => m.status !== 'shutdown' && m.status !== 'shutdown_requested').map(m => m.name);
 }
 
 function rChatMentions(query) {

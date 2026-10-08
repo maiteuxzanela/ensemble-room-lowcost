@@ -368,12 +368,22 @@ function handleDashboardRequest(
           text = text.slice(mentionMatch[0].length)
         }
 
-        const activeTeam = db.query("SELECT id FROM team WHERE status = 'active' ORDER BY time_updated DESC LIMIT 1").get() as { id: string } | null
-        if (!activeTeam) {
+        let teamId = payload.teamId ? String(payload.teamId) : ""
+        if (teamId) {
+          const check = db.query("SELECT id FROM team WHERE id = ?").get(teamId) as { id: string } | null
+          if (!check) {
+            sendJson(res, { ok: false, error: `Team '${teamId}' not found` }, 400)
+            return
+          }
+        }
+        if (!teamId) {
+          const activeTeam = db.query("SELECT id FROM team WHERE status = 'active' ORDER BY time_updated DESC LIMIT 1").get() as { id: string } | null
+          if (activeTeam) teamId = activeTeam.id
+        }
+        if (!teamId) {
           sendJson(res, { ok: false, error: "No active team found" }, 400)
           return
         }
-        const teamId = activeTeam.id
 
         const isBroadcast = !to || ["all", "todos", "broadcast"].includes(to.toLowerCase())
         const recipients: string[] = []

@@ -149,6 +149,18 @@ async function runSuite() {
   expectedCalls = mc.calls.promptAsync.filter(c => c.sessionID === "ses_clara" && c.parts[0].text.includes("ajuste o teste"));
   check("DM despachado via promptAsync apenas para a clara", expectedCalls.length === 1 && expectedCalls[0].synthetic === true);
   check("DM NÃO foi despachado para tulio", mc.calls.promptAsync.length === 1);
+
+  mc.calls.promptAsync = []; // reset
+
+  // 5. Explicit teamId
+  r = await post({ text: "olá team explicit", teamId: "team_1" });
+  check("Broadcast com teamId explicito retorna 200 OK", r.status === 200 && r.data.ok === true);
+  row = db.query("SELECT * FROM team_message WHERE id = ?").get(r.data.messageId);
+  check("Broadcast teamId explicit gravado no SQLite", row && row.from_name === "human" && row.to_name === null && row.content === "olá team explicit");
+
+  // 6. Explicit wrong teamId
+  r = await post({ text: "olá wrong team", teamId: "team_fake_999" });
+  check("Broadcast com teamId invalido HTTP 400", r.status === 400 && r.data.ok === false);
   
   // Shutdown
   server.stop();

@@ -23,8 +23,7 @@ async function sendChatMessage(text, target) {
       input.style.height = 'auto'; // reset textarea height if auto-resizing
     }
   } catch (err) {
-    console.error(err);
-    alert('Erro ao enviar mensagem: ' + err.message);
+    console.error('Erro ao enviar mensagem:', err.message);
   } finally {
     if (input) {
       input.disabled = false;

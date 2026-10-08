@@ -1,5 +1,6 @@
 import type { ToolDeps } from "../types"
 import { requireTeamMember, resolveStandbyWake } from "./shared"
+import { getMemberModel } from "../member-model"
 import { log } from "../log"
 
 /**
@@ -73,11 +74,13 @@ export async function executeTeamTasksComplete(
         if (memberSessionId) {
           const wake = resolveStandbyWake(deps.db, teamInfo.teamId, t.assignee, `[System: Task "${t.id}" was unblocked and is ready for you to start]`)
           if (wake.woke) {
+            const memberModel = getMemberModel(deps.db, teamInfo.teamId, t.assignee)
             deps.client.session.promptAsync({
               sessionID: memberSessionId,
               parts: [{ type: "text", text: wake.text }],
               agent: wake.agent,
-              synthetic: true
+              synthetic: true,
+              ...(memberModel ? { model: memberModel } : {})
             }).catch(err => log(`tasks-complete:wake-member:failed err=${String(err)}`))
             log(`tasks-complete:wake-member:ok member=${t.assignee} task=${t.id}`)
             wokeMembers++

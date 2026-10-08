@@ -2119,10 +2119,12 @@ async function executeTeamBroadcast(deps, args, sessionId) {
       continue;
     }
     const wake = recipient.name !== "lead" ? resolveStandbyWake(deps.db, teamInfo.teamId, recipient.name, baseText) : { text: baseText, woke: false };
+    const memberModel = recipient.name !== "lead" ? getMemberModel(deps.db, teamInfo.teamId, recipient.name) : void 0;
     deps.client.session.promptAsync({
       sessionID: recipient.sessionId,
       parts: [{ type: "text", text: wake.text }],
-      ...wake.agent ? { agent: wake.agent } : {}
+      ...wake.agent ? { agent: wake.agent } : {},
+      ...memberModel ? { model: memberModel } : {}
     }).then(() => {
       delivered++;
       if (delivered === 1) markDelivered(deps.db, msgId);
@@ -2236,11 +2238,13 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
         if (memberSessionId) {
           const wake = resolveStandbyWake(deps.db, teamInfo.teamId, t.assignee, `[System: Task "${t.id}" was unblocked and is ready for you to start]`);
           if (wake.woke) {
+            const memberModel = getMemberModel(deps.db, teamInfo.teamId, t.assignee);
             deps.client.session.promptAsync({
               sessionID: memberSessionId,
               parts: [{ type: "text", text: wake.text }],
               agent: wake.agent,
-              synthetic: true
+              synthetic: true,
+              ...memberModel ? { model: memberModel } : {}
             }).catch((err) => log(`tasks-complete:wake-member:failed err=${String(err)}`));
             log(`tasks-complete:wake-member:ok member=${t.assignee} task=${t.id}`);
             wokeMembers++;
@@ -4013,8 +4017,7 @@ async function sendChatMessage(text, target) {
       input.style.height = 'auto'; // reset textarea height if auto-resizing
     }
   } catch (err) {
-    console.error(err);
-    alert('Erro ao enviar mensagem: ' + err.message);
+    console.error('Erro ao enviar mensagem:', err.message);
   } finally {
     if (input) {
       input.disabled = false;
@@ -4312,7 +4315,7 @@ let mentionsOpen = false;
 function getActiveMembersForChat() {
   const t = cur();
   if(!t) return [];
-  return (t.members || []).filter(m => m.status !== 'shut down').map(m => m.name);
+  return (t.members || []).filter(m => m.status !== 'shutdown' && m.status !== 'shutdown_requested').map(m => m.name);
 }
 
 function rChatMentions(query) {
@@ -4989,12 +4992,22 @@ function handleDashboardRequest(db, port, req, res, options) {
           to = mentionMatch[1];
           text = text.slice(mentionMatch[0].length);
         }
-        const activeTeam = db.query("SELECT id FROM team WHERE status = 'active' ORDER BY time_updated DESC LIMIT 1").get();
-        if (!activeTeam) {
+        let teamId = payload.teamId ? String(payload.teamId) : "";
+        if (teamId) {
+          const check = db.query("SELECT id FROM team WHERE id = ?").get(teamId);
+          if (!check) {
+            sendJson(res, { ok: false, error: `Team '${teamId}' not found` }, 400);
+            return;
+          }
+        }
+        if (!teamId) {
+          const activeTeam = db.query("SELECT id FROM team WHERE status = 'active' ORDER BY time_updated DESC LIMIT 1").get();
+          if (activeTeam) teamId = activeTeam.id;
+        }
+        if (!teamId) {
           sendJson(res, { ok: false, error: "No active team found" }, 400);
           return;
         }
-        const teamId = activeTeam.id;
         const isBroadcast = !to || ["all", "todos", "broadcast"].includes(to.toLowerCase());
         const recipients = [];
         let messageId;

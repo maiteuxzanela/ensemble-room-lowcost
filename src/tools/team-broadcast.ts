@@ -1,5 +1,6 @@
 import type { ToolDeps } from "../types"
 import { requireTeamMember, resolveStandbyWake } from "./shared"
+import { getMemberModel } from "../member-model"
 import { broadcastMessage, markDelivered, hasReportedCompletion } from "../messaging"
 import { log } from "../log"
 
@@ -57,10 +58,16 @@ export async function executeTeamBroadcast(
     const wake: { text: string; woke: boolean; agent?: string } = recipient.name !== "lead"
       ? resolveStandbyWake(deps.db, teamInfo.teamId, recipient.name, baseText)
       : { text: baseText, woke: false }
+    
+    const memberModel = recipient.name !== "lead" 
+      ? getMemberModel(deps.db, teamInfo.teamId, recipient.name)
+      : undefined
+
     deps.client.session.promptAsync({
       sessionID: recipient.sessionId,
       parts: [{ type: "text", text: wake.text }],
       ...(wake.agent ? { agent: wake.agent } : {}),
+      ...(memberModel ? { model: memberModel } : {})
     }).then(() => {
       delivered++
       if (delivered === 1) markDelivered(deps.db, msgId)
