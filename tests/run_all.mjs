@@ -32,6 +32,7 @@ const SUITES = [
   { file: "test_silent_lead_board_wake.mjs", label: "Silent Lead & Board Wake" },
   { file: "test_dashboard_chat.mjs", label: "Dashboard Chat API (Fase 3)" },
   { file: "test_auto_standby_seq.mjs", label: "Auto-Sequenciamento & Auto-Standby" },
+  { file: "test_auto_wake_unblock.mjs", label: "Auto-Wake de Subagentes no Desbloqueio" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

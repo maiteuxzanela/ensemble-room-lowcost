@@ -41,7 +41,7 @@
     "test": "node tests/run_all.mjs",
     "check": "node --check dist/index.js",
     "typecheck": "tsc --noEmit",
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js"
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/index.js"
   },
   "engines": {
     "node": ">=24",
@@ -52,6 +52,7 @@
     "@opentui/core": "0.5.10",
     "@opentui/solid": "0.5.10",
     "@types/bun": "latest",
+    "esbuild": "^0.28.2",
     "solid-js": "1.9.0",
     "typescript": "^7.0.2"
   },
