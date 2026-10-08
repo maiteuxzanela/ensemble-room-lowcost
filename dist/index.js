@@ -1589,7 +1589,17 @@ async function executeTeamSpawn(deps, args, sessionId) {
   const isReadOnly = agent === "plan" || agent === "explore";
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory);
   const usePlanApproval = args.plan_approval === true;
-  const useStandby = args.standby === true;
+  let autoStandby = false;
+  let claimedTaskBlocked = false;
+  if (args.claim_task) {
+    const task = deps.db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?").get(args.claim_task, teamInfo.teamId);
+    if (task && task.status === "blocked") {
+      autoStandby = true;
+      claimedTaskBlocked = true;
+      log(`spawn:auto-standby member=${args.name} task=${args.claim_task} reason=task_blocked`);
+    }
+  }
+  const useStandby = args.standby === true || autoStandby;
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`);
   let worktreeDir = null;
   let worktreeBranch = null;
@@ -1751,12 +1761,27 @@ async function executeTeamSpawn(deps, args, sessionId) {
   let claimedTaskContent = null;
   let claimWarning = null;
   if (args.claim_task && !isReadOnly) {
-    try {
-      claimedTaskContent = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name);
-      log(`spawn:claim:ok name=${args.name} task=${args.claim_task}`);
-    } catch (err) {
-      claimWarning = err instanceof Error ? err.message : String(err);
-      log(`spawn:claim:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`);
+    if (claimedTaskBlocked) {
+      const updateResult = deps.db.run(
+        "UPDATE team_task SET assignee = ?, time_updated = ? WHERE id = ? AND team_id = ? AND assignee IS NULL",
+        [args.name, Date.now(), args.claim_task, teamInfo.teamId]
+      );
+      if (updateResult.changes === 0) {
+        claimWarning = `Task "${args.claim_task}" is already claimed or missing`;
+        log(`spawn:claim-blocked:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`);
+      } else {
+        const taskRow = deps.db.query("SELECT content FROM team_task WHERE id = ? AND team_id = ?").get(args.claim_task, teamInfo.teamId);
+        claimedTaskContent = taskRow?.content ?? null;
+        log(`spawn:claim-blocked:ok name=${args.name} task=${args.claim_task}`);
+      }
+    } else {
+      try {
+        claimedTaskContent = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name);
+        log(`spawn:claim:ok name=${args.name} task=${args.claim_task}`);
+      } catch (err) {
+        claimWarning = err instanceof Error ? err.message : String(err);
+        log(`spawn:claim:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`);
+      }
     }
   }
   const context = [
@@ -1931,7 +1956,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     });
   }
   const branchInfo = worktreeBranch ? ` (branch: ${worktreeBranch})` : "";
-  const standbyInfo = useStandby ? " [standby \u2014 no prompt sent; wakes on first team_message]" : "";
+  const standbyInfo = autoStandby ? ` (auto-standby: claimed task ${args.claim_task} is blocked)` : useStandby ? " [standby \u2014 no prompt sent; wakes on first team_message]" : "";
   const planInfo = usePlanApproval ? " [plan mode \u2014 will send plan for approval]" : "";
   const claimInfo = claimedTaskContent ? ` (claimed task: ${args.claim_task})` : claimWarning ? ` (could not claim task: ${claimWarning})` : "";
   spawnFailures.delete(teamInfo.teamId);
@@ -2133,12 +2158,25 @@ async function executeTeamTasksAdd(deps, args, sessionId) {
   const teamInfo = requireTeamMember(deps, sessionId);
   const ids = [];
   const now = Date.now();
-  for (const task of args.tasks) {
+  const hasExplicitDependencies = args.tasks.some((t) => t.depends_on && t.depends_on.length > 0);
+  const isSequential = args.sequential === true || args.tasks.length > 1 && !hasExplicitDependencies;
+  for (let i = 0; i < args.tasks.length; i++) {
+    const task = args.tasks[i];
+    if (!task) continue;
     const id = generateId("task");
+    ids.push(id);
+    if (isSequential && i > 0) {
+      if (!task.depends_on) task.depends_on = [];
+      const prevId = ids[i - 1];
+      if (prevId && !task.depends_on.includes(prevId)) {
+        task.depends_on.push(prevId);
+      }
+    }
     const depsJson = task.depends_on?.length ? JSON.stringify(task.depends_on) : null;
     let status = "pending";
     if (task.depends_on?.length) {
       const resolved = task.depends_on.every((depId) => {
+        if (ids.includes(depId)) return false;
         const dep = deps.db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?").get(depId, teamInfo.teamId);
         return dep && (dep.status === "completed" || dep.status === "cancelled");
       });
@@ -2148,7 +2186,6 @@ async function executeTeamTasksAdd(deps, args, sessionId) {
       "INSERT INTO team_task (id, team_id, content, status, priority, depends_on, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       [id, teamInfo.teamId, task.content, status, task.priority, depsJson, now, now]
     );
-    ids.push(id);
   }
   return `Added ${ids.length} task${ids.length !== 1 ? "s" : ""}: ${ids.join(", ")}`;
 }
@@ -3114,7 +3151,8 @@ async function registerV2Tools(domain, deps) {
               required: ["content"],
               additionalProperties: false
             }
-          }
+          },
+          sequential: bool("If true, or if tasks.length > 1 and no depends_on is provided in any task, tasks are added in sequence where each task depends on the previous one", false)
         },
         required: ["tasks"],
         additionalProperties: false
@@ -3128,7 +3166,8 @@ async function registerV2Tools(domain, deps) {
               content: task.content,
               priority: normalizePriority(task.priority),
               ...task.depends_on ? { depends_on: task.depends_on } : {}
-            }))
+            })),
+            sequential: args.sequential
           },
           context.sessionID
         );
@@ -6029,7 +6068,8 @@ var plugin = async (input) => {
             content: tool.schema.string().describe("Task description"),
             priority: tool.schema.enum(["high", "medium", "low"]).default("medium").describe("Task priority"),
             depends_on: tool.schema.array(tool.schema.string()).optional().describe("Task IDs this depends on")
-          })).describe("Tasks to add")
+          })).describe("Tasks to add"),
+          sequential: tool.schema.boolean().optional().describe("If true, or if tasks.length > 1 and no depends_on is provided in any task, tasks are added in sequence where each task depends on the previous one")
         },
         async execute(args, ctx) {
           const result = await executeTeamTasksAdd(deps, args, ctx.sessionID);

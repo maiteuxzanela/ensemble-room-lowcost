@@ -41,7 +41,7 @@
     "test": "node tests/run_all.mjs",
     "check": "node --check dist/index.js",
     "typecheck": "tsc --noEmit",
-    "build": "bun build src/index.ts --outdir dist --target node"
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js"
   },
   "engines": {
     "node": ">=24",

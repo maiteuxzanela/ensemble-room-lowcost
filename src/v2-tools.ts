@@ -190,6 +190,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
               additionalProperties: false,
             },
           },
+          sequential: bool("If true, or if tasks.length > 1 and no depends_on is provided in any task, tasks are added in sequence where each task depends on the previous one", false),
         },
         required: ["tasks"],
         additionalProperties: false,
@@ -197,6 +198,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
       execute: async (input: unknown, context: { sessionID: string }) => {
         const args = input as {
           tasks: Array<{ content: string; priority?: string; depends_on?: string[] }>
+          sequential?: boolean
         }
         const content = await executeTeamTasksAdd(
           deps,
@@ -206,6 +208,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
               priority: normalizePriority(task.priority),
               ...(task.depends_on ? { depends_on: task.depends_on } : {}),
             })),
+            sequential: args.sequential,
           },
           context.sessionID,
         )

@@ -31,6 +31,7 @@ const SUITES = [
   { file: "test_standby_lifecycle.mjs", label: "Spawn em Standby + Blindagem de Hooks" },
   { file: "test_silent_lead_board_wake.mjs", label: "Silent Lead & Board Wake" },
   { file: "test_dashboard_chat.mjs", label: "Dashboard Chat API (Fase 3)" },
+  { file: "test_auto_standby_seq.mjs", label: "Auto-Sequenciamento & Auto-Standby" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

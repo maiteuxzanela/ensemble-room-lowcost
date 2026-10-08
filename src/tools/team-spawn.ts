@@ -93,10 +93,24 @@ export async function executeTeamSpawn(
   const isReadOnly = agent === "plan" || agent === "explore"
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory)
   const usePlanApproval = args.plan_approval === true
+
+  // Auto-standby check: if claim_task is provided and the task is blocked
+  let autoStandby = false
+  let claimedTaskBlocked = false
+  if (args.claim_task) {
+    const task = deps.db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?")
+      .get(args.claim_task, teamInfo.teamId) as { status: string } | null
+    if (task && task.status === "blocked") {
+      autoStandby = true
+      claimedTaskBlocked = true
+      log(`spawn:auto-standby member=${args.name} task=${args.claim_task} reason=task_blocked`)
+    }
+  }
+
   // Standby mode: the member is registered and its session is created, but no
   // prompt is sent at birth (zero tokens). The full init prompt is persisted in
   // spawn_context and prepended by the first team_message/team_broadcast.
-  const useStandby = args.standby === true
+  const useStandby = args.standby === true || autoStandby
 
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`)
 
@@ -279,12 +293,29 @@ export async function executeTeamSpawn(
   let claimedTaskContent: string | null = null
   let claimWarning: string | null = null
   if (args.claim_task && !isReadOnly) {
-    try {
-      claimedTaskContent = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name)
-      log(`spawn:claim:ok name=${args.name} task=${args.claim_task}`)
-    } catch (err) {
-      claimWarning = err instanceof Error ? err.message : String(err)
-      log(`spawn:claim:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`)
+    if (claimedTaskBlocked) {
+      // Pre-assign the blocked task atomically
+      const updateResult = deps.db.run(
+        "UPDATE team_task SET assignee = ?, time_updated = ? WHERE id = ? AND team_id = ? AND assignee IS NULL",
+        [args.name, Date.now(), args.claim_task, teamInfo.teamId]
+      )
+      if (updateResult.changes === 0) {
+        claimWarning = `Task "${args.claim_task}" is already claimed or missing`
+        log(`spawn:claim-blocked:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`)
+      } else {
+        const taskRow = deps.db.query("SELECT content FROM team_task WHERE id = ? AND team_id = ?")
+          .get(args.claim_task, teamInfo.teamId) as { content: string } | null
+        claimedTaskContent = taskRow?.content ?? null
+        log(`spawn:claim-blocked:ok name=${args.name} task=${args.claim_task}`)
+      }
+    } else {
+      try {
+        claimedTaskContent = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name)
+        log(`spawn:claim:ok name=${args.name} task=${args.claim_task}`)
+      } catch (err) {
+        claimWarning = err instanceof Error ? err.message : String(err)
+        log(`spawn:claim:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`)
+      }
     }
   }
 
@@ -483,7 +514,9 @@ export async function executeTeamSpawn(
   }
 
   const branchInfo = worktreeBranch ? ` (branch: ${worktreeBranch})` : ""
-  const standbyInfo = useStandby ? " [standby — no prompt sent; wakes on first team_message]" : ""
+  const standbyInfo = autoStandby 
+    ? ` (auto-standby: claimed task ${args.claim_task} is blocked)` 
+    : useStandby ? " [standby — no prompt sent; wakes on first team_message]" : ""
   const planInfo = usePlanApproval ? " [plan mode — will send plan for approval]" : ""
   const claimInfo = claimedTaskContent
     ? ` (claimed task: ${args.claim_task})`
