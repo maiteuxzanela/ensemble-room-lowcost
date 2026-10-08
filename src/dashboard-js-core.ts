@@ -1,5 +1,39 @@
 /** Dashboard JS — utilities, data helpers, and state management. */
 export const DASHBOARD_JS_CORE = `
+
+async function sendChatMessage(text, target) {
+  const input = document.getElementById('chat-input');
+  if (input) input.disabled = true;
+  const btn = document.getElementById('chat-send-btn');
+  if (btn) btn.disabled = true;
+
+  try {
+    const t = cur();
+    const teamId = t ? t.id : '';
+    const res = await fetch('/api/chat/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ teamId, text, to: target })
+    });
+    if (!res.ok) throw new Error('Chat send failed: ' + res.statusText);
+    
+    // clear input
+    if (input) {
+      input.value = '';
+      input.style.height = 'auto'; // reset textarea height if auto-resizing
+    }
+  } catch (err) {
+    console.error(err);
+    alert('Erro ao enviar mensagem: ' + err.message);
+  } finally {
+    if (input) {
+      input.disabled = false;
+      input.focus();
+    }
+    if (btn) btn.disabled = false;
+  }
+}
+
 let S=null,selId=null,selProjectId=null,fails=0,pollT=Date.now(),prevMC=0,selCard=-1,navCollapsed=false,verbose=(function(){try{return localStorage.getItem('ensemble-verbose')==='1'}catch(e){return false}})(),drawerActivity=null,drawerSession=null;
 const expCards=new Set(),expMsgs=new Set();
 const E=s=>s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):'';

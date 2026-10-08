@@ -6,6 +6,7 @@ import { DASHBOARD_JS_CORE } from "./dashboard-js-core"
 import { DASHBOARD_JS_EVENTS } from "./dashboard-js-events"
 import { DASHBOARD_JS_RENDER } from "./dashboard-js-render"
 import { log } from "./log"
+import { broadcastMessage, sendMessage, hasReportedCompletion } from "./messaging"
 import type { ActivityBuffer, ActivityEntry } from "./activity"
 import type { PluginClient } from "./types"
 
@@ -213,8 +214,8 @@ export interface DashboardOptions {
   client?: PluginClient
 }
 
-function sendJson(res: ServerResponse, data: unknown): void {
-  res.writeHead(200, {
+function sendJson(res: ServerResponse, data: unknown, status: number = 200): void {
+  res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
   })
@@ -347,7 +348,79 @@ function handleDashboardRequest(
     return
   }
 
-  const activityMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/activity$/)
+  if (req.method === "POST" && url.pathname === "/api/chat/send") {
+    let body = ""
+    req.on("data", chunk => { body += chunk })
+    req.on("end", () => {
+      try {
+        const payload = JSON.parse(body)
+        let text = String(payload.text || "")
+        let to = payload.to ? String(payload.to) : ""
+
+        if (!text.trim()) {
+          sendJson(res, { ok: false, error: "Empty message" }, 400)
+          return
+        }
+
+        const mentionMatch = text.match(/^@([a-zA-Z0-9_-]+)\s+/)
+        if (mentionMatch) {
+          to = mentionMatch[1]!
+          text = text.slice(mentionMatch[0].length)
+        }
+
+        const activeTeam = db.query("SELECT id FROM team WHERE status = 'active' ORDER BY time_updated DESC LIMIT 1").get() as { id: string } | null
+        if (!activeTeam) {
+          sendJson(res, { ok: false, error: "No active team found" }, 400)
+          return
+        }
+        const teamId = activeTeam.id
+
+        const isBroadcast = !to || ["all", "todos", "broadcast"].includes(to.toLowerCase())
+        const recipients: string[] = []
+        let messageId: string
+
+        if (isBroadcast) {
+          messageId = broadcastMessage(db, { teamId, from: "human", content: text })
+          const members = db.query("SELECT session_id, name FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error')").all(teamId) as { session_id: string, name: string }[]
+          
+          for (const m of members) {
+            if (hasReportedCompletion(db, teamId, m.name)) continue
+            recipients.push(m.name)
+            if (options?.client) {
+              options.client.session.promptAsync({
+                sessionID: m.session_id,
+                parts: [{ type: "text", text: `[Team broadcast from human]: ${text}` }],
+                synthetic: true
+              }).catch((err: unknown) => log(`dashboard:chat broadcast failed to ${m.name} err=${err}`))
+            }
+          }
+        } else {
+          const member = db.query("SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status NOT IN ('shutdown', 'error')").get(teamId, to) as { session_id: string } | null
+          if (!member) {
+            sendJson(res, { ok: false, error: `Member '${to}' not found in active team` }, 404)
+            return
+          }
+          messageId = sendMessage(db, { teamId, from: "human", to, content: text })
+          recipients.push(to)
+          if (options?.client) {
+            options.client.session.promptAsync({
+              sessionID: member.session_id,
+              parts: [{ type: "text", text: `[Direct message from human]: ${text}` }],
+              synthetic: true
+            }).catch((err: unknown) => log(`dashboard:chat direct msg failed to ${to} err=${err}`))
+          }
+        }
+
+        sendJson(res, { ok: true, messageId, recipients }, 200)
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err)
+        sendJson(res, { ok: false, error: msg }, 500)
+      }
+    })
+    return
+  }
+
+  const activityMatch = url.pathname?.match(/^\/api\/session\/([^/]+)\/activity$/)
   if (activityMatch) {
     const sessionId = decodeURIComponent(activityMatch[1]!)
     handleActivityRoute(sessionId, options, res).catch(() => {
