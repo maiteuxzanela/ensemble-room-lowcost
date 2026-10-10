@@ -521,7 +521,7 @@ const plugin: Plugin = async (input) => {
             priority: tool.schema.enum(["high", "medium", "low"]).default("medium").describe("Task priority"),
             depends_on: tool.schema.array(tool.schema.string()).optional().describe("Task IDs this depends on"),
           })).describe("Tasks to add"),
-          sequential: tool.schema.boolean().optional().describe("If true, or if tasks.length > 1 and no depends_on is provided in any task, tasks are added in sequence where each task depends on the previous one"),
+          sequential: tool.schema.boolean().optional().describe("If true, tasks are added in sequence where each task depends on the previous one. Defaults to false (tasks are independent/parallel unless depends_on is explicitly specified)."),
         },
         async execute(args, ctx) {
           const result = await executeTeamTasksAdd(deps, args, ctx.sessionID)

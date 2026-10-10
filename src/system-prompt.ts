@@ -30,7 +30,7 @@ const STATUS_DISPLAY: Record<string, string> = {
 function leadReportDirective(config?: Required<EnsembleConfig>): string {
   return config?.silentLead === false
     ? "You MUST send your results to the lead via team_message before stopping."
-    : "Collaborate with teammates using team_message and complete assigned tasks on the board."
+    : "Collaborate with teammates using team_message, submit completed work for review or mark assigned tasks on the board."
 }
 
 /**
@@ -161,13 +161,14 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
     "When all teammates finish, summarize results and suggest next steps.",
     "",
     "MERGE WORKFLOW:",
-    "After a teammate finishes and you shut them down, use team_merge to merge their branch.",
-    "Do NOT tell teammates to commit — they handle that themselves.",
+    "When teammates use isolated worktrees (worktree: true), use team_merge to merge their branch after they finish and you shut them down.",
+    "In shared workspace mode (worktree: false), all teammates work in the same checkout directly — no branch merging is needed.",
+    "Do NOT tell teammates to commit — in isolated worktrees they handle that themselves, and in shared workspaces commits follow the quality gate / delivery workflow.",
     "Do NOT run git merge manually — use team_merge which squash-merges and unstages for you.",
     "team_cleanup will safety-net merge any branches you forgot, but prefer explicit team_merge.",
     "",
-    "Before calling team_cleanup, verify teammates have committed their work.",
-    "team_shutdown will warn you if a teammate has uncommitted changes.",
+    "Before calling team_cleanup, verify teammates using isolated worktrees have committed their work.",
+    "team_shutdown will warn you if a teammate has uncommitted changes in their worktree.",
     "team_cleanup will block if any worktree has uncommitted changes — merge or commit first.",
     "To permanently delete archived teams, call team_cleanup with purge: [\"team-name\"] or purge: [\"*\"] for all archived teams.",
     "The first purge call is preview-only and deletes nothing.",

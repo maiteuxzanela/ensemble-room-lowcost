@@ -1894,18 +1894,28 @@ async function executeTeamSpawn(deps, args, sessionId) {
   context.push("", "When you finish your task:");
   if (!isReadOnly && worktreeBranch) {
     context.push(`1. Commit your changes: git add -A && git commit -m "your summary"`);
-    context.push("2. If you claimed a task, mark it complete using team_tasks_complete.");
+    context.push(
+      "2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with Clara via team_message(to: 'clara') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a task, mark it complete using team_tasks_complete."
+    );
     context.push(
       "3. Send ONE message to the lead using team_message with this format:"
     );
   } else if (!isReadOnly) {
-    context.push("1. If you claimed a task, mark it complete using team_tasks_complete.");
     context.push(
-      "2. Send ONE message to the lead using team_message with this format:"
+      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for Quality Gate inspection and anti-early-commit governance)."
+    );
+    context.push(
+      "2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so Clara can validate and approve. Coordinate peer-to-peer with Clara via team_message(to: 'clara') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete."
+    );
+    context.push(
+      "3. Send ONE message to the lead using team_message with this format:"
     );
   } else {
     context.push(
-      "1. Send ONE message to the lead using team_message with this format:"
+      "1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with Clara via team_message(to: 'clara'). If you claimed a task, mark it complete using team_tasks_complete."
+    );
+    context.push(
+      "2. Send ONE message to the lead using team_message with this format:"
     );
   }
   context.push(
@@ -1918,7 +1928,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     context.push(`<branch>${worktreeBranch}</branch>`);
   }
   context.push("</task-result>");
-  const lastStep = !isReadOnly && worktreeBranch ? "4" : !isReadOnly ? "3" : "2";
+  const lastStep = !isReadOnly ? "4" : "3";
   context.push(
     `${lastStep}. STOP. Do not send follow-up confirmations, status updates, or 'standing by' messages.`,
     "",
@@ -3277,7 +3287,7 @@ async function registerV2Tools(domain, deps) {
               additionalProperties: false
             }
           },
-          sequential: bool("If true, or if tasks.length > 1 and no depends_on is provided in any task, tasks are added in sequence where each task depends on the previous one", false)
+          sequential: bool("If true, tasks are added in sequence where each task depends on the previous one. Defaults to false (tasks are independent/parallel unless depends_on is explicitly specified).", false)
         },
         required: ["tasks"],
         additionalProperties: false
@@ -3765,7 +3775,7 @@ var STATUS_DISPLAY = {
   error: "error"
 };
 function leadReportDirective(config) {
-  return config?.silentLead === false ? "You MUST send your results to the lead via team_message before stopping." : "Collaborate with teammates using team_message and complete assigned tasks on the board.";
+  return config?.silentLead === false ? "You MUST send your results to the lead via team_message before stopping." : "Collaborate with teammates using team_message, submit completed work for review or mark assigned tasks on the board.";
 }
 function buildLeadSystemPrompt(db, teamId, config) {
   const team = db.query("SELECT name FROM team WHERE id = ?").get(teamId);
@@ -3868,13 +3878,14 @@ function buildLeadSystemPrompt(db, teamId, config) {
     "When all teammates finish, summarize results and suggest next steps.",
     "",
     "MERGE WORKFLOW:",
-    "After a teammate finishes and you shut them down, use team_merge to merge their branch.",
-    "Do NOT tell teammates to commit \u2014 they handle that themselves.",
+    "When teammates use isolated worktrees (worktree: true), use team_merge to merge their branch after they finish and you shut them down.",
+    "In shared workspace mode (worktree: false), all teammates work in the same checkout directly \u2014 no branch merging is needed.",
+    "Do NOT tell teammates to commit \u2014 in isolated worktrees they handle that themselves, and in shared workspaces commits follow the quality gate / delivery workflow.",
     "Do NOT run git merge manually \u2014 use team_merge which squash-merges and unstages for you.",
     "team_cleanup will safety-net merge any branches you forgot, but prefer explicit team_merge.",
     "",
-    "Before calling team_cleanup, verify teammates have committed their work.",
-    "team_shutdown will warn you if a teammate has uncommitted changes.",
+    "Before calling team_cleanup, verify teammates using isolated worktrees have committed their work.",
+    "team_shutdown will warn you if a teammate has uncommitted changes in their worktree.",
     "team_cleanup will block if any worktree has uncommitted changes \u2014 merge or commit first.",
     'To permanently delete archived teams, call team_cleanup with purge: ["team-name"] or purge: ["*"] for all archived teams.',
     "The first purge call is preview-only and deletes nothing.",
@@ -6274,7 +6285,7 @@ var plugin = async (input) => {
             priority: tool.schema.enum(["high", "medium", "low"]).default("medium").describe("Task priority"),
             depends_on: tool.schema.array(tool.schema.string()).optional().describe("Task IDs this depends on")
           })).describe("Tasks to add"),
-          sequential: tool.schema.boolean().optional().describe("If true, or if tasks.length > 1 and no depends_on is provided in any task, tasks are added in sequence where each task depends on the previous one")
+          sequential: tool.schema.boolean().optional().describe("If true, tasks are added in sequence where each task depends on the previous one. Defaults to false (tasks are independent/parallel unless depends_on is explicitly specified).")
         },
         async execute(args, ctx) {
           const result = await executeTeamTasksAdd(deps, args, ctx.sessionID);

@@ -60,7 +60,7 @@ const STANDBY_SUITE = path.join(import.meta.dirname, "test_standby_lifecycle.mjs
 const WATCHDOG_SUITE = path.join(import.meta.dirname, "test_watchdog_heartbeat.mjs");
 
 const LEGACY_COERCION = "You MUST send your results to the lead via team_message before stopping.";
-const SILENT_DIRECTIVE = "Collaborate with teammates using team_message and complete assigned tasks on the board.";
+const SILENT_DIRECTIVE = "Collaborate with teammates using team_message, submit completed work for review or mark assigned tasks on the board.";
 
 const results = [];
 const check = (name, ok, detail) => {

@@ -397,18 +397,28 @@ export async function executeTeamSpawn(
   context.push("", "When you finish your task:")
   if (!isReadOnly && worktreeBranch) {
     context.push(`1. Commit your changes: git add -A && git commit -m "your summary"`)
-    context.push("2. If you claimed a task, mark it complete using team_tasks_complete.")
+    context.push(
+      "2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with Clara via team_message(to: 'clara') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a task, mark it complete using team_tasks_complete.",
+    )
     context.push(
       "3. Send ONE message to the lead using team_message with this format:",
     )
   } else if (!isReadOnly) {
-    context.push("1. If you claimed a task, mark it complete using team_tasks_complete.")
     context.push(
-      "2. Send ONE message to the lead using team_message with this format:",
+      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for Quality Gate inspection and anti-early-commit governance).",
+    )
+    context.push(
+      "2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so Clara can validate and approve. Coordinate peer-to-peer with Clara via team_message(to: 'clara') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.",
+    )
+    context.push(
+      "3. Send ONE message to the lead using team_message with this format:",
     )
   } else {
     context.push(
-      "1. Send ONE message to the lead using team_message with this format:",
+      "1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with Clara via team_message(to: 'clara'). If you claimed a task, mark it complete using team_tasks_complete.",
+    )
+    context.push(
+      "2. Send ONE message to the lead using team_message with this format:",
     )
   }
   context.push(
@@ -421,7 +431,7 @@ export async function executeTeamSpawn(
     context.push(`<branch>${worktreeBranch}</branch>`)
   }
   context.push("</task-result>")
-  const lastStep = !isReadOnly && worktreeBranch ? "4" : !isReadOnly ? "3" : "2"
+  const lastStep = !isReadOnly ? "4" : "3"
   context.push(
     `${lastStep}. STOP. Do not send follow-up confirmations, status updates, or 'standing by' messages.`,
     "",

@@ -190,7 +190,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
               additionalProperties: false,
             },
           },
-          sequential: bool("If true, or if tasks.length > 1 and no depends_on is provided in any task, tasks are added in sequence where each task depends on the previous one", false),
+          sequential: bool("If true, tasks are added in sequence where each task depends on the previous one. Defaults to false (tasks are independent/parallel unless depends_on is explicitly specified).", false),
         },
         required: ["tasks"],
         additionalProperties: false,
