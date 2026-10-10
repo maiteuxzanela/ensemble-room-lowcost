@@ -1,6 +1,7 @@
 import type { Database } from "./db"
 import type { MemberRegistry, DescendantTracker } from "./state"
 import type { PluginClient } from "./types"
+import type { EnsembleConfig } from "./config"
 import { notifyLead } from "./notify"
 import { releaseMemberTasks } from "./tasks"
 import { findTeamBySession } from "./types"
@@ -283,17 +284,51 @@ export function hasActivePeerDialogue(db: Database, teamId: string, memberName: 
 }
 
 /**
+ * True when the team has any uncompleted tasks remaining on the board
+ * (status is pending, in_progress, blocked, or in_review).
+ */
+export function hasPendingBoardTasks(db: Database, teamId: string): boolean {
+  const row = db.query(
+    "SELECT id FROM team_task WHERE team_id = ? AND status != 'completed' LIMIT 1"
+  ).get(teamId)
+  return !!row
+}
+
+/**
+ * True when the team has other active members (status not shutdown or error).
+ */
+export function hasOtherActiveMembers(db: Database, teamId: string, memberName: string): boolean {
+  const row = db.query(
+    "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error') LIMIT 1"
+  ).get(teamId, memberName)
+  return !!row
+}
+
+/**
  * Check if a member went idle without ever sending a message to the lead.
  * Returns true if the member is idle/ready and has no outbound messages.
  *
- * Returns false (nudge suppressed) when the silence is legitimate:
+ * Returns false (nudge suppressed) when:
+ * - `silentLead: true` (default economic mode) is active — coercive report nudges
+ *   are completely suppressed to conserve tokens and prevent unnecessary wakes;
  * - `execution_status === 'standby'` — spawned paused, woken only by the first
  *   inbound `team_message` (standby spawn lifecycle);
  * - the member owns tasks blocked on unresolved `depends_on` entries;
  * - the member owns tasks in status 'in_review' (waiting on reviewer feedback);
  * - the member is in active peer dialogue (collaborating with teammates).
+ *
+ * For backwards compatibility, passing config with `{ silentLead: false }`
+ * re-enables the legacy idle-without-report nudge flow.
  */
-export function shouldNudgeIdleMember(db: Database, teamId: string, memberName: string): boolean {
+export function shouldNudgeIdleMember(
+  db: Database,
+  teamId: string,
+  memberName: string,
+  config?: EnsembleConfig,
+): boolean {
+  const isSilentLead = config?.silentLead ?? true
+  if (isSilentLead) return false
+
   const member = db.query("SELECT status, execution_status FROM team_member WHERE team_id = ? AND name = ?")
     .get(teamId, memberName) as { status: string; execution_status: string } | null
   if (!member || member.status !== "ready") return false
@@ -325,6 +360,7 @@ export function shouldNudgeIdleMember(db: Database, teamId: string, memberName: 
  *   until the wake path delivers `spawn_context`);
  * - members with assigned tasks blocked on unresolved dependencies;
  * - members with assigned tasks in review;
+ * - teams with pending tasks remaining on the board or other active members;
  * - members older than 15s, or that already produced at least one message.
  *
  * Extracted from the inline `fast-idle` block of `src/index.ts` so the decision
@@ -345,6 +381,10 @@ export function shouldAlarmFastIdle(
   if (member.execution_status === "standby") return false
   if (hasBlockedAssignedTasks(db, teamId, memberName)) return false
   if (hasInReviewAssignedTasks(db, teamId, memberName)) return false
+
+  // Suppress alarm if there are pending tasks on the board or other active members in the team.
+  if (hasPendingBoardTasks(db, teamId)) return false
+  if (hasOtherActiveMembers(db, teamId, memberName)) return false
 
   if (now - member.time_created >= 15_000) return false
 

@@ -5,7 +5,7 @@
  * Executa, em sequência estrita (fail-report, sem aborte antecipado):
  *
  *   1. test_watchdog_heartbeat.mjs     — Heartbeat ativo + imunidade a compaction (53 checks)
- *   2. test_standby_lifecycle.mjs      — Spawn em standby + blindagem de nudge/fast-idle (122 checks,
+ *   2. test_standby_lifecycle.mjs      — Spawn em standby + blindagem de nudge/fast-idle (130 checks,
  *                                        re-executa a suíte 1 como regressão)
  *   3. test_silent_lead_board_wake.mjs — Silent lead + despertar sistemático por board (151 checks,
  *                                        re-executa as suítes 1 e 2 como regressão)

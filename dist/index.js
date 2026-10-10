@@ -1033,7 +1033,21 @@ function hasActivePeerDialogue(db, teamId, memberName) {
   ).get(teamId, memberName, memberName);
   return !!row;
 }
-function shouldNudgeIdleMember(db, teamId, memberName) {
+function hasPendingBoardTasks(db, teamId) {
+  const row = db.query(
+    "SELECT id FROM team_task WHERE team_id = ? AND status != 'completed' LIMIT 1"
+  ).get(teamId);
+  return !!row;
+}
+function hasOtherActiveMembers(db, teamId, memberName) {
+  const row = db.query(
+    "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error') LIMIT 1"
+  ).get(teamId, memberName);
+  return !!row;
+}
+function shouldNudgeIdleMember(db, teamId, memberName, config) {
+  const isSilentLead = config?.silentLead ?? true;
+  if (isSilentLead) return false;
   const member = db.query("SELECT status, execution_status FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
   if (!member || member.status !== "ready") return false;
   if (member.execution_status === "standby") return false;
@@ -1049,6 +1063,8 @@ function shouldAlarmFastIdle(db, teamId, memberName, now = Date.now()) {
   if (member.execution_status === "standby") return false;
   if (hasBlockedAssignedTasks(db, teamId, memberName)) return false;
   if (hasInReviewAssignedTasks(db, teamId, memberName)) return false;
+  if (hasPendingBoardTasks(db, teamId)) return false;
+  if (hasOtherActiveMembers(db, teamId, memberName)) return false;
   if (now - member.time_created >= 15e3) return false;
   const msgCount = db.query("SELECT COUNT(*) as c FROM team_message WHERE team_id = ? AND from_name = ?").get(teamId, memberName).c;
   return msgCount === 0;
@@ -1632,16 +1648,32 @@ async function executeTeamSpawn(deps, args, sessionId) {
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory);
   const usePlanApproval = args.plan_approval === true;
   let autoStandby = false;
+  let autoStandbyReason = "";
   let claimedTaskBlocked = false;
   if (args.claim_task) {
     const task = deps.db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?").get(args.claim_task, teamInfo.teamId);
     if (task && task.status === "blocked") {
       autoStandby = true;
       claimedTaskBlocked = true;
+      autoStandbyReason = `claimed task ${args.claim_task} is blocked`;
       log(`spawn:auto-standby member=${args.name} task=${args.claim_task} reason=task_blocked`);
     }
   }
-  const useStandby = args.standby === true || autoStandby;
+  const isQualityGate = agent === "clara" || args.name.toLowerCase() === "clara";
+  if (!autoStandby && isQualityGate && args.standby !== false) {
+    const otherMembersCount = deps.db.query(
+      "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
+    ).get(teamInfo.teamId, args.name).c;
+    const pendingTasksCount = deps.db.query(
+      "SELECT COUNT(*) as c FROM team_task WHERE team_id = ? AND status != 'completed'"
+    ).get(teamInfo.teamId).c;
+    if (otherMembersCount > 0 || pendingTasksCount > 0) {
+      autoStandby = true;
+      autoStandbyReason = "quality gate guardian with active team or board";
+      log(`spawn:auto-standby member=${args.name} agent=${agent} reason=quality_gate_active_team`);
+    }
+  }
+  const useStandby = (args.standby === true || autoStandby) && args.standby !== false;
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`);
   let worktreeDir = null;
   let worktreeBranch = null;
@@ -2008,7 +2040,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     });
   }
   const branchInfo = worktreeBranch ? ` (branch: ${worktreeBranch})` : "";
-  const standbyInfo = autoStandby ? ` (auto-standby: claimed task ${args.claim_task} is blocked)` : useStandby ? " [standby \u2014 no prompt sent; wakes on first team_message]" : "";
+  const standbyInfo = autoStandby ? ` (auto-standby: ${claimedTaskBlocked ? `claimed task ${args.claim_task} is blocked` : autoStandbyReason})` : useStandby ? " [standby \u2014 no prompt sent; wakes on first team_message]" : "";
   const planInfo = usePlanApproval ? " [plan mode \u2014 will send plan for approval]" : "";
   const claimInfo = claimedTaskContent ? ` (claimed task: ${args.claim_task})` : claimWarning ? ` (could not claim task: ${claimWarning})` : "";
   spawnFailures.delete(teamInfo.teamId);
@@ -5423,7 +5455,7 @@ async function setupEnsemble(ctx, options = {}) {
   const nudgeMember = (teamId, memberName, sessionId) => {
     const nudgeKey = `${teamId}:${memberName}`;
     if (nudgedMembers.has(nudgeKey)) return;
-    if (!shouldNudgeIdleMember(db, teamId, memberName)) return;
+    if (!shouldNudgeIdleMember(db, teamId, memberName, config)) return;
     if (hasReportedCompletion(db, teamId, memberName)) return;
     nudgedMembers.add(nudgeKey);
     db.run("UPDATE team_member SET last_nudged_at = ? WHERE team_id = ? AND name = ?", [
@@ -5440,15 +5472,17 @@ async function setupEnsemble(ctx, options = {}) {
       vlog(`nudge:idle-without-report:failed name=${memberName} err=${err instanceof Error ? err.message : String(err)}`);
     });
   };
-  const nudgeCutoff = Date.now() - 60 * 60 * 1e3;
-  const silent = db.query(
-    `SELECT tm.team_id, tm.name, tm.session_id FROM team_member tm
-     JOIN team t ON tm.team_id = t.id
-     WHERE t.status = 'active' AND tm.status = 'ready'
-       AND tm.execution_status != 'standby'
-       AND (tm.last_nudged_at IS NULL OR tm.last_nudged_at < ?)`
-  ).all(nudgeCutoff);
-  for (const member of silent) nudgeMember(member.team_id, member.name, member.session_id);
+  if (config.silentLead === false) {
+    const nudgeCutoff = Date.now() - 60 * 60 * 1e3;
+    const silent = db.query(
+      `SELECT tm.team_id, tm.name, tm.session_id FROM team_member tm
+       JOIN team t ON tm.team_id = t.id
+       WHERE t.status = 'active' AND tm.status = 'ready'
+         AND tm.execution_status != 'standby'
+         AND (tm.last_nudged_at IS NULL OR tm.last_nudged_at < ?)`
+    ).all(nudgeCutoff);
+    for (const member of silent) nudgeMember(member.team_id, member.name, member.session_id);
+  }
   const rateLimiter = new TokenBucket({
     capacity: config.rateLimitCapacity,
     refillRate: 2,
@@ -6036,7 +6070,7 @@ var plugin = async (input) => {
               });
             }
             const nudgeKey = `${transition.teamId}:${transition.memberName}`;
-            if (!nudgedMembers.has(nudgeKey) && shouldNudgeIdleMember(db, transition.teamId, transition.memberName) && !hasReportedCompletion(db, transition.teamId, transition.memberName)) {
+            if (!nudgedMembers.has(nudgeKey) && shouldNudgeIdleMember(db, transition.teamId, transition.memberName, config) && !hasReportedCompletion(db, transition.teamId, transition.memberName)) {
               nudgedMembers.add(nudgeKey);
               log(`nudge:idle-without-report name=${transition.memberName}`);
               const nudgeModel = getMemberModel(db, transition.teamId, transition.memberName);
@@ -6438,6 +6472,8 @@ export {
   hasActivePeerDialogue,
   hasBlockedAssignedTasks,
   hasInReviewAssignedTasks,
+  hasOtherActiveMembers,
+  hasPendingBoardTasks,
   shouldAlarmFastIdle,
   shouldNudgeIdleMember
 };

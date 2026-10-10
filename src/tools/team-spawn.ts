@@ -96,6 +96,7 @@ export async function executeTeamSpawn(
 
   // Auto-standby check: if claim_task is provided and the task is blocked
   let autoStandby = false
+  let autoStandbyReason = ""
   let claimedTaskBlocked = false
   if (args.claim_task) {
     const task = deps.db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?")
@@ -103,14 +104,36 @@ export async function executeTeamSpawn(
     if (task && task.status === "blocked") {
       autoStandby = true
       claimedTaskBlocked = true
+      autoStandbyReason = `claimed task ${args.claim_task} is blocked`
       log(`spawn:auto-standby member=${args.name} task=${args.claim_task} reason=task_blocked`)
+    }
+  }
+
+  // Semantic Auto-Standby for Quality Gate Guardian (clara):
+  // If agent is clara (or agent === "clara" or name === "clara") and the team
+  // has other active members or pending tasks on the board, Clara must be born
+  // in standby unless args.standby === false is explicitly passed.
+  const isQualityGate = agent === "clara" || args.name.toLowerCase() === "clara"
+  if (!autoStandby && isQualityGate && args.standby !== false) {
+    const otherMembersCount = (deps.db.query(
+      "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
+    ).get(teamInfo.teamId, args.name) as { c: number }).c
+
+    const pendingTasksCount = (deps.db.query(
+      "SELECT COUNT(*) as c FROM team_task WHERE team_id = ? AND status != 'completed'"
+    ).get(teamInfo.teamId) as { c: number }).c
+
+    if (otherMembersCount > 0 || pendingTasksCount > 0) {
+      autoStandby = true
+      autoStandbyReason = "quality gate guardian with active team or board"
+      log(`spawn:auto-standby member=${args.name} agent=${agent} reason=quality_gate_active_team`)
     }
   }
 
   // Standby mode: the member is registered and its session is created, but no
   // prompt is sent at birth (zero tokens). The full init prompt is persisted in
   // spawn_context and prepended by the first team_message/team_broadcast.
-  const useStandby = args.standby === true || autoStandby
+  const useStandby = (args.standby === true || autoStandby) && args.standby !== false
 
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`)
 
@@ -525,7 +548,7 @@ export async function executeTeamSpawn(
 
   const branchInfo = worktreeBranch ? ` (branch: ${worktreeBranch})` : ""
   const standbyInfo = autoStandby 
-    ? ` (auto-standby: claimed task ${args.claim_task} is blocked)` 
+    ? ` (auto-standby: ${claimedTaskBlocked ? `claimed task ${args.claim_task} is blocked` : autoStandbyReason})` 
     : useStandby ? " [standby — no prompt sent; wakes on first team_message]" : ""
   const planInfo = usePlanApproval ? " [plan mode — will send plan for approval]" : ""
   const claimInfo = claimedTaskContent

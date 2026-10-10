@@ -434,20 +434,40 @@ async function runBehavior(label, mods) {
 
   check(`[${label}] B1 nudge: false para membro em standby`, shouldNudgeIdleMember(db, TEAM_ID, "b-standby") === false, String(shouldNudgeIdleMember(db, TEAM_ID, "b-standby")));
   check(`[${label}] B2 nudge: false para membro com tarefa bloqueada por dependência não resolvida`, shouldNudgeIdleMember(db, TEAM_ID, "b-blocked") === false, String(shouldNudgeIdleMember(db, TEAM_ID, "b-blocked")));
-  check(`[${label}] B3 CONTROLE: true para membro ready/idle sem bloqueio (não é supressão cega)`, shouldNudgeIdleMember(db, TEAM_ID, "b-control") === true, String(shouldNudgeIdleMember(db, TEAM_ID, "b-control")));
+  check(`[${label}] B3a nudge: false sob silentLead: true padrão para membro ready/idle sem bloqueio (supressão econômica)`, shouldNudgeIdleMember(db, TEAM_ID, "b-control") === false, String(shouldNudgeIdleMember(db, TEAM_ID, "b-control")));
+  check(`[${label}] B3b CONTROLE LEGADO: true para membro ready/idle sem bloqueio sob silentLead: false`, shouldNudgeIdleMember(db, TEAM_ID, "b-control", { silentLead: false }) === true, String(shouldNudgeIdleMember(db, TEAM_ID, "b-control", { silentLead: false })));
   check(`[${label}] B4 CONTROLE: false quando já reportou ao lead`, shouldNudgeIdleMember(db, TEAM_ID, "b-reported") === false);
   check(`[${label}] B5 nudge: false para membro inexistente`, shouldNudgeIdleMember(db, TEAM_ID, "nope") === false);
 
   /* ================================================================ *
    * C) BLINDAGEM DO FAST-IDLE
    * ================================================================ */
+  const TEAM_ISO = `team_iso_${label}`;
+  db.run(
+    "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?)",
+    [TEAM_ISO, "isolated-team", "default", LEAD_SESSION, "active", 0, now, now],
+  );
+  const insertIsoMember = (name, status, executionStatus, createdOffsetMs = 0) => {
+    db.run(
+      `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, time_created, time_updated)
+       VALUES (?,?,?,?,?,?,?,?)`,
+      [TEAM_ISO, name, `ses_${name}`, "build", status, executionStatus, now - createdOffsetMs, now - createdOffsetMs],
+    );
+  };
+  const insertIsoTask = (id, status, assignee, dependsOn) => {
+    db.run(
+      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, depends_on, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?,?)",
+      [id, TEAM_ISO, `task ${id}`, status, "medium", assignee, dependsOn, now, now],
+    );
+  };
+
   const fastIdleSeam = Object.keys(mods).find((k) => /fastidle/i.test(k) && typeof mods[k] === "function");
   if (fastIdleSeam) {
     const fn = mods[fastIdleSeam];
     const cases = [
       ["c-standby", "ready", "standby", 1_000, false, "standby → sem alarme"],
       ["c-blocked", "ready", "idle", 1_000, false, "tarefa bloqueada → sem alarme"],
-      ["c-normal", "ready", "idle", 1_000, true, "caso legítimo → alarme"],
+      ["c-suppressed-team", "ready", "idle", 1_000, false, "equipe com pendências/outros membros → sem alarme"],
       ["c-old", "ready", "idle", 60_000, false, "spawnAge >= 15s → sem alarme"],
     ];
     for (const [name, status, exec, age, expected, why] of cases) {
@@ -456,6 +476,23 @@ async function runBehavior(label, mods) {
       const got = fn(db, TEAM_ID, name);
       check(`[${label}] C fast-idle(${fastIdleSeam}) ${name}: ${why}`, got === expected, `got=${got}`);
     }
+
+    // Caso legítimo isolado: equipe sem outras tarefas e sem outros membros
+    insertIsoMember("c-normal", "ready", "idle", 1_000);
+    const gotIsoNormal = fn(db, TEAM_ISO, "c-normal");
+    check(`[${label}] C fast-idle(${fastIdleSeam}) c-normal isolado: caso legítimo → alarme`, gotIsoNormal === true, `got=${gotIsoNormal}`);
+
+    // Supressão quando surge tarefa pendente no board da equipe
+    insertIsoTask("t_iso_pend", "pending", null, null);
+    const gotIsoWithTask = fn(db, TEAM_ISO, "c-normal");
+    check(`[${label}] C fast-idle(${fastIdleSeam}) c-normal: tarefa pendente no board → suprime alarme`, gotIsoWithTask === false, `got=${gotIsoWithTask}`);
+    db.run("DELETE FROM team_task WHERE team_id = ? AND id = 't_iso_pend'", [TEAM_ISO]);
+
+    // Supressão quando há outro membro ativo na equipe
+    insertIsoMember("other-active", "ready", "idle", 1_000);
+    const gotIsoWithOther = fn(db, TEAM_ISO, "c-normal");
+    check(`[${label}] C fast-idle(${fastIdleSeam}) c-normal: outro membro ativo → suprime alarme`, gotIsoWithOther === false, `got=${gotIsoWithOther}`);
+    db.run("DELETE FROM team_member WHERE team_id = ? AND name = 'other-active'", [TEAM_ISO]);
   } else {
     // Fallback: extrai o bloco REAL do fast-idle e o executa com as closures reais.
     const block = extractFastIdleBlock(distRaw) ?? extractFastIdleBlock(srcIndex);
@@ -466,19 +503,23 @@ async function runBehavior(label, mods) {
         "db", "transition", "client", "client3", "nudgedMembers", "log", "log2", "notifyLead",
         block + "\n",
       );
-      const runFastIdle = (name, status, exec, age) => {
-        insertMember(name, status, exec, age);
-        if (name === "c-blocked") insertTask("t_cblock", "blocked", name, JSON.stringify(["t_missing"]));
+      const runFastIdle = (team, name, status, exec, age) => {
+        if (team === TEAM_ISO) {
+          insertIsoMember(name, status, exec, age);
+        } else {
+          insertMember(name, status, exec, age);
+          if (name === "c-blocked") insertTask("t_cblock", "blocked", name, JSON.stringify(["t_missing"]));
+        }
         const before = systemMsgs().length;
         const beforeToast = calls.toast.length;
         const nudged = new Set();
-        runner(db, { to: "ready", from: "busy", teamId: TEAM_ID, memberName: name }, client, client, nudged, () => {}, () => {}, notifyLead);
+        runner(db, { to: "ready", from: "busy", teamId: team, memberName: name }, client, client, nudged, () => {}, () => {}, notifyLead);
         return systemMsgs().length - before > 0 || calls.toast.length - beforeToast > 0;
       };
-      check(`[${label}] C fast-idle(inline) c-standby: standby → NÃO dispara notifyLead`, runFastIdle("c-standby", "ready", "standby", 1_000) === false);
-      check(`[${label}] C fast-idle(inline) c-blocked: bloqueado → NÃO dispara notifyLead`, runFastIdle("c-blocked", "ready", "idle", 1_000) === false);
-      check(`[${label}] C fast-idle(inline) c-normal: caso legítimo AINDA dispara notifyLead`, runFastIdle("c-normal", "ready", "idle", 1_000) === true);
-      check(`[${label}] C fast-idle(inline) c-old: spawnAge >= 15s → não dispara`, runFastIdle("c-old", "ready", "idle", 60_000) === false);
+      check(`[${label}] C fast-idle(inline) c-standby: standby → NÃO dispara notifyLead`, runFastIdle(TEAM_ID, "c-standby", "ready", "standby", 1_000) === false);
+      check(`[${label}] C fast-idle(inline) c-blocked: bloqueado → NÃO dispara notifyLead`, runFastIdle(TEAM_ID, "c-blocked", "ready", "idle", 1_000) === false);
+      check(`[${label}] C fast-idle(inline) c-normal: caso legítimo AINDA dispara notifyLead`, runFastIdle(TEAM_ISO, "c-normal", "ready", "idle", 1_000) === true);
+      check(`[${label}] C fast-idle(inline) c-old: spawnAge >= 15s → não dispara`, runFastIdle(TEAM_ID, "c-old", "ready", "idle", 60_000) === false);
     }
   }
 

@@ -35,7 +35,7 @@ const check = (name, ok, detail) => {
 const unhandled = [];
 process.on("unhandledRejection", (e) => unhandled.push(e));
 
-const REQUIRED_SYMBOLS = ["createDb", "executeTeamTasksAdd", "executeTeamSpawn", "MemberRegistry", "DEFAULT_CONFIG"];
+const REQUIRED_SYMBOLS = ["createDb", "executeTeamTasksAdd", "executeTeamSpawn", "MemberRegistry", "ProgressTracker", "DEFAULT_CONFIG"];
 const distRaw = readFileSync(DIST, "utf8");
 {
   const missing = REQUIRED_SYMBOLS.filter(
@@ -57,7 +57,7 @@ const distRaw = readFileSync(DIST, "utf8");
 }
 
 const mods = await import(HARNESS);
-const { createDb, executeTeamTasksAdd, executeTeamSpawn, MemberRegistry, DEFAULT_CONFIG } = mods;
+const { createDb, executeTeamTasksAdd, executeTeamSpawn, MemberRegistry, ProgressTracker, DEFAULT_CONFIG } = mods;
 
 function mockClient() {
   const calls = { create: [], promptAsync: [] };
@@ -90,12 +90,14 @@ async function runSuite() {
   registry.register(LEAD_SESSION, "lead", "team_auto");
 
   const mc = mockClient();
+  const progressTracker = new ProgressTracker();
   const deps = {
     db,
     directory: ROOT,
     client: mc.client,
     registry,
-    config: DEFAULT_CONFIG
+    config: DEFAULT_CONFIG,
+    progressTracker,
   };
 
   // 1. Validar team_tasks_add sequencial com flag sequential: true
@@ -144,6 +146,39 @@ async function runSuite() {
 
   // Validar promptAsync (zero calls)
   check("ZERO chamadas promptAsync realizadas durante o spawn", mc.calls.promptAsync.length === 0, `chamadas=${mc.calls.promptAsync.length}`);
+
+  // 3. Validar auto-standby semântico para a Guardiã do Quality Gate (clara)
+  // Quando há tarefas pendentes ou outros membros ativos na equipe, Clara nasce em standby
+  const resClara = await executeTeamSpawn(deps, {
+    name: "clara",
+    agent: "clara",
+    prompt: "Auditar Quality Gate e integridade determinística"
+    // standby omitido!
+  }, LEAD_SESSION);
+
+  check("team_spawn da Clara rodou sem erro", typeof resClara === "string");
+  check("team_spawn da Clara reporta auto-standby semântico", resClara.includes("auto-standby: quality gate guardian with active team or board"));
+
+  const memberClara = db.query("SELECT * FROM team_member WHERE team_id = ? AND name = 'clara'").get(TEAM_ID);
+  check("Clara existe e está ready", memberClara && memberClara.status === "ready");
+  check("Clara teve execution_status forçado para standby", memberClara && memberClara.execution_status === "standby", `execution_status=${memberClara?.execution_status}`);
+  check("Clara teve spawn_context gravado com prompt", memberClara && memberClara.spawn_context !== null && memberClara.spawn_context.includes("Auditar Quality Gate"));
+  check("Clara consumiu ZERO tokens ao nascer (zero promptAsync)", mc.calls.promptAsync.length === 0, `chamadas=${mc.calls.promptAsync.length}`);
+
+  // 4. Validar override: Clara com standby: false explícito não entra em standby
+  const promptBeforeOverride = mc.calls.promptAsync.length;
+  const resClaraOverride = await executeTeamSpawn(deps, {
+    name: "clara-override",
+    agent: "clara",
+    prompt: "Auditar imediatamente sem standby",
+    standby: false
+  }, LEAD_SESSION);
+
+  check("team_spawn da Clara com standby: false rodou sem erro", typeof resClaraOverride === "string");
+  const memberClaraOverride = db.query("SELECT * FROM team_member WHERE team_id = ? AND name = 'clara-override'").get(TEAM_ID);
+  check("Clara com standby: false NÃO está em standby", memberClaraOverride && memberClaraOverride.execution_status !== "standby", `execution_status=${memberClaraOverride?.execution_status}`);
+  check("Clara com standby: false NÃO tem spawn_context", memberClaraOverride && (memberClaraOverride.spawn_context === null || memberClaraOverride.spawn_context === undefined));
+  check("Clara com standby: false disparou promptAsync imediatamente", mc.calls.promptAsync.length === promptBeforeOverride + 1, `delta=${mc.calls.promptAsync.length - promptBeforeOverride}`);
 }
 
 await runSuite();

@@ -10,10 +10,10 @@ import { wrapThrowingClient } from "./client"
 import { recoverStaleMembers, recoverUndeliveredMessages, recoverOrphanedWorktrees, recoverOrphanedBranches, recoverOrphanedTeams, rehydrateRegistry } from "./recovery"
 import { MemberRegistry, DescendantTracker, PendingPurgeApprovals } from "./state"
 import { isWorktreeInstance } from "./util"
-import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, shouldAlarmFastIdle, handleSessionErrorEvent } from "./hooks"
+import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, shouldAlarmFastIdle, handleSessionErrorEvent, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
 // Re-exported so test harnesses (and the dist bundle) can exercise the nudge /
 // fast-idle decisions against a real SQLite database without reimplementing them.
-export { shouldNudgeIdleMember, shouldAlarmFastIdle, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue } from "./hooks"
+export { shouldNudgeIdleMember, shouldAlarmFastIdle, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
 export { executeTeamTasksReview, executeTeamTasksReject } from "./tools/team-tasks-complete"
 import { notifyTeamEvent, notifyWorkingProgress, notifyLead } from "./notify"
 import { hasReportedCompletion } from "./messaging"
@@ -215,7 +215,7 @@ const plugin: Plugin = async (input) => {
             // Nudge teammate if they went idle without reporting to the lead (once only)
             // Skip if they already reported completion (issue #3 — prevents re-waking completed teammates)
             const nudgeKey = `${transition.teamId}:${transition.memberName}`
-            if (!nudgedMembers.has(nudgeKey) && shouldNudgeIdleMember(db, transition.teamId, transition.memberName) && !hasReportedCompletion(db, transition.teamId, transition.memberName)) {
+            if (!nudgedMembers.has(nudgeKey) && shouldNudgeIdleMember(db, transition.teamId, transition.memberName, config) && !hasReportedCompletion(db, transition.teamId, transition.memberName)) {
               nudgedMembers.add(nudgeKey)
               log(`nudge:idle-without-report name=${transition.memberName}`)
               const nudgeModel = getMemberModel(db, transition.teamId, transition.memberName)

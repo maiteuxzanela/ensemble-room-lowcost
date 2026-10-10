@@ -505,11 +505,15 @@ async function runCyclicGraphSuite() {
   check("hasActivePeerDialogue detecta mensagens trocadas entre pares", hasActivePeerDialogue(db, TEAM_ID, "tulio") === true);
   check("shouldNudgeIdleMember suprime nudge por diálogo ativo com par", shouldNudgeIdleMember(db, TEAM_ID, "tulio") === false);
 
-  // CONTROLE: Membro sem tarefas e sem mensagens sofre nudge normalmente
+  // CONTROLE: Sob silentLead: true (padrão econômico), o nudge coercitivo é suprimido
   insertMember("novo_agente", "ses_novo", "build");
   check(
-    "CONTROLE: novo agente idle sem tarefas nem diálogo recebe nudge",
-    shouldNudgeIdleMember(db, TEAM_ID, "novo_agente") === true,
+    "shouldNudgeIdleMember suprime nudge para novo agente idle sob silentLead: true padrão",
+    shouldNudgeIdleMember(db, TEAM_ID, "novo_agente") === false,
+  );
+  check(
+    "CONTROLE LEGADO: novo agente idle sem tarefas nem diálogo recebe nudge sob silentLead: false",
+    shouldNudgeIdleMember(db, TEAM_ID, "novo_agente", { silentLead: false }) === true,
   );
 
   /* ================================================================== *

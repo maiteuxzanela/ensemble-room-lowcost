@@ -115,7 +115,7 @@ export async function setupEnsemble(
   const nudgeMember = (teamId: string, memberName: string, sessionId: string): void => {
     const nudgeKey = `${teamId}:${memberName}`
     if (nudgedMembers.has(nudgeKey)) return
-    if (!shouldNudgeIdleMember(db, teamId, memberName)) return
+    if (!shouldNudgeIdleMember(db, teamId, memberName, config)) return
     if (hasReportedCompletion(db, teamId, memberName)) return
     nudgedMembers.add(nudgeKey)
     // Persist so hot-reloads don't re-nudge: every setup re-runs the sweep,
@@ -141,15 +141,18 @@ export async function setupEnsemble(
   // nudged within the hour — the guard survives reloads via the DB column.
   // Standby members are excluded at SQL level too (defense in depth on top of
   // shouldNudgeIdleMember): a paused spawn must stay silent until it wakes.
-  const nudgeCutoff = Date.now() - 60 * 60 * 1000
-  const silent = db.query(
-    `SELECT tm.team_id, tm.name, tm.session_id FROM team_member tm
-     JOIN team t ON tm.team_id = t.id
-     WHERE t.status = 'active' AND tm.status = 'ready'
-       AND tm.execution_status != 'standby'
-       AND (tm.last_nudged_at IS NULL OR tm.last_nudged_at < ?)`,
-  ).all(nudgeCutoff) as Array<{ team_id: string; name: string; session_id: string }>
-  for (const member of silent) nudgeMember(member.team_id, member.name, member.session_id)
+  // In economic default mode (silentLead: true), report nudges are fully silenced.
+  if (config.silentLead === false) {
+    const nudgeCutoff = Date.now() - 60 * 60 * 1000
+    const silent = db.query(
+      `SELECT tm.team_id, tm.name, tm.session_id FROM team_member tm
+       JOIN team t ON tm.team_id = t.id
+       WHERE t.status = 'active' AND tm.status = 'ready'
+         AND tm.execution_status != 'standby'
+         AND (tm.last_nudged_at IS NULL OR tm.last_nudged_at < ?)`,
+    ).all(nudgeCutoff) as Array<{ team_id: string; name: string; session_id: string }>
+    for (const member of silent) nudgeMember(member.team_id, member.name, member.session_id)
+  }
   const rateLimiter = new TokenBucket({
     capacity: config.rateLimitCapacity,
     refillRate: 2,
