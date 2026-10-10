@@ -261,13 +261,37 @@ export function hasBlockedAssignedTasks(db: Database, teamId: string, memberName
 }
 
 /**
+ * True when the member holds at least one assigned task in status 'in_review'.
+ * A member waiting on review feedback from Clara/reviewer is in legitimate wait.
+ */
+export function hasInReviewAssignedTasks(db: Database, teamId: string, memberName: string): boolean {
+  const row = db.query(
+    "SELECT id FROM team_task WHERE team_id = ? AND assignee = ? AND status = 'in_review' LIMIT 1"
+  ).get(teamId, memberName)
+  return !!row
+}
+
+/**
+ * True when the member is in active peer dialogue (sent or received messages
+ * to/from teammates other than lead).
+ */
+export function hasActivePeerDialogue(db: Database, teamId: string, memberName: string): boolean {
+  const row = db.query(
+    "SELECT id FROM team_message WHERE team_id = ? AND ((from_name = ? AND to_name != 'lead' AND to_name IS NOT NULL) OR (to_name = ? AND from_name != 'lead')) LIMIT 1"
+  ).get(teamId, memberName, memberName)
+  return !!row
+}
+
+/**
  * Check if a member went idle without ever sending a message to the lead.
  * Returns true if the member is idle/ready and has no outbound messages.
  *
  * Returns false (nudge suppressed) when the silence is legitimate:
  * - `execution_status === 'standby'` — spawned paused, woken only by the first
  *   inbound `team_message` (standby spawn lifecycle);
- * - the member owns tasks blocked on unresolved `depends_on` entries.
+ * - the member owns tasks blocked on unresolved `depends_on` entries;
+ * - the member owns tasks in status 'in_review' (waiting on reviewer feedback);
+ * - the member is in active peer dialogue (collaborating with teammates).
  */
 export function shouldNudgeIdleMember(db: Database, teamId: string, memberName: string): boolean {
   const member = db.query("SELECT status, execution_status FROM team_member WHERE team_id = ? AND name = ?")
@@ -279,6 +303,12 @@ export function shouldNudgeIdleMember(db: Database, teamId: string, memberName: 
 
   // Waiting on the task board: silence is legitimate too.
   if (hasBlockedAssignedTasks(db, teamId, memberName)) return false
+
+  // Member has tasks under review — waiting on reviewer/Clara is legitimate.
+  if (hasInReviewAssignedTasks(db, teamId, memberName)) return false
+
+  // Member in active dialogue with peers — collaborating directly.
+  if (hasActivePeerDialogue(db, teamId, memberName)) return false
 
   const msg = db.query("SELECT id FROM team_message WHERE team_id = ? AND from_name = ? AND (to_name = 'lead' OR to_name IS NULL) LIMIT 1")
     .get(teamId, memberName) as { id: string } | null
@@ -294,6 +324,7 @@ export function shouldNudgeIdleMember(db: Database, teamId: string, memberName: 
  * - `execution_status === 'standby'` (spawned paused — prompt is suppressed
  *   until the wake path delivers `spawn_context`);
  * - members with assigned tasks blocked on unresolved dependencies;
+ * - members with assigned tasks in review;
  * - members older than 15s, or that already produced at least one message.
  *
  * Extracted from the inline `fast-idle` block of `src/index.ts` so the decision
@@ -310,9 +341,10 @@ export function shouldAlarmFastIdle(
     .get(teamId, memberName) as { time_created: number; execution_status: string } | null
   if (!member) return false
 
-  // Standby or dependency-blocked members idle immediately on purpose.
+  // Standby, dependency-blocked or review-waiting members idle immediately on purpose.
   if (member.execution_status === "standby") return false
   if (hasBlockedAssignedTasks(db, teamId, memberName)) return false
+  if (hasInReviewAssignedTasks(db, teamId, memberName)) return false
 
   if (now - member.time_created >= 15_000) return false
 

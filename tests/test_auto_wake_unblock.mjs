@@ -100,12 +100,13 @@ async function runSuite() {
     config: DEFAULT_CONFIG
   };
 
-  // 1. Validar team_tasks_add sequencial automático
+  // 1. Validar team_tasks_add sequencial com flag sequential: true
   await executeTeamTasksAdd(deps, {
     tasks: [
       { content: "Task 1", priority: "medium" },
       { content: "Task 2", priority: "medium" }
-    ]
+    ],
+    sequential: true
   }, LEAD_SESSION);
   
   const tasks = db.query("SELECT * FROM team_task WHERE team_id = ? ORDER BY time_created ASC").all(TEAM_ID);

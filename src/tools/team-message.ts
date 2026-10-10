@@ -143,13 +143,24 @@ export async function executeTeamMessage(
     return `Message sent to ${args.to}.`
   }
 
-  // Guard: skip promptAsync delivery to teammates who have already reported completion (issue #3),
-  // unless the lead explicitly forces it. Forcing wakes the session; the natural busy transition
-  // (handleSessionStatusEvent) resets the completion flag when the teammate next goes idle, the
-  // same reset that already happens for a normal re-activation — this just gives the lead a way
-  // to trigger it deliberately instead of it being unreachable once the guard is set.
-  if (hasReportedCompletion(deps.db, teamInfo.teamId, args.to) && !args.force) {
-    return `Message stored for ${args.to} (teammate has completed their task — message will not wake them). Pass force:true to re-activate them.`
+  const isPeerMessage = teamInfo.role !== "lead" && args.to !== "lead"
+
+  // Peer-to-peer messages (member -> member) always wake the recipient for cyclic loops,
+  // even if they previously reported completion. Reset reported_to_lead to 0 on the recipient.
+  if (isPeerMessage) {
+    deps.db.run(
+      "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
+      [Date.now(), teamInfo.teamId, args.to],
+    )
+  } else {
+    // Guard: skip promptAsync delivery to teammates who have already reported completion (issue #3),
+    // unless the lead explicitly forces it. Forcing wakes the session; the natural busy transition
+    // (handleSessionStatusEvent) resets the completion flag when the teammate next goes idle, the
+    // same reset that already happens for a normal re-activation — this just gives the lead a way
+    // to trigger it deliberately instead of it being unreachable once the guard is set.
+    if (hasReportedCompletion(deps.db, teamInfo.teamId, args.to) && !args.force) {
+      return `Message stored for ${args.to} (teammate has completed their task — message will not wake them). Pass force:true to re-activate them.`
+    }
   }
 
   // For member-to-member messages, fire-and-forget delivery is safe.

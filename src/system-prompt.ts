@@ -54,6 +54,7 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
 
   const completed = countMap.completed ?? 0
   const inProgress = countMap.in_progress ?? 0
+  const inReview = countMap.in_review ?? 0
   const pending = countMap.pending ?? 0
 
   const memberList = members
@@ -71,13 +72,13 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
   const lines = [
     `You are leading team "${team.name}" with ${members.length} active teammates.`,
     teammateLine,
-    `Tasks: ${completed} completed, ${inProgress} in progress, ${pending} pending`,
+    `Tasks: ${completed} completed, ${inProgress} in progress${inReview ? `, ${inReview} in review` : ""}, ${pending} pending`,
   ]
 
   // Inline active and recently completed tasks
   const activeTasks = db.query(
-    "SELECT content, assignee FROM team_task WHERE team_id = ? AND status = 'in_progress' ORDER BY time_updated DESC LIMIT 5"
-  ).all(teamId) as Array<{ content: string; assignee: string | null }>
+    "SELECT content, assignee, status FROM team_task WHERE team_id = ? AND status IN ('in_progress', 'in_review') ORDER BY time_updated DESC LIMIT 5"
+  ).all(teamId) as Array<{ content: string; assignee: string | null; status: string }>
 
   const recentCompleted = db.query(
     "SELECT content, assignee FROM team_task WHERE team_id = ? AND status = 'completed' ORDER BY time_updated DESC LIMIT 3"
@@ -86,7 +87,7 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
   if (activeTasks.length > 0) {
     lines.push("Active tasks:")
     for (const t of activeTasks) {
-      lines.push(`  [in_progress] ${truncate(t.content, 120)}${t.assignee ? ` → ${t.assignee}` : ""}`)
+      lines.push(`  [${t.status}] ${truncate(t.content, 120)}${t.assignee ? ` → ${t.assignee}` : ""}`)
     }
   }
   if (recentCompleted.length > 0) {
@@ -242,6 +243,7 @@ export function buildTeamCompactionContext(
 
   const completed = countMap.completed ?? 0
   const inProgress = countMap.in_progress ?? 0
+  const inReview = countMap.in_review ?? 0
   const pending = countMap.pending ?? 0
 
   const roleLine = role === "lead"
@@ -259,7 +261,7 @@ export function buildTeamCompactionContext(
   const lines = [
     roleLine,
     membersLine,
-    `Tasks: ${completed} completed, ${inProgress} in progress, ${pending} pending`,
+    `Tasks: ${completed} completed, ${inProgress} in progress${inReview ? `, ${inReview} in review` : ""}, ${pending} pending`,
   ]
 
   if (role === "member" && memberName) {

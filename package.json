@@ -52,6 +52,7 @@
     "@opentui/core": "0.5.10",
     "@opentui/solid": "0.5.10",
     "@types/bun": "latest",
+    "@types/node": "^26.6.4",
     "esbuild": "^0.28.2",
     "solid-js": "1.9.0",
     "typescript": "^7.0.2"

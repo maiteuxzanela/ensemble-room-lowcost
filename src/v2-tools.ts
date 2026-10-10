@@ -218,10 +218,14 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
 
     editor.add({
       name: "team_tasks_complete",
-      description: "Mark a task as completed on the shared board. This unblocks any tasks that depend on it.",
+      description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
       input: {
         type: "object",
-        properties: { task_id: str("ID of the task to mark complete") },
+        properties: {
+          task_id: str("ID of the task to mark complete, submit for review, or reject"),
+          action: str("Action: 'complete' (default), 'submit_review', or 'reject'"),
+          notes: str("Review notes or rejection reason"),
+        },
         required: ["task_id"],
         additionalProperties: false,
       },

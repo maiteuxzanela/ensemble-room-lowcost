@@ -22,9 +22,8 @@ export async function executeTeamTasksAdd(
   const ids: string[] = []
   const now = Date.now()
 
-  // Determine if automatic sequential chaining is needed
-  const hasExplicitDependencies = args.tasks.some(t => t.depends_on && t.depends_on.length > 0)
-  const isSequential = args.sequential === true || (args.tasks.length > 1 && !hasExplicitDependencies)
+  // Determine if sequential chaining is explicitly requested
+  const isSequential = args.sequential === true
 
   for (let i = 0; i < args.tasks.length; i++) {
     const task = args.tasks[i]

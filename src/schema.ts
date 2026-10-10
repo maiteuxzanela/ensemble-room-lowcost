@@ -251,6 +251,33 @@ export const MIGRATIONS: string[] = [
    DROP TABLE team_member_old_m12;
    CREATE INDEX IF NOT EXISTS team_member_session_idx ON team_member(session_id);
    CREATE INDEX IF NOT EXISTS team_member_status_idx ON team_member(team_id, status);`,
+  // Migration 13: add 'in_review' to team_task status CHECK constraint and
+  // add rejection_count and review_notes columns. Rebuilds team_task exactly
+  // like Migrations 8 and 12 (rename → create → copy → drop) to update the CHECK
+  // constraint in SQLite, carrying over all existing rows and recreating the
+  // three indexes.
+  `ALTER TABLE team_task RENAME TO team_task_old_m13;
+   CREATE TABLE IF NOT EXISTS team_task (
+     id              TEXT PRIMARY KEY,
+     team_id         TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     content         TEXT NOT NULL,
+     status          TEXT NOT NULL DEFAULT 'pending'
+                       CHECK(status IN ('pending', 'in_progress', 'in_review', 'completed', 'cancelled', 'blocked')),
+     priority        TEXT NOT NULL DEFAULT 'medium'
+                       CHECK(priority IN ('high', 'medium', 'low')),
+     assignee        TEXT,
+     depends_on      TEXT,
+     time_created    INTEGER NOT NULL,
+     time_updated    INTEGER NOT NULL,
+     rejection_count INTEGER NOT NULL DEFAULT 0,
+     review_notes    TEXT
+   );
+   INSERT INTO team_task (id, team_id, content, status, priority, assignee, depends_on, time_created, time_updated, rejection_count, review_notes)
+     SELECT id, team_id, content, status, priority, assignee, depends_on, time_created, time_updated, 0, NULL FROM team_task_old_m13;
+   DROP TABLE team_task_old_m13;
+   CREATE INDEX IF NOT EXISTS team_task_team_idx ON team_task(team_id);
+   CREATE INDEX IF NOT EXISTS team_task_assignee_idx ON team_task(assignee);
+   CREATE INDEX IF NOT EXISTS team_task_status_idx ON team_task(team_id, status);`,
 ]
 
 /**

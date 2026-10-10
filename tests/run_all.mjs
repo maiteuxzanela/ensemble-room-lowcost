@@ -33,6 +33,7 @@ const SUITES = [
   { file: "test_dashboard_chat.mjs", label: "Dashboard Chat API (Fase 3)" },
   { file: "test_auto_standby_seq.mjs", label: "Auto-Sequenciamento & Auto-Standby" },
   { file: "test_auto_wake_unblock.mjs", label: "Auto-Wake de Subagentes no Desbloqueio" },
+  { file: "test_cyclic_graph_loop.mjs", label: "Grafos Cíclicos & Trava da Guardiã Clara" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

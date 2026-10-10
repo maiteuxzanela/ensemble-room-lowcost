@@ -22,6 +22,23 @@ export interface ToolDeps {
   progressTracker: ProgressTracker
 }
 
+/** Status values for team tasks supported by the database schema (Migration 13). */
+export type TaskStatus = "pending" | "in_progress" | "in_review" | "completed" | "cancelled" | "blocked"
+
+export interface TeamTask {
+  id: string
+  team_id: string
+  content: string
+  status: TaskStatus
+  priority: "high" | "medium" | "low"
+  assignee: string | null
+  depends_on: string | null
+  time_created: number
+  time_updated: number
+  rejection_count: number
+  review_notes: string | null
+}
+
 /** A single permission rule for session-level enforcement. */
 export interface PermissionRule {
   permission: string

@@ -95,11 +95,12 @@ export async function executeTeamStatus(
       lines.push(`  ${m.name}  [${statusIcon} ${duration}, ${msgInfo}${plan}${nudged}${retrying}]  agent: ${m.agent}${branch}`)
 
       // Current task
-      const task = deps.db.query("SELECT content FROM team_task WHERE team_id = ? AND assignee = ? AND status = 'in_progress' LIMIT 1")
-        .get(teamInfo.teamId, m.name) as { content: string } | null
+      const task = deps.db.query("SELECT content, status FROM team_task WHERE team_id = ? AND assignee = ? AND status IN ('in_progress', 'in_review') LIMIT 1")
+        .get(teamInfo.teamId, m.name) as { content: string; status: string } | null
       if (task) {
         const truncated = task.content.length > 80 ? `${task.content.slice(0, 80)}...` : task.content
-        lines.push(`    task: ${truncated}`)
+        const statusAnnotation = task.status === "in_review" ? " [in_review]" : ""
+        lines.push(`    task: ${truncated}${statusAnnotation}`)
       }
       if (m.worktree_dir) {
         lines.push(`    worktree: ${m.worktree_dir}`)

@@ -56,7 +56,7 @@ function rAttention(t){
   const el=document.getElementById('attention'),a=deriveAttention(t),h=deriveHealth(t),tk=t.tasks||[];
   const tone=a.items.length?'border-amber-500/30 bg-amber-500/[0.05]':'border-emerald-500/20 bg-emerald-500/[0.035]';
   const lead=a.items.length?'Needs attention':'No blockers detected';
-  const chips=[chip(h.w+' working','blue'),chip(a.running.length+' active tasks','green'),chip(a.blocked.length+' blocked',a.blocked.length?'amber':'muted'),chip(tk.filter(x=>x.status==='pending').length+' pending','muted')];
+  const chips=[chip(h.w+' working','blue'),chip(a.running.length+' active tasks','green'),(a.review?.length?chip(a.review.length+' in review','amber'):''),chip(a.blocked.length+' blocked',a.blocked.length?'amber':'muted'),chip(tk.filter(x=>x.status==='pending').length+' pending','muted')].filter(Boolean);
   let html='<div class="rounded-lg border '+tone+' px-3 py-2 flex flex-col md:flex-row md:items-center gap-2 md:gap-4">';
   html+='<div class="min-w-[180px]"><div class="text-[10px] uppercase tracking-[.16em] text-txt-500">Team attention</div><div class="text-[14px] font-semibold text-txt-100">'+lead+'</div></div>';
   html+='<div class="flex flex-wrap gap-1.5">'+chips.join('')+'</div>';
@@ -71,7 +71,7 @@ function rAgents(t){
   if(!mm.length){patch(el,'<div class="col-span-full text-center py-12"><div class="text-txt-400 text-sm mb-1">No agents yet</div><div class="text-txt-500 text-[11px]">Spawn teammates with <code class="px-1 py-0.5 bg-base-900 rounded font-mono text-[10px]">team_spawn</code></div></div>');return}
   const n=Date.now(),msgs=t.messages||[],sorted=[...mm].sort((a,b)=>rankAgent(a,b,t));
   const html=sorted.map((m,idx)=>{
-    const s=si(m.status,m.executionStatus),task=activeTaskFor(m.name,t.tasks||[]),msg=lastMessageFor(m.name,msgs),blocked=blockedTaskFor(m.name,t.tasks||[]);
+    const s=si(m.status,m.executionStatus),task=activeTaskFor(m.name,t.tasks||[]),msg=lastMessageFor(m.name,msgs),blocked=blockedTaskFor(m.name,t.tasks||[]),inReview=task&&task.status==='in_review';
     const d=D(n-m.timeUpdated),mi=msg?relT(msg.timeCreated):'\\u2014';
     const tt=task?.content,tr=tt&&tt.length>90?tt.slice(0,90)+'\\u2026':tt;
     const mp=msg?(msg.content.length>90?msg.content.slice(0,90)+'\\u2026':msg.content):'';
@@ -86,7 +86,7 @@ function rAgents(t){
         '<span class="text-[10px] text-txt-500 ml-auto shrink-0">'+E(m.agent)+'</span>'+
         (m.model?chip(E(m.model),'muted'):'')+
       '</div>'+
-      (tr?'<div class="mt-2 text-[13px] text-txt-200 leading-snug truncate">'+(blocked?'<span class="text-amber-400">Blocked: </span>':'Current task: ')+E(tr)+'</div>':'<div class="mt-2 text-[13px] text-txt-500 leading-snug">No active task</div>')+
+      (tr?'<div class="mt-2 text-[13px] text-txt-200 leading-snug truncate">'+(blocked?'<span class="text-amber-400">Blocked: </span>':inReview?'<span class="text-amber-400">In review: </span>':'Current task: ')+E(tr)+'</div>':'<div class="mt-2 text-[13px] text-txt-500 leading-snug">No active task</div>')+
       (mp?'<div class="mt-1 text-[12px] text-txt-400 truncate">Latest: '+E(mp)+'</div>':'')+
       '<div class="mt-2 flex items-center gap-1.5 flex-wrap">'+
         chip('status '+d,'muted')+chip('msg '+mi,'muted')+chip(E(m.executionStatus||m.status),sx(m))+
@@ -272,23 +272,26 @@ function rTasks(t){
   if(!tk.length){patch(el,'<div class="text-txt-500 text-sm py-6 text-center">No tasks yet</div>');return}
   const c=tk.filter(x=>x.status==='completed').length,pct=Math.max(Math.round(c/tk.length*100),tk.length>0?2:0);
   const allDone=c===tk.length&&tk.length>0;
-  const g={in_progress:[],pending:[],completed:[],blocked:[],cancelled:[]};for(const x of tk)(g[x.status]||(g[x.status]=[])).push(x);
+  const g={in_progress:[],in_review:[],pending:[],completed:[],blocked:[],cancelled:[]};for(const x of tk)(g[x.status]||(g[x.status]=[])).push(x);
   const ds=saveD(el);
   const taskMap={};tk.forEach(x=>{taskMap[x.id]=x});
   function grp(label,items,dc,defOpen){
     if(!items.length)return'';
     const rows=items.map(x=>{
-      const ic=x.status==='completed'?'\\u2713':x.status==='in_progress'?'\\u25CF':'\\u25CB';
-      const icl=x.status==='completed'?'text-emerald-500':x.status==='in_progress'?'text-blue-400':'text-txt-500';
+      const ic=x.status==='completed'?'\\u2713':x.status==='in_progress'?'\\u25CF':x.status==='in_review'?'\\u25C9':'\\u25CB';
+      const icl=x.status==='completed'?'text-emerald-500':x.status==='in_progress'?'text-blue-400':x.status==='in_review'?'text-amber-400':'text-txt-500';
       const p=PR[x.priority]||PR.low,cn=x.content.length>55?x.content.slice(0,55)+'\\u2026':x.content;
       let dep='';
       const depIds=Array.isArray(x.dependsOn)?x.dependsOn:(x.dependsOn?[String(x.dependsOn)]:[]);
       if(depIds.length){const labels=depIds.map(id=>{const parent=taskMap[id];return parent?parent.content.slice(0,42):id}).join(', ');dep='<div class="text-[10px] text-txt-500 mt-0.5">blocked by: '+E(labels)+'</div>'}
+      const reviewBadge=x.status==='in_review'?chip('in review','amber'):'';
+      const rejChip=(x.rejectionCount&&x.rejectionCount>0)?chip('rejections: '+x.rejectionCount,'red'):'';
+      const notes=(x.reviewNotes)?'<div class="text-[10px] text-amber-400/80 italic mt-0.5">notes: '+E(x.reviewNotes)+'</div>':'';
       return '<div class="flex items-start gap-2 py-1.5 px-1 rounded hover:bg-base-800/40 transition-colors">'+
         '<span class="'+icl+' text-[11px] mt-[2px] shrink-0">'+ic+'</span>'+
         '<div class="flex-1 min-w-0"><div class="text-[13px] text-txt-200 truncate">'+E(cn)+'</div>'+
-        '<div class="flex gap-2 mt-1 text-[10px]"><span class="rounded px-1.5 py-[0px] '+p+'">'+E(x.priority)+'</span>'+
-        '<span class="text-txt-500">'+(E(x.assignee)||'unassigned')+'</span></div>'+dep+'</div></div>';
+        '<div class="flex items-center gap-2 mt-1 text-[10px] flex-wrap"><span class="rounded px-1.5 py-[0px] '+p+'">'+E(x.priority)+'</span>'+
+        '<span class="text-txt-500">'+(E(x.assignee)||'unassigned')+'</span>'+reviewBadge+rejChip+'</div>'+dep+notes+'</div></div>';
     }).join('');
     return '<details '+(defOpen?'open':'')+'><summary class="flex items-center gap-2 text-[11px] text-txt-300 cursor-pointer py-1.5 hover:text-txt-200 transition-colors select-none">'+
       '<svg class="w-3 h-3 transition-transform [details[open]>summary>&]:rotate-90" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>'+
@@ -301,7 +304,7 @@ function rTasks(t){
     '<span class="text-[11px] text-txt-400 font-mono">'+c+'/'+tk.length+'</span>'+
     (allDone?'<span class="text-emerald-400 text-[10px] font-medium">All complete</span>':'')+
   '</div>'+
-  grp('In Progress',g.in_progress,'bg-blue-500',true)+grp('Pending',g.pending,'bg-txt-500',true)+grp('Blocked',g.blocked||[],'bg-amber-500',true)+grp('Completed',g.completed,'bg-emerald-500',false);
+  grp('In Progress',g.in_progress,'bg-blue-500',true)+grp('In Review',g.in_review||[],'bg-amber-500',true)+grp('Pending',g.pending,'bg-txt-500',true)+grp('Blocked',g.blocked||[],'bg-amber-500',true)+grp('Completed',g.completed,'bg-emerald-500',false);
   restD(el,ds);
 }
 

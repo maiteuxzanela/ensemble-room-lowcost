@@ -61,6 +61,8 @@ interface TaskRow {
   depends_on: string | null
   time_created: number
   time_updated: number
+  rejection_count?: number
+  review_notes?: string | null
 }
 
 interface MessageRow {
@@ -113,7 +115,7 @@ function buildState(db: Database): EnsembleDashboardState {
   const projects = db.query("SELECT id, name, path, status, time_created, time_updated FROM project ORDER BY time_updated DESC").all() as ProjectRow[]
   const teams = db.query("SELECT id, name, project_id, lead_session_id, status, lead_agent, time_created, time_updated FROM team ORDER BY time_created DESC").all() as TeamRow[]
   const memberStmt = db.query("SELECT name, agent, status, execution_status, session_id, worktree_branch, prompt, model, plan_approval, time_created, time_updated, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message FROM team_member WHERE team_id = ?")
-  const taskStmt = db.query("SELECT id, content, status, priority, assignee, depends_on, time_created, time_updated FROM team_task WHERE team_id = ?")
+  const taskStmt = db.query("SELECT id, content, status, priority, assignee, depends_on, time_created, time_updated, rejection_count, review_notes FROM team_task WHERE team_id = ?")
   const msgStmt = db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC LIMIT 50")
 
   const mappedTeams = teams.map((t) => {
@@ -158,6 +160,8 @@ function buildState(db: Database): EnsembleDashboardState {
         dependsOn: parseDependsOn(tk.depends_on),
         timeCreated: tk.time_created,
         timeUpdated: tk.time_updated,
+        rejectionCount: tk.rejection_count ?? 0,
+        reviewNotes: tk.review_notes ?? null,
       })),
       messages: (msgStmt.all(t.id) as MessageRow[]).map((msg) => ({
         id: msg.id,
@@ -214,10 +218,49 @@ export interface DashboardOptions {
   client?: PluginClient
 }
 
-function sendJson(res: ServerResponse, data: unknown, status: number = 200): void {
+/**
+ * DEF-5 — Loopback-only CORS.
+ *
+ * The dashboard is a local operator console served from the same origin it
+ * polls. Only `localhost` / `127.0.0.1` / `[::1]` on the configured port may
+ * be reflected in `Access-Control-Allow-Origin`; `*` is never emitted, so a
+ * page on any other origin cannot read `/api/state` or any other JSON route.
+ */
+function localOrigins(port: number): string[] {
+  return [`http://localhost:${port}`, `http://127.0.0.1:${port}`, `http://[::1]:${port}`]
+}
+
+/** Resolve the concrete `Access-Control-Allow-Origin` value for one request. */
+function corsOriginFor(port: number, origin: string | string[] | undefined): string {
+  const raw = Array.isArray(origin) ? origin[0] : origin
+  if (raw && localOrigins(port).includes(raw)) return raw
+  return `http://localhost:${port}`
+}
+
+/**
+ * DEF-5 — Origin/Host gate for state-changing routes (`POST /api/chat/send`).
+ *
+ * `Host` must name this very port on a loopback address and, when the browser
+ * sends one, `Origin` must be a loopback origin on the same port. A missing
+ * `Origin` (curl, the TUI, other non-browser clients) is accepted — the Host
+ * gate still binds the request to this listener.
+ */
+function isTrustedLocalRequest(port: number, req: IncomingMessage): boolean {
+  const host = req.headers.host
+  if (!host || ![`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`].includes(host)) return false
+  const origin = req.headers.origin
+  if (origin === undefined) return true
+  return localOrigins(port).includes(Array.isArray(origin) ? (origin[0] ?? "") : origin)
+}
+
+/** Max accepted HTTP body for `POST /api/chat/send` (DEF-7): 64 KiB. */
+export const MAX_CHAT_BODY_BYTES = 64 * 1024
+
+function sendJson(res: ServerResponse, data: unknown, corsOrigin: string, status: number = 200): void {
   res.writeHead(status, {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": corsOrigin,
+    "Vary": "Origin",
   })
   res.end(JSON.stringify(data))
 }
@@ -297,10 +340,22 @@ export function parseMessageParts(parts: unknown[], msgInfo: unknown): ActivityE
 
 /** Handle the /api/session/:sessionId/activity endpoint. */
 async function handleActivityRoute(
+  db: Database,
   sessionId: string,
   options: DashboardOptions | undefined,
   res: ServerResponse,
+  corsOrigin: string,
 ): Promise<void> {
+  // DEF-6 — the path parameter must name a real team member session. Without
+  // this gate any caller could hand an arbitrary host session id to the SDK and
+  // read that session's message history back through the dashboard.
+  const member = db.query("SELECT session_id FROM team_member WHERE session_id = ?")
+    .get(sessionId) as { session_id: string } | null
+  if (!member) {
+    sendJson(res, { error: "Unknown session" }, corsOrigin, 404)
+    return
+  }
+
   const buffer = options?.activityBuffer
   const client = options?.client
 
@@ -326,7 +381,7 @@ async function handleActivityRoute(
 
   const combined = [...buffered, ...fallbackActivity].sort((a, b) => a.timestamp - b.timestamp)
 
-  sendJson(res, { activity: combined, session: sessionData })
+  sendJson(res, { activity: combined, session: sessionData }, corsOrigin)
 }
 
 function handleDashboardRequest(
@@ -337,28 +392,68 @@ function handleDashboardRequest(
   options?: DashboardOptions,
 ): void {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? `localhost:${port}`}`)
+  const corsOrigin = corsOriginFor(port, req.headers.origin)
 
   if (url.pathname === "/api/health") {
-    sendJson(res, { ensemble: true, pid: process.pid })
+    sendJson(res, { ensemble: true, pid: process.pid }, corsOrigin)
     return
   }
 
   if (url.pathname === "/api/state") {
-    sendJson(res, buildState(db))
+    sendJson(res, buildState(db), corsOrigin)
     return
   }
 
   if (req.method === "POST" && url.pathname === "/api/chat/send") {
-    let body = ""
-    req.on("data", chunk => { body += chunk })
+    // DEF-5 — refuse anything that does not come from this loopback port.
+    if (!isTrustedLocalRequest(port, req)) {
+      log(`dashboard:chat:forbidden host=${req.headers.host ?? "-"} origin=${req.headers.origin ?? "-"}`)
+      sendJson(res, { ok: false, error: "Forbidden" }, corsOrigin, 403)
+      return
+    }
+
+    // DEF-7 — hard 64 KiB ceiling on the request body. The buffer is discarded
+    // as soon as the limit is crossed: no partial parse, no unbounded growth.
+    const chunks: Buffer[] = []
+    let received = 0
+    let tooLarge = false
+
+    req.on("error", () => { /* client went away mid-body — nothing to parse */ })
+
+    req.on("data", (chunk: Buffer) => {
+      if (tooLarge) return
+      received += chunk.length
+      if (received > MAX_CHAT_BODY_BYTES) {
+        tooLarge = true
+        chunks.length = 0
+        req.removeAllListeners("end")
+        // Drain the remainder instead of destroying the socket, so the 413
+        // actually reaches the client before the connection is torn down.
+        req.removeAllListeners("data")
+        req.resume()
+        res.writeHead(413, {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": corsOrigin,
+          "Vary": "Origin",
+          "Connection": "close",
+        })
+        res.end(JSON.stringify({ ok: false, error: "Payload Too Large", limit: MAX_CHAT_BODY_BYTES }))
+        log(`dashboard:chat:payload-too-large limit=${MAX_CHAT_BODY_BYTES}`)
+        return
+      }
+      chunks.push(chunk)
+    })
+
     req.on("end", () => {
+      if (tooLarge) return
+      const body = Buffer.concat(chunks).toString("utf8")
       try {
         const payload = JSON.parse(body)
         let text = String(payload.text || "")
         let to = payload.to ? String(payload.to) : ""
 
         if (!text.trim()) {
-          sendJson(res, { ok: false, error: "Empty message" }, 400)
+          sendJson(res, { ok: false, error: "Empty message" }, corsOrigin, 400)
           return
         }
 
@@ -372,7 +467,7 @@ function handleDashboardRequest(
         if (teamId) {
           const check = db.query("SELECT id FROM team WHERE id = ?").get(teamId) as { id: string } | null
           if (!check) {
-            sendJson(res, { ok: false, error: `Team '${teamId}' not found` }, 400)
+            sendJson(res, { ok: false, error: `Team '${teamId}' not found` }, corsOrigin, 400)
             return
           }
         }
@@ -381,7 +476,7 @@ function handleDashboardRequest(
           if (activeTeam) teamId = activeTeam.id
         }
         if (!teamId) {
-          sendJson(res, { ok: false, error: "No active team found" }, 400)
+          sendJson(res, { ok: false, error: "No active team found" }, corsOrigin, 400)
           return
         }
 
@@ -407,7 +502,7 @@ function handleDashboardRequest(
         } else {
           const member = db.query("SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status NOT IN ('shutdown', 'error')").get(teamId, to) as { session_id: string } | null
           if (!member) {
-            sendJson(res, { ok: false, error: `Member '${to}' not found in active team` }, 404)
+            sendJson(res, { ok: false, error: `Member '${to}' not found in active team` }, corsOrigin, 404)
             return
           }
           messageId = sendMessage(db, { teamId, from: "human", to, content: text })
@@ -421,10 +516,10 @@ function handleDashboardRequest(
           }
         }
 
-        sendJson(res, { ok: true, messageId, recipients }, 200)
+        sendJson(res, { ok: true, messageId, recipients }, corsOrigin, 200)
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err)
-        sendJson(res, { ok: false, error: msg }, 500)
+        sendJson(res, { ok: false, error: msg }, corsOrigin, 500)
       }
     })
     return
@@ -433,9 +528,13 @@ function handleDashboardRequest(
   const activityMatch = url.pathname?.match(/^\/api\/session\/([^/]+)\/activity$/)
   if (activityMatch) {
     const sessionId = decodeURIComponent(activityMatch[1]!)
-    handleActivityRoute(sessionId, options, res).catch(() => {
+    handleActivityRoute(db, sessionId, options, res, corsOrigin).catch(() => {
       if (!res.headersSent) {
-        res.writeHead(500, { "Content-Type": "application/json" })
+        res.writeHead(500, {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": corsOrigin,
+          "Vary": "Origin",
+        })
         res.end(JSON.stringify({ error: "Failed to fetch activity" }))
       }
     })

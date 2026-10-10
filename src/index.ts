@@ -13,7 +13,8 @@ import { isWorktreeInstance } from "./util"
 import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, shouldAlarmFastIdle, handleSessionErrorEvent } from "./hooks"
 // Re-exported so test harnesses (and the dist bundle) can exercise the nudge /
 // fast-idle decisions against a real SQLite database without reimplementing them.
-export { shouldNudgeIdleMember, shouldAlarmFastIdle, hasBlockedAssignedTasks } from "./hooks"
+export { shouldNudgeIdleMember, shouldAlarmFastIdle, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue } from "./hooks"
+export { executeTeamTasksReview, executeTeamTasksReject } from "./tools/team-tasks-complete"
 import { notifyTeamEvent, notifyWorkingProgress, notifyLead } from "./notify"
 import { hasReportedCompletion } from "./messaging"
 import { getMemberModel } from "./member-model"
@@ -273,6 +274,10 @@ const plugin: Plugin = async (input) => {
 
         // Wake the lead when it goes idle and has pending messages.
         // The system prompt transform delivers the actual message content.
+        // DEF-3 (vazamento do Silent Lead): while silentLead is on, the SQLite row
+        // written by team_message IS the delivery channel and board closure is the
+        // only legitimate wake. Without this guard the idle hook re-fires every 5s
+        // (WAKE_LEAD_COOLDOWN_MS) and silently breaks "Lead Silencioso".
         if (statusType === "idle") {
           const team = db.query("SELECT id FROM team WHERE lead_session_id = ? AND status = 'active'").get(sessionID) as { id: string } | null
           if (team) {
@@ -282,7 +287,7 @@ const plugin: Plugin = async (input) => {
               "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND status NOT IN ('ready', 'shutdown', 'error')"
             ).get(team.id) as { c: number }).c === 0
             const lastWake = wakeLeadTimestamps.get(team.id) ?? 0
-            if (pending.c > 0 && !allDone && Date.now() - lastWake > WAKE_LEAD_COOLDOWN_MS) {
+            if (pending.c > 0 && !allDone && !config.silentLead && Date.now() - lastWake > WAKE_LEAD_COOLDOWN_MS) {
               wakeLeadTimestamps.set(team.id, Date.now())
               log(`wake-lead: ${pending.c} pending messages, sending promptAsync`)
               client.session.promptAsync({
@@ -526,9 +531,11 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_tasks_complete: tool({
-        description: "Mark a task as completed on the shared board. This unblocks any tasks that depend on it.",
+        description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
         args: {
-          task_id: tool.schema.string().describe("ID of the task to mark complete"),
+          task_id: tool.schema.string().describe("ID of the task to mark complete, submit for review, or reject"),
+          action: tool.schema.string().optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), or 'reject' (in_review -> in_progress)"),
+          notes: tool.schema.string().optional().describe("Review notes or rejection reason"),
         },
         async execute(args, ctx) {
           const result = await executeTeamTasksComplete(deps, args, ctx.sessionID)

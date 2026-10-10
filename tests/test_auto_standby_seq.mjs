@@ -98,12 +98,13 @@ async function runSuite() {
     config: DEFAULT_CONFIG
   };
 
-  // 1. Validar team_tasks_add sequencial automático
+  // 1. Validar team_tasks_add sequencial com flag sequential: true
   const resTasks = await executeTeamTasksAdd(deps, {
     tasks: [
       { content: "Task 0", priority: "medium" },
       { content: "Task 1", priority: "medium" }
-    ] // Sem depends_on explicitos, deve encadear automaticamente
+    ],
+    sequential: true
   }, LEAD_SESSION);
 
   check("team_tasks_add rodou sem erro", typeof resTasks === "string");

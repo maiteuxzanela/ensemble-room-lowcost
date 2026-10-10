@@ -433,7 +433,34 @@ var MIGRATIONS = [
      SELECT team_id, name, session_id, agent, status, execution_status, model, prompt, time_created, time_updated, worktree_dir, worktree_branch, plan_approval, workspace_id, reported_to_lead, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message, spawn_context FROM team_member_old_m12;
    DROP TABLE team_member_old_m12;
    CREATE INDEX IF NOT EXISTS team_member_session_idx ON team_member(session_id);
-   CREATE INDEX IF NOT EXISTS team_member_status_idx ON team_member(team_id, status);`
+   CREATE INDEX IF NOT EXISTS team_member_status_idx ON team_member(team_id, status);`,
+  // Migration 13: add 'in_review' to team_task status CHECK constraint and
+  // add rejection_count and review_notes columns. Rebuilds team_task exactly
+  // like Migrations 8 and 12 (rename → create → copy → drop) to update the CHECK
+  // constraint in SQLite, carrying over all existing rows and recreating the
+  // three indexes.
+  `ALTER TABLE team_task RENAME TO team_task_old_m13;
+   CREATE TABLE IF NOT EXISTS team_task (
+     id              TEXT PRIMARY KEY,
+     team_id         TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     content         TEXT NOT NULL,
+     status          TEXT NOT NULL DEFAULT 'pending'
+                       CHECK(status IN ('pending', 'in_progress', 'in_review', 'completed', 'cancelled', 'blocked')),
+     priority        TEXT NOT NULL DEFAULT 'medium'
+                       CHECK(priority IN ('high', 'medium', 'low')),
+     assignee        TEXT,
+     depends_on      TEXT,
+     time_created    INTEGER NOT NULL,
+     time_updated    INTEGER NOT NULL,
+     rejection_count INTEGER NOT NULL DEFAULT 0,
+     review_notes    TEXT
+   );
+   INSERT INTO team_task (id, team_id, content, status, priority, assignee, depends_on, time_created, time_updated, rejection_count, review_notes)
+     SELECT id, team_id, content, status, priority, assignee, depends_on, time_created, time_updated, 0, NULL FROM team_task_old_m13;
+   DROP TABLE team_task_old_m13;
+   CREATE INDEX IF NOT EXISTS team_task_team_idx ON team_task(team_id);
+   CREATE INDEX IF NOT EXISTS team_task_assignee_idx ON team_task(assignee);
+   CREATE INDEX IF NOT EXISTS team_task_status_idx ON team_task(team_id, status);`
 ];
 function applyMigrations(db) {
   const { user_version: current } = db.query("PRAGMA user_version").get();
@@ -994,11 +1021,25 @@ function hasBlockedAssignedTasks(db, teamId, memberName) {
   }
   return false;
 }
+function hasInReviewAssignedTasks(db, teamId, memberName) {
+  const row = db.query(
+    "SELECT id FROM team_task WHERE team_id = ? AND assignee = ? AND status = 'in_review' LIMIT 1"
+  ).get(teamId, memberName);
+  return !!row;
+}
+function hasActivePeerDialogue(db, teamId, memberName) {
+  const row = db.query(
+    "SELECT id FROM team_message WHERE team_id = ? AND ((from_name = ? AND to_name != 'lead' AND to_name IS NOT NULL) OR (to_name = ? AND from_name != 'lead')) LIMIT 1"
+  ).get(teamId, memberName, memberName);
+  return !!row;
+}
 function shouldNudgeIdleMember(db, teamId, memberName) {
   const member = db.query("SELECT status, execution_status FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
   if (!member || member.status !== "ready") return false;
   if (member.execution_status === "standby") return false;
   if (hasBlockedAssignedTasks(db, teamId, memberName)) return false;
+  if (hasInReviewAssignedTasks(db, teamId, memberName)) return false;
+  if (hasActivePeerDialogue(db, teamId, memberName)) return false;
   const msg = db.query("SELECT id FROM team_message WHERE team_id = ? AND from_name = ? AND (to_name = 'lead' OR to_name IS NULL) LIMIT 1").get(teamId, memberName);
   return !msg;
 }
@@ -1007,6 +1048,7 @@ function shouldAlarmFastIdle(db, teamId, memberName, now = Date.now()) {
   if (!member) return false;
   if (member.execution_status === "standby") return false;
   if (hasBlockedAssignedTasks(db, teamId, memberName)) return false;
+  if (hasInReviewAssignedTasks(db, teamId, memberName)) return false;
   if (now - member.time_created >= 15e3) return false;
   const msgCount = db.query("SELECT COUNT(*) as c FROM team_message WHERE team_id = ? AND from_name = ?").get(teamId, memberName).c;
   return msgCount === 0;
@@ -2059,8 +2101,16 @@ async function executeTeamMessage(deps, args, sessionId) {
     });
     return `Message sent to ${args.to}.`;
   }
-  if (hasReportedCompletion(deps.db, teamInfo.teamId, args.to) && !args.force) {
-    return `Message stored for ${args.to} (teammate has completed their task \u2014 message will not wake them). Pass force:true to re-activate them.`;
+  const isPeerMessage = teamInfo.role !== "lead" && args.to !== "lead";
+  if (isPeerMessage) {
+    deps.db.run(
+      "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
+      [Date.now(), teamInfo.teamId, args.to]
+    );
+  } else {
+    if (hasReportedCompletion(deps.db, teamInfo.teamId, args.to) && !args.force) {
+      return `Message stored for ${args.to} (teammate has completed their task \u2014 message will not wake them). Pass force:true to re-activate them.`;
+    }
   }
   const wake = resolveStandbyWake(
     deps.db,
@@ -2160,8 +2210,7 @@ async function executeTeamTasksAdd(deps, args, sessionId) {
   const teamInfo = requireTeamMember(deps, sessionId);
   const ids = [];
   const now = Date.now();
-  const hasExplicitDependencies = args.tasks.some((t) => t.depends_on && t.depends_on.length > 0);
-  const isSequential = args.sequential === true || args.tasks.length > 1 && !hasExplicitDependencies;
+  const isSequential = args.sequential === true;
   for (let i = 0; i < args.tasks.length; i++) {
     const task = args.tasks[i];
     if (!task) continue;
@@ -2197,15 +2246,51 @@ init_log();
 async function executeTeamTasksComplete(deps, args, sessionId) {
   const teamInfo = requireTeamMember(deps, sessionId);
   const caller = teamInfo.role === "lead" ? "lead" : teamInfo.memberName ?? "unknown";
-  const task = deps.db.query("SELECT id, content, status, assignee FROM team_task WHERE id = ? AND team_id = ?").get(args.task_id, teamInfo.teamId);
+  const task = deps.db.query("SELECT id, content, status, assignee, rejection_count, review_notes FROM team_task WHERE id = ? AND team_id = ?").get(args.task_id, teamInfo.teamId);
   if (!task) throw new Error(`Task "${args.task_id}" not found`);
+  const now = Date.now();
+  const notes = args.review_notes ?? args.notes ?? null;
+  const isSubmitReview = args.action === "submit_review" || args.action === "in_review" || args.status === "in_review";
+  if (isSubmitReview) {
+    if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`);
+    if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`);
+    if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`);
+    if (task.status === "in_review") throw new Error(`Task "${args.task_id}" is already in review`);
+    if (task.assignee && teamInfo.role !== "lead" && caller !== task.assignee) {
+      throw new Error(`Task "${args.task_id}" is claimed by ${task.assignee}`);
+    }
+    const assignee = task.assignee ?? caller;
+    deps.db.run(
+      "UPDATE team_task SET status = 'in_review', assignee = ?, review_notes = ?, time_updated = ? WHERE id = ?",
+      [assignee, notes ?? task.review_notes ?? null, now, args.task_id]
+    );
+    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}`;
+  }
+  const isReject = args.action === "reject" || args.action === "reject_review" || task.status === "in_review" && (args.action === "in_progress" || args.status === "in_progress");
+  if (isReject) {
+    if (task.status !== "in_review") {
+      throw new Error(`Task "${args.task_id}" is not in review (current status: ${task.status})`);
+    }
+    if (teamInfo.role !== "lead" && caller !== "clara") {
+      throw new Error(`Only clara or the team lead can reject tasks in review`);
+    }
+    const newRejectionCount = (task.rejection_count ?? 0) + 1;
+    deps.db.run(
+      "UPDATE team_task SET status = 'in_progress', rejection_count = ?, review_notes = ?, time_updated = ? WHERE id = ?",
+      [newRejectionCount, notes, now, args.task_id]
+    );
+    return `Rejected task: ${task.content} (rejection #${newRejectionCount})${notes ? ` - ${notes}` : ""}`;
+  }
   if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`);
   if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`);
   if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`);
-  if (task.status === "in_progress" && task.assignee && teamInfo.role !== "lead" && caller !== task.assignee) {
+  if (task.status === "in_review") {
+    if (teamInfo.role !== "lead" && caller !== "clara") {
+      throw new Error(`Task "${args.task_id}" is in review; only clara or the team lead can complete it`);
+    }
+  } else if (task.status === "in_progress" && task.assignee && teamInfo.role !== "lead" && caller !== task.assignee) {
     throw new Error(`Task "${args.task_id}" is claimed by ${task.assignee}`);
   }
-  const now = Date.now();
   if (task.assignee) {
     deps.db.run("UPDATE team_task SET status = 'completed', time_updated = ? WHERE id = ?", [now, args.task_id]);
   } else {
@@ -2257,7 +2342,11 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
     "SELECT status, COUNT(*) as c FROM team_task WHERE team_id = ? GROUP BY status"
   ).all(teamInfo.teamId);
   const completed = counts.find((r) => r.status === "completed")?.c ?? 0;
-  const total = counts.reduce((sum, r) => sum + r.c, 0);
+  const total = counts.reduce((sum, r) => r.status === "cancelled" ? sum : sum + r.c, 0);
+  const activeRemaining = counts.reduce(
+    (sum, r) => r.status === "pending" || r.status === "in_progress" || r.status === "in_review" || r.status === "blocked" ? sum + r.c : sum,
+    0
+  );
   const who = teamInfo.memberName ?? "teammate";
   try {
     deps.client.tui.showToast({
@@ -2270,7 +2359,7 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
   } catch {
     log(`tasks-complete:toast:failed`);
   }
-  if (total > 0 && completed === total) {
+  if (total > 0 && completed === total && activeRemaining === 0) {
     const lead = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?").get(teamInfo.teamId);
     if (lead?.lead_session_id) {
       deps.client.session.promptAsync({
@@ -2292,6 +2381,12 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
     unblockedMsg += ")";
   }
   return `Completed task: ${task.content}${unblockedMsg}`;
+}
+async function executeTeamTasksReview(deps, args, sessionId) {
+  return executeTeamTasksComplete(deps, { ...args, action: "submit_review" }, sessionId);
+}
+async function executeTeamTasksReject(deps, args, sessionId) {
+  return executeTeamTasksComplete(deps, { ...args, action: "reject" }, sessionId);
 }
 
 // src/result-parser.ts
@@ -2996,10 +3091,11 @@ async function executeTeamStatus(deps, sessionId) {
       const lastMsg = deps.db.query("SELECT MAX(time_created) as last_msg FROM team_message WHERE team_id = ? AND from_name = ?").get(teamInfo.teamId, m.name);
       const msgInfo = lastMsg?.last_msg ? `last msg: ${formatDuration(now - lastMsg.last_msg)} ago` : "no messages yet";
       lines.push(`  ${m.name}  [${statusIcon} ${duration}, ${msgInfo}${plan}${nudged}${retrying}]  agent: ${m.agent}${branch}`);
-      const task = deps.db.query("SELECT content FROM team_task WHERE team_id = ? AND assignee = ? AND status = 'in_progress' LIMIT 1").get(teamInfo.teamId, m.name);
+      const task = deps.db.query("SELECT content, status FROM team_task WHERE team_id = ? AND assignee = ? AND status IN ('in_progress', 'in_review') LIMIT 1").get(teamInfo.teamId, m.name);
       if (task) {
         const truncated = task.content.length > 80 ? `${task.content.slice(0, 80)}...` : task.content;
-        lines.push(`    task: ${truncated}`);
+        const statusAnnotation = task.status === "in_review" ? " [in_review]" : "";
+        lines.push(`    task: ${truncated}${statusAnnotation}`);
       }
       if (m.worktree_dir) {
         lines.push(`    worktree: ${m.worktree_dir}`);
@@ -3205,10 +3301,14 @@ async function registerV2Tools(domain, deps) {
     });
     editor.add({
       name: "team_tasks_complete",
-      description: "Mark a task as completed on the shared board. This unblocks any tasks that depend on it.",
+      description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
       input: {
         type: "object",
-        properties: { task_id: str("ID of the task to mark complete") },
+        properties: {
+          task_id: str("ID of the task to mark complete, submit for review, or reject"),
+          action: str("Action: 'complete' (default), 'submit_review', or 'reject'"),
+          notes: str("Review notes or rejection reason")
+        },
         required: ["task_id"],
         additionalProperties: false
       },
@@ -3680,6 +3780,7 @@ function buildLeadSystemPrompt(db, teamId, config) {
   }
   const completed = countMap.completed ?? 0;
   const inProgress = countMap.in_progress ?? 0;
+  const inReview = countMap.in_review ?? 0;
   const pending = countMap.pending ?? 0;
   const memberList = members.map((m) => `${m.name} [${STATUS_DISPLAY[m.status] ?? m.status}]`).join(", ");
   const teammateLine = members.length > 0 ? `Teammates: ${memberList}` : "Teammates: none";
@@ -3689,10 +3790,10 @@ function buildLeadSystemPrompt(db, teamId, config) {
   const lines = [
     `You are leading team "${team.name}" with ${members.length} active teammates.`,
     teammateLine,
-    `Tasks: ${completed} completed, ${inProgress} in progress, ${pending} pending`
+    `Tasks: ${completed} completed, ${inProgress} in progress${inReview ? `, ${inReview} in review` : ""}, ${pending} pending`
   ];
   const activeTasks = db.query(
-    "SELECT content, assignee FROM team_task WHERE team_id = ? AND status = 'in_progress' ORDER BY time_updated DESC LIMIT 5"
+    "SELECT content, assignee, status FROM team_task WHERE team_id = ? AND status IN ('in_progress', 'in_review') ORDER BY time_updated DESC LIMIT 5"
   ).all(teamId);
   const recentCompleted = db.query(
     "SELECT content, assignee FROM team_task WHERE team_id = ? AND status = 'completed' ORDER BY time_updated DESC LIMIT 3"
@@ -3700,7 +3801,7 @@ function buildLeadSystemPrompt(db, teamId, config) {
   if (activeTasks.length > 0) {
     lines.push("Active tasks:");
     for (const t of activeTasks) {
-      lines.push(`  [in_progress] ${truncate(t.content, 120)}${t.assignee ? ` \u2192 ${t.assignee}` : ""}`);
+      lines.push(`  [${t.status}] ${truncate(t.content, 120)}${t.assignee ? ` \u2192 ${t.assignee}` : ""}`);
     }
   }
   if (recentCompleted.length > 0) {
@@ -3823,6 +3924,7 @@ function buildTeamCompactionContext(db, teamId, role, memberName, config) {
   }
   const completed = countMap.completed ?? 0;
   const inProgress = countMap.in_progress ?? 0;
+  const inReview = countMap.in_review ?? 0;
   const pending = countMap.pending ?? 0;
   const roleLine = role === "lead" ? `[Team Context] You are the lead of team "${team.name}".` : `[Team Context] You are a teammate named "${memberName}" in team "${team.name}".`;
   const memberList = members.map((m) => `${m.name} (${STATUS_DISPLAY[m.status] ?? m.status})`).join(", ");
@@ -3830,7 +3932,7 @@ function buildTeamCompactionContext(db, teamId, role, memberName, config) {
   const lines = [
     roleLine,
     membersLine,
-    `Tasks: ${completed} completed, ${inProgress} in progress, ${pending} pending`
+    `Tasks: ${completed} completed, ${inProgress} in progress${inReview ? `, ${inReview} in review` : ""}, ${pending} pending`
   ];
   if (role === "member" && memberName) {
     lines.push(`IMPORTANT: ${leadReportDirective(config)}`);
@@ -4058,7 +4160,9 @@ function md(s){
   h=h.replace(/^# (.+)$/gm,'<h1>$1</h1>');
   h=h.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>');
   h=h.replace(/\\*(.+?)\\*/g,'<em>$1</em>');
-  h=h.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // DEF-4 (XSS via markdown links): only http(s) and same-origin paths may become
+  // hrefs \u2014 anything else (javascript:, data:, vbscript:, ...) is left as escaped text.
+  h=h.replace(/\\[([^\\]]+)\\]\\(((?:https?:\\/\\/|\\/)[^)]*)\\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
   h=h.replace(/^- (.+)$/gm,'<li>$1</li>');
   h=h.replace(/(<li>.*<\\/li>\\n?)+/g,'<ul>$&</ul>');
   h=h.replace(/^\\d+\\. (.+)$/gm,'<li>$1</li>');
@@ -4110,10 +4214,10 @@ function deriveHealth(t){
 function coarseTeamStatus(t){const h=deriveHealth(t),blocked=(t.tasks||[]).filter(x=>x.status==='blocked').length;if(h.e)return{label:'error',color:'red',dot:'bg-red-500'};if(blocked)return{label:'blocked',color:'amber',dot:'bg-amber-500'};if(h.w)return{label:'working',color:'blue',dot:'bg-blue-500'};if(h.i)return{label:'idle',color:'muted',dot:'bg-txt-500'};return{label:t.status==='active'?'empty':t.status,color:'muted',dot:'bg-base-600'}}
 function projectStatus(p){const teams=p.teams||[],counts={working:0,blocked:0,error:0,idle:0,done:0};teams.forEach(t=>{const s=coarseTeamStatus(t).label;if(s==='working')counts.working++;else if(s==='blocked')counts.blocked++;else if(s==='error')counts.error++;else if(s==='idle'||s==='empty')counts.idle++;else counts.done++});if(counts.error)return{label:'error',color:'red',dot:'bg-red-500',counts};if(counts.blocked)return{label:'blocked',color:'amber',dot:'bg-amber-500',counts};if(counts.working)return{label:'working',color:'blue',dot:'bg-blue-500',counts};return{label:'idle',color:'muted',dot:'bg-txt-500',counts}}
 function statusTitleProject(p){const s=projectStatus(p),teams=p.teams||[];return projectLabel(p)+'\\nStatus: '+s.label+'\\nTeams: '+teams.length+'\\nWorking: '+s.counts.working+' \xB7 Blocked: '+s.counts.blocked+' \xB7 Error: '+s.counts.error+' \xB7 Idle: '+s.counts.idle}
-function statusTitleTeam(t){const h=deriveHealth(t),tasks=t.tasks||[],blocked=tasks.filter(x=>x.status==='blocked').length,active=tasks.filter(x=>x.status==='in_progress').length,pending=tasks.filter(x=>x.status==='pending').length,done=tasks.filter(x=>x.status==='completed').length;return t.name+'\\nStatus: '+coarseTeamStatus(t).label+'\\nAgents: '+h.total+' total, '+h.w+' working, '+h.i+' idle, '+h.e+' error\\nTasks: '+active+' active, '+blocked+' blocked, '+pending+' pending, '+done+' done'}
+function statusTitleTeam(t){const h=deriveHealth(t),tasks=t.tasks||[],blocked=tasks.filter(x=>x.status==='blocked').length,active=tasks.filter(x=>x.status==='in_progress').length,review=tasks.filter(x=>x.status==='in_review').length,pending=tasks.filter(x=>x.status==='pending').length,done=tasks.filter(x=>x.status==='completed').length;return t.name+'\\nStatus: '+coarseTeamStatus(t).label+'\\nAgents: '+h.total+' total, '+h.w+' working, '+h.i+' idle, '+h.e+' error\\nTasks: '+active+' active, '+(review?review+' in review, ':'')+blocked+' blocked, '+pending+' pending, '+done+' done'}
 
 function lastMessageFor(name,msgs){return msgs.filter(m=>m.fromName===name||m.toName===name).sort((a,b)=>b.timeCreated-a.timeCreated)[0]||null}
-function activeTaskFor(name,tasks){return tasks.find(x=>x.assignee===name&&x.status==='in_progress')||tasks.find(x=>x.assignee===name&&x.status==='blocked')||null}
+function activeTaskFor(name,tasks){return tasks.find(x=>x.assignee===name&&x.status==='in_progress')||tasks.find(x=>x.assignee===name&&x.status==='in_review')||tasks.find(x=>x.assignee===name&&x.status==='blocked')||null}
 function blockedTaskFor(name,tasks){return tasks.find(x=>x.assignee===name&&x.status==='blocked')||null}
 
 function rankAgent(a,b,t){
@@ -4135,15 +4239,16 @@ function rankAgent(a,b,t){
 
 function deriveAttention(t){
   const tasks=t.tasks||[],msgs=t.messages||[];
-  const blocked=tasks.filter(x=>x.status==='blocked'),running=tasks.filter(x=>x.status==='in_progress');
+  const blocked=tasks.filter(x=>x.status==='blocked'),running=tasks.filter(x=>x.status==='in_progress'),review=tasks.filter(x=>x.status==='in_review');
   const errored=(t.members||[]).filter(m=>m.status==='error');
   const stopping=(t.members||[]).filter(m=>m.status==='shutdown_requested');
   const latest=msgs[0]||null;
   const items=[];
   errored.forEach(m=>items.push({kind:'Agent error',label:m.name,detail:m.executionStatus||m.status,color:'red'}));
+  review.forEach(x=>items.push({kind:'In review',label:x.assignee||'unassigned',detail:x.content,color:'amber'}));
   blocked.forEach(x=>items.push({kind:'Blocked task',label:x.assignee||'unassigned',detail:x.content,color:'amber'}));
   stopping.forEach(m=>items.push({kind:'Stopping',label:m.name,detail:'shutdown requested',color:'amber'}));
-  return{items,running,latest,blocked,errored};
+  return{items,running,review,latest,blocked,errored};
 }
 
 function deriveSparkline(name,msgs){
@@ -4162,6 +4267,7 @@ function deriveTimeline(t){
   (t.members||[]).forEach(m=>{ev.push({t:m.timeCreated,type:'spawn',label:E(m.name)+' spawned',c:'bg-blue-400'});if(m.status==='shutdown')ev.push({t:m.timeUpdated,type:'off',label:E(m.name)+' shut down',c:'bg-txt-500'});if(m.status==='error')ev.push({t:m.timeUpdated,type:'err',label:E(m.name)+' error',c:'bg-red-500'})});
   (t.messages||[]).forEach(m=>{const p=parseR(m.content);ev.push({t:m.timeCreated,type:'msg',label:E(m.fromName)+' \\u2192 '+(E(m.toName)||'all'),c:p?'bg-emerald-500':'bg-blue-400'})});
   (t.tasks||[]).filter(x=>x.status==='completed').forEach(x=>{ev.push({t:x.timeUpdated,type:'done',label:'Task done',c:'bg-emerald-500'})});
+  (t.tasks||[]).filter(x=>x.status==='in_review').forEach(x=>{ev.push({t:x.timeUpdated,type:'review',label:'Task in review',c:'bg-amber-500'})});
   return ev.sort((a,b)=>a.t-b.t).slice(-50);
 }
 
@@ -4470,7 +4576,7 @@ function rAttention(t){
   const el=document.getElementById('attention'),a=deriveAttention(t),h=deriveHealth(t),tk=t.tasks||[];
   const tone=a.items.length?'border-amber-500/30 bg-amber-500/[0.05]':'border-emerald-500/20 bg-emerald-500/[0.035]';
   const lead=a.items.length?'Needs attention':'No blockers detected';
-  const chips=[chip(h.w+' working','blue'),chip(a.running.length+' active tasks','green'),chip(a.blocked.length+' blocked',a.blocked.length?'amber':'muted'),chip(tk.filter(x=>x.status==='pending').length+' pending','muted')];
+  const chips=[chip(h.w+' working','blue'),chip(a.running.length+' active tasks','green'),(a.review?.length?chip(a.review.length+' in review','amber'):''),chip(a.blocked.length+' blocked',a.blocked.length?'amber':'muted'),chip(tk.filter(x=>x.status==='pending').length+' pending','muted')].filter(Boolean);
   let html='<div class="rounded-lg border '+tone+' px-3 py-2 flex flex-col md:flex-row md:items-center gap-2 md:gap-4">';
   html+='<div class="min-w-[180px]"><div class="text-[10px] uppercase tracking-[.16em] text-txt-500">Team attention</div><div class="text-[14px] font-semibold text-txt-100">'+lead+'</div></div>';
   html+='<div class="flex flex-wrap gap-1.5">'+chips.join('')+'</div>';
@@ -4485,7 +4591,7 @@ function rAgents(t){
   if(!mm.length){patch(el,'<div class="col-span-full text-center py-12"><div class="text-txt-400 text-sm mb-1">No agents yet</div><div class="text-txt-500 text-[11px]">Spawn teammates with <code class="px-1 py-0.5 bg-base-900 rounded font-mono text-[10px]">team_spawn</code></div></div>');return}
   const n=Date.now(),msgs=t.messages||[],sorted=[...mm].sort((a,b)=>rankAgent(a,b,t));
   const html=sorted.map((m,idx)=>{
-    const s=si(m.status,m.executionStatus),task=activeTaskFor(m.name,t.tasks||[]),msg=lastMessageFor(m.name,msgs),blocked=blockedTaskFor(m.name,t.tasks||[]);
+    const s=si(m.status,m.executionStatus),task=activeTaskFor(m.name,t.tasks||[]),msg=lastMessageFor(m.name,msgs),blocked=blockedTaskFor(m.name,t.tasks||[]),inReview=task&&task.status==='in_review';
     const d=D(n-m.timeUpdated),mi=msg?relT(msg.timeCreated):'\\u2014';
     const tt=task?.content,tr=tt&&tt.length>90?tt.slice(0,90)+'\\u2026':tt;
     const mp=msg?(msg.content.length>90?msg.content.slice(0,90)+'\\u2026':msg.content):'';
@@ -4500,7 +4606,7 @@ function rAgents(t){
         '<span class="text-[10px] text-txt-500 ml-auto shrink-0">'+E(m.agent)+'</span>'+
         (m.model?chip(E(m.model),'muted'):'')+
       '</div>'+
-      (tr?'<div class="mt-2 text-[13px] text-txt-200 leading-snug truncate">'+(blocked?'<span class="text-amber-400">Blocked: </span>':'Current task: ')+E(tr)+'</div>':'<div class="mt-2 text-[13px] text-txt-500 leading-snug">No active task</div>')+
+      (tr?'<div class="mt-2 text-[13px] text-txt-200 leading-snug truncate">'+(blocked?'<span class="text-amber-400">Blocked: </span>':inReview?'<span class="text-amber-400">In review: </span>':'Current task: ')+E(tr)+'</div>':'<div class="mt-2 text-[13px] text-txt-500 leading-snug">No active task</div>')+
       (mp?'<div class="mt-1 text-[12px] text-txt-400 truncate">Latest: '+E(mp)+'</div>':'')+
       '<div class="mt-2 flex items-center gap-1.5 flex-wrap">'+
         chip('status '+d,'muted')+chip('msg '+mi,'muted')+chip(E(m.executionStatus||m.status),sx(m))+
@@ -4686,23 +4792,26 @@ function rTasks(t){
   if(!tk.length){patch(el,'<div class="text-txt-500 text-sm py-6 text-center">No tasks yet</div>');return}
   const c=tk.filter(x=>x.status==='completed').length,pct=Math.max(Math.round(c/tk.length*100),tk.length>0?2:0);
   const allDone=c===tk.length&&tk.length>0;
-  const g={in_progress:[],pending:[],completed:[],blocked:[],cancelled:[]};for(const x of tk)(g[x.status]||(g[x.status]=[])).push(x);
+  const g={in_progress:[],in_review:[],pending:[],completed:[],blocked:[],cancelled:[]};for(const x of tk)(g[x.status]||(g[x.status]=[])).push(x);
   const ds=saveD(el);
   const taskMap={};tk.forEach(x=>{taskMap[x.id]=x});
   function grp(label,items,dc,defOpen){
     if(!items.length)return'';
     const rows=items.map(x=>{
-      const ic=x.status==='completed'?'\\u2713':x.status==='in_progress'?'\\u25CF':'\\u25CB';
-      const icl=x.status==='completed'?'text-emerald-500':x.status==='in_progress'?'text-blue-400':'text-txt-500';
+      const ic=x.status==='completed'?'\\u2713':x.status==='in_progress'?'\\u25CF':x.status==='in_review'?'\\u25C9':'\\u25CB';
+      const icl=x.status==='completed'?'text-emerald-500':x.status==='in_progress'?'text-blue-400':x.status==='in_review'?'text-amber-400':'text-txt-500';
       const p=PR[x.priority]||PR.low,cn=x.content.length>55?x.content.slice(0,55)+'\\u2026':x.content;
       let dep='';
       const depIds=Array.isArray(x.dependsOn)?x.dependsOn:(x.dependsOn?[String(x.dependsOn)]:[]);
       if(depIds.length){const labels=depIds.map(id=>{const parent=taskMap[id];return parent?parent.content.slice(0,42):id}).join(', ');dep='<div class="text-[10px] text-txt-500 mt-0.5">blocked by: '+E(labels)+'</div>'}
+      const reviewBadge=x.status==='in_review'?chip('in review','amber'):'';
+      const rejChip=(x.rejectionCount&&x.rejectionCount>0)?chip('rejections: '+x.rejectionCount,'red'):'';
+      const notes=(x.reviewNotes)?'<div class="text-[10px] text-amber-400/80 italic mt-0.5">notes: '+E(x.reviewNotes)+'</div>':'';
       return '<div class="flex items-start gap-2 py-1.5 px-1 rounded hover:bg-base-800/40 transition-colors">'+
         '<span class="'+icl+' text-[11px] mt-[2px] shrink-0">'+ic+'</span>'+
         '<div class="flex-1 min-w-0"><div class="text-[13px] text-txt-200 truncate">'+E(cn)+'</div>'+
-        '<div class="flex gap-2 mt-1 text-[10px]"><span class="rounded px-1.5 py-[0px] '+p+'">'+E(x.priority)+'</span>'+
-        '<span class="text-txt-500">'+(E(x.assignee)||'unassigned')+'</span></div>'+dep+'</div></div>';
+        '<div class="flex items-center gap-2 mt-1 text-[10px] flex-wrap"><span class="rounded px-1.5 py-[0px] '+p+'">'+E(x.priority)+'</span>'+
+        '<span class="text-txt-500">'+(E(x.assignee)||'unassigned')+'</span>'+reviewBadge+rejChip+'</div>'+dep+notes+'</div></div>';
     }).join('');
     return '<details '+(defOpen?'open':'')+'><summary class="flex items-center gap-2 text-[11px] text-txt-300 cursor-pointer py-1.5 hover:text-txt-200 transition-colors select-none">'+
       '<svg class="w-3 h-3 transition-transform [details[open]>summary>&]:rotate-90" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>'+
@@ -4715,7 +4824,7 @@ function rTasks(t){
     '<span class="text-[11px] text-txt-400 font-mono">'+c+'/'+tk.length+'</span>'+
     (allDone?'<span class="text-emerald-400 text-[10px] font-medium">All complete</span>':'')+
   '</div>'+
-  grp('In Progress',g.in_progress,'bg-blue-500',true)+grp('Pending',g.pending,'bg-txt-500',true)+grp('Blocked',g.blocked||[],'bg-amber-500',true)+grp('Completed',g.completed,'bg-emerald-500',false);
+  grp('In Progress',g.in_progress,'bg-blue-500',true)+grp('In Review',g.in_review||[],'bg-amber-500',true)+grp('Pending',g.pending,'bg-txt-500',true)+grp('Blocked',g.blocked||[],'bg-amber-500',true)+grp('Completed',g.completed,'bg-emerald-500',false);
   restD(el,ds);
 }
 
@@ -4796,7 +4905,7 @@ function buildState(db) {
   const projects = db.query("SELECT id, name, path, status, time_created, time_updated FROM project ORDER BY time_updated DESC").all();
   const teams = db.query("SELECT id, name, project_id, lead_session_id, status, lead_agent, time_created, time_updated FROM team ORDER BY time_created DESC").all();
   const memberStmt = db.query("SELECT name, agent, status, execution_status, session_id, worktree_branch, prompt, model, plan_approval, time_created, time_updated, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message FROM team_member WHERE team_id = ?");
-  const taskStmt = db.query("SELECT id, content, status, priority, assignee, depends_on, time_created, time_updated FROM team_task WHERE team_id = ?");
+  const taskStmt = db.query("SELECT id, content, status, priority, assignee, depends_on, time_created, time_updated, rejection_count, review_notes FROM team_task WHERE team_id = ?");
   const msgStmt = db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC LIMIT 50");
   const mappedTeams = teams.map((t) => {
     const members = memberStmt.all(t.id).map((m) => ({
@@ -4839,7 +4948,9 @@ function buildState(db) {
         assignee: tk.assignee,
         dependsOn: parseDependsOn(tk.depends_on),
         timeCreated: tk.time_created,
-        timeUpdated: tk.time_updated
+        timeUpdated: tk.time_updated,
+        rejectionCount: tk.rejection_count ?? 0,
+        reviewNotes: tk.review_notes ?? null
       })),
       messages: msgStmt.all(t.id).map((msg) => ({
         id: msg.id,
@@ -4880,10 +4991,27 @@ function buildState(db) {
     teams: mappedTeams
   };
 }
-function sendJson(res, data, status = 200) {
+function localOrigins(port) {
+  return [`http://localhost:${port}`, `http://127.0.0.1:${port}`, `http://[::1]:${port}`];
+}
+function corsOriginFor(port, origin) {
+  const raw = Array.isArray(origin) ? origin[0] : origin;
+  if (raw && localOrigins(port).includes(raw)) return raw;
+  return `http://localhost:${port}`;
+}
+function isTrustedLocalRequest(port, req) {
+  const host = req.headers.host;
+  if (!host || ![`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`].includes(host)) return false;
+  const origin = req.headers.origin;
+  if (origin === void 0) return true;
+  return localOrigins(port).includes(Array.isArray(origin) ? origin[0] ?? "" : origin);
+}
+var MAX_CHAT_BODY_BYTES = 64 * 1024;
+function sendJson(res, data, corsOrigin, status = 200) {
   res.writeHead(status, {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*"
+    "Access-Control-Allow-Origin": corsOrigin,
+    "Vary": "Origin"
   });
   res.end(JSON.stringify(data));
 }
@@ -4939,7 +5067,12 @@ function parseMessageParts(parts, msgInfo) {
   }
   return entries;
 }
-async function handleActivityRoute(sessionId, options, res) {
+async function handleActivityRoute(db, sessionId, options, res, corsOrigin) {
+  const member = db.query("SELECT session_id FROM team_member WHERE session_id = ?").get(sessionId);
+  if (!member) {
+    sendJson(res, { error: "Unknown session" }, corsOrigin, 404);
+    return;
+  }
   const buffer = options?.activityBuffer;
   const client = options?.client;
   const buffered = buffer?.getActivity(sessionId) ?? [];
@@ -4961,30 +5094,60 @@ async function handleActivityRoute(sessionId, options, res) {
     }
   }
   const combined = [...buffered, ...fallbackActivity].sort((a, b) => a.timestamp - b.timestamp);
-  sendJson(res, { activity: combined, session: sessionData });
+  sendJson(res, { activity: combined, session: sessionData }, corsOrigin);
 }
 function handleDashboardRequest(db, port, req, res, options) {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? `localhost:${port}`}`);
+  const corsOrigin = corsOriginFor(port, req.headers.origin);
   if (url.pathname === "/api/health") {
-    sendJson(res, { ensemble: true, pid: process.pid });
+    sendJson(res, { ensemble: true, pid: process.pid }, corsOrigin);
     return;
   }
   if (url.pathname === "/api/state") {
-    sendJson(res, buildState(db));
+    sendJson(res, buildState(db), corsOrigin);
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/chat/send") {
-    let body = "";
+    if (!isTrustedLocalRequest(port, req)) {
+      log(`dashboard:chat:forbidden host=${req.headers.host ?? "-"} origin=${req.headers.origin ?? "-"}`);
+      sendJson(res, { ok: false, error: "Forbidden" }, corsOrigin, 403);
+      return;
+    }
+    const chunks = [];
+    let received = 0;
+    let tooLarge = false;
+    req.on("error", () => {
+    });
     req.on("data", (chunk) => {
-      body += chunk;
+      if (tooLarge) return;
+      received += chunk.length;
+      if (received > MAX_CHAT_BODY_BYTES) {
+        tooLarge = true;
+        chunks.length = 0;
+        req.removeAllListeners("end");
+        req.removeAllListeners("data");
+        req.resume();
+        res.writeHead(413, {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": corsOrigin,
+          "Vary": "Origin",
+          "Connection": "close"
+        });
+        res.end(JSON.stringify({ ok: false, error: "Payload Too Large", limit: MAX_CHAT_BODY_BYTES }));
+        log(`dashboard:chat:payload-too-large limit=${MAX_CHAT_BODY_BYTES}`);
+        return;
+      }
+      chunks.push(chunk);
     });
     req.on("end", () => {
+      if (tooLarge) return;
+      const body = Buffer.concat(chunks).toString("utf8");
       try {
         const payload = JSON.parse(body);
         let text = String(payload.text || "");
         let to = payload.to ? String(payload.to) : "";
         if (!text.trim()) {
-          sendJson(res, { ok: false, error: "Empty message" }, 400);
+          sendJson(res, { ok: false, error: "Empty message" }, corsOrigin, 400);
           return;
         }
         const mentionMatch = text.match(/^@([a-zA-Z0-9_-]+)\s+/);
@@ -4996,7 +5159,7 @@ function handleDashboardRequest(db, port, req, res, options) {
         if (teamId) {
           const check = db.query("SELECT id FROM team WHERE id = ?").get(teamId);
           if (!check) {
-            sendJson(res, { ok: false, error: `Team '${teamId}' not found` }, 400);
+            sendJson(res, { ok: false, error: `Team '${teamId}' not found` }, corsOrigin, 400);
             return;
           }
         }
@@ -5005,7 +5168,7 @@ function handleDashboardRequest(db, port, req, res, options) {
           if (activeTeam) teamId = activeTeam.id;
         }
         if (!teamId) {
-          sendJson(res, { ok: false, error: "No active team found" }, 400);
+          sendJson(res, { ok: false, error: "No active team found" }, corsOrigin, 400);
           return;
         }
         const isBroadcast = !to || ["all", "todos", "broadcast"].includes(to.toLowerCase());
@@ -5028,7 +5191,7 @@ function handleDashboardRequest(db, port, req, res, options) {
         } else {
           const member = db.query("SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status NOT IN ('shutdown', 'error')").get(teamId, to);
           if (!member) {
-            sendJson(res, { ok: false, error: `Member '${to}' not found in active team` }, 404);
+            sendJson(res, { ok: false, error: `Member '${to}' not found in active team` }, corsOrigin, 404);
             return;
           }
           messageId = sendMessage(db, { teamId, from: "human", to, content: text });
@@ -5041,10 +5204,10 @@ function handleDashboardRequest(db, port, req, res, options) {
             }).catch((err) => log(`dashboard:chat direct msg failed to ${to} err=${err}`));
           }
         }
-        sendJson(res, { ok: true, messageId, recipients }, 200);
+        sendJson(res, { ok: true, messageId, recipients }, corsOrigin, 200);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        sendJson(res, { ok: false, error: msg }, 500);
+        sendJson(res, { ok: false, error: msg }, corsOrigin, 500);
       }
     });
     return;
@@ -5052,9 +5215,13 @@ function handleDashboardRequest(db, port, req, res, options) {
   const activityMatch = url.pathname?.match(/^\/api\/session\/([^/]+)\/activity$/);
   if (activityMatch) {
     const sessionId = decodeURIComponent(activityMatch[1]);
-    handleActivityRoute(sessionId, options, res).catch(() => {
+    handleActivityRoute(db, sessionId, options, res, corsOrigin).catch(() => {
       if (!res.headersSent) {
-        res.writeHead(500, { "Content-Type": "application/json" });
+        res.writeHead(500, {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": corsOrigin,
+          "Vary": "Origin"
+        });
         res.end(JSON.stringify({ error: "Failed to fetch activity" }));
       }
     });
@@ -5916,7 +6083,7 @@ var plugin = async (input) => {
               "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND status NOT IN ('ready', 'shutdown', 'error')"
             ).get(team.id).c === 0;
             const lastWake = wakeLeadTimestamps.get(team.id) ?? 0;
-            if (pending.c > 0 && !allDone && Date.now() - lastWake > WAKE_LEAD_COOLDOWN_MS) {
+            if (pending.c > 0 && !allDone && !config.silentLead && Date.now() - lastWake > WAKE_LEAD_COOLDOWN_MS) {
               wakeLeadTimestamps.set(team.id, Date.now());
               log(`wake-lead: ${pending.c} pending messages, sending promptAsync`);
               client.session.promptAsync({
@@ -6116,9 +6283,11 @@ var plugin = async (input) => {
         }
       }),
       team_tasks_complete: tool({
-        description: "Mark a task as completed on the shared board. This unblocks any tasks that depend on it.",
+        description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
         args: {
-          task_id: tool.schema.string().describe("ID of the task to mark complete")
+          task_id: tool.schema.string().describe("ID of the task to mark complete, submit for review, or reject"),
+          action: tool.schema.string().optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), or 'reject' (in_review -> in_progress)"),
+          notes: tool.schema.string().optional().describe("Review notes or rejection reason")
         },
         async execute(args, ctx) {
           const result = await executeTeamTasksComplete(deps, args, ctx.sessionID);
@@ -6253,7 +6422,11 @@ var index_default = {
 };
 export {
   index_default as default,
+  executeTeamTasksReject,
+  executeTeamTasksReview,
+  hasActivePeerDialogue,
   hasBlockedAssignedTasks,
+  hasInReviewAssignedTasks,
   shouldAlarmFastIdle,
   shouldNudgeIdleMember
 };
