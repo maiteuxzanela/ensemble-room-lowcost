@@ -1516,7 +1516,7 @@ function resolveStandbyWake(db, teamId, memberName, baseText) {
     return { text: baseText, woke: false };
   }
   const context = row.spawn_context?.trim();
-  log(`standby:wake member=${memberName} team=${teamId} context=${context ? `${context.length} chars` : "none"}`);
+  log(`standby:wake member=${memberName} team=${teamId} context=${context ? `${context.length} chars` : "none"} runtime=${!context}`);
   return {
     text: context ? `${context}
 
@@ -1583,23 +1583,61 @@ function requireCanPurgeArchivedTeams(deps, sessionId) {
 function claimTask(db, teamId, taskId, assignee) {
   const task = db.query("SELECT content, status, assignee FROM team_task WHERE id = ? AND team_id = ?").get(taskId, teamId);
   if (!task) throw new Error(`Task "${taskId}" not found`);
-  if (task.status === "blocked") throw new Error(`Task "${taskId}" is blocked by unresolved dependencies`);
-  if (task.status !== "pending") throw new Error(`Task "${taskId}" is not pending (status: ${task.status})`);
+  if (task.assignee === assignee) {
+    if (task.status === "blocked") {
+      return { content: task.content, status: "blocked", isBlocked: true };
+    }
+    if (task.status === "pending") {
+      const result2 = db.run(
+        "UPDATE team_task SET status = 'in_progress', time_updated = ? WHERE id = ? AND team_id = ? AND status = 'pending' AND assignee = ?",
+        [Date.now(), taskId, teamId, assignee]
+      );
+      if (result2.changes === 0) {
+        const current = db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?").get(taskId, teamId);
+        if (current?.status === "in_progress") {
+          return { content: task.content, status: "in_progress", isBlocked: false, alreadyInProgress: true };
+        }
+        throw new Error(`Task "${taskId}" could not be claimed (status: ${current?.status ?? "unknown"})`);
+      }
+      return { content: task.content, status: "in_progress", isBlocked: false };
+    }
+    if (task.status === "in_progress") {
+      return { content: task.content, status: "in_progress", isBlocked: false, alreadyInProgress: true };
+    }
+    throw new Error(`Task "${taskId}" cannot be claimed (status: ${task.status})`);
+  }
   if (task.assignee) throw new Error(`Task "${taskId}" is already claimed by ${task.assignee}`);
+  if (task.status === "blocked") {
+    const result2 = db.run(
+      "UPDATE team_task SET assignee = ?, time_updated = ? WHERE id = ? AND team_id = ? AND status = 'blocked' AND assignee IS NULL",
+      [assignee, Date.now(), taskId, teamId]
+    );
+    if (result2.changes === 0) {
+      throw new Error(`Task "${taskId}" is already claimed (race condition)`);
+    }
+    return { content: task.content, status: "blocked", isBlocked: true };
+  }
+  if (task.status !== "pending") throw new Error(`Task "${taskId}" is not pending (status: ${task.status})`);
   const result = db.run(
-    "UPDATE team_task SET status = 'in_progress', assignee = ?, time_updated = ? WHERE id = ? AND status = 'pending' AND assignee IS NULL",
-    [assignee, Date.now(), taskId]
+    "UPDATE team_task SET status = 'in_progress', assignee = ?, time_updated = ? WHERE id = ? AND team_id = ? AND status = 'pending' AND assignee IS NULL",
+    [assignee, Date.now(), taskId, teamId]
   );
   if (result.changes === 0) {
     throw new Error(`Task "${taskId}" is already claimed (race condition)`);
   }
-  return task.content;
+  return { content: task.content, status: "in_progress", isBlocked: false };
 }
 async function executeTeamClaim(deps, args, sessionId) {
   const teamInfo = requireTeamMember(deps, sessionId);
   const claimerName = teamInfo.role === "lead" ? "lead" : teamInfo.memberName ?? "unknown";
-  const content = claimTask(deps.db, teamInfo.teamId, args.task_id, claimerName);
-  return `Claimed task: ${content}`;
+  const result = claimTask(deps.db, teamInfo.teamId, args.task_id, claimerName);
+  if (result.isBlocked) {
+    return `Pre-claimed blocked task "${args.task_id}": "${result.content}". This task is blocked by unresolved dependencies. Stop execution and enter standby (yield) via team_standby \u2014 the runtime will automatically wake you when dependencies resolve.`;
+  }
+  if (result.alreadyInProgress) {
+    return `Task "${args.task_id}" is already in progress and assigned to you: "${result.content}".`;
+  }
+  return `Claimed task: ${result.content}`;
 }
 
 // src/tools/team-spawn.ts
@@ -1729,6 +1767,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     "team_tasks_add",
     "team_tasks_complete",
     "team_claim",
+    "team_standby",
     "team_results",
     "team_status",
     "team_view"
@@ -1850,7 +1889,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
       }
     } else {
       try {
-        claimedTaskContent = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name);
+        const claimResult = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name);
+        claimedTaskContent = claimResult.content;
         log(`spawn:claim:ok name=${args.name} task=${args.claim_task}`);
       } catch (err) {
         claimWarning = err instanceof Error ? err.message : String(err);
@@ -1898,7 +1938,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
       "Tools available to you:",
       "- team_message: send a message to the lead or another teammate",
       "- team_broadcast: send a message to all team members",
-      "- team_tasks_list: view the shared team task board"
+      "- team_tasks_list: view the shared team task board",
+      "- team_standby: yield execution and enter standby mode until unblocked or messaged"
     );
   } else {
     context.push(
@@ -1909,7 +1950,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
       "- team_tasks_list: view the shared team task board",
       "- team_tasks_add: add tasks to the shared board",
       "- team_tasks_complete: mark a task complete on the shared board",
-      "- team_claim: claim a pending task from the shared board"
+      "- team_claim: claim a pending task from the shared board",
+      "- team_standby: yield execution and enter standby mode until unblocked or messaged"
     );
   }
   if (otherMembers.length > 0) {
@@ -2193,8 +2235,12 @@ async function executeTeamBroadcast(deps, args, sessionId) {
   });
   const recipients = [];
   if (teamInfo.role !== "lead") {
-    const leadSession = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?").get(teamInfo.teamId);
-    if (leadSession) recipients.push({ name: "lead", sessionId: leadSession.lead_session_id });
+    if (!deps.config?.silentLead) {
+      const leadSession = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?").get(teamInfo.teamId);
+      if (leadSession) recipients.push({ name: "lead", sessionId: leadSession.lead_session_id });
+    } else {
+      log(`team_broadcast:lead-silenced from=${senderName}`);
+    }
   }
   const members = deps.registry.listByTeam(teamInfo.teamId);
   for (const member of members) {
@@ -2206,6 +2252,10 @@ async function executeTeamBroadcast(deps, args, sessionId) {
   let delivered = 0;
   let skipped = 0;
   for (const recipient of recipients) {
+    if (recipient.name === "lead" && deps.config?.silentLead) {
+      skipped++;
+      continue;
+    }
     if (recipient.name !== "lead" && hasReportedCompletion(deps.db, teamInfo.teamId, recipient.name)) {
       skipped++;
       continue;
@@ -2357,23 +2407,45 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
       return dep && (dep.status === "completed" || dep.status === "cancelled");
     });
     if (allResolved) {
-      deps.db.run("UPDATE team_task SET status = 'pending', time_updated = ? WHERE id = ?", [now, t.id]);
+      const nextStatus = t.assignee ? "in_progress" : "pending";
+      deps.db.run("UPDATE team_task SET status = ?, time_updated = ? WHERE id = ?", [nextStatus, now, t.id]);
       unblocked++;
-      if (t.assignee) {
-        const memberRow = deps.db.query("SELECT session_id FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, t.assignee);
+      let wakeTarget = t.assignee;
+      if (!wakeTarget) {
+        const standbyCandidate = deps.db.query(`
+          SELECT name FROM team_member
+          WHERE team_id = ? AND execution_status = 'standby'
+          AND name NOT IN (
+            SELECT assignee FROM team_task
+            WHERE team_id = ? AND assignee IS NOT NULL AND status IN ('in_progress', 'in_review', 'blocked')
+          )
+          ORDER BY time_updated ASC LIMIT 1
+        `).get(teamInfo.teamId, teamInfo.teamId);
+        if (standbyCandidate) {
+          wakeTarget = standbyCandidate.name;
+        }
+      }
+      if (wakeTarget) {
+        const memberRow = deps.db.query("SELECT session_id FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, wakeTarget);
         const memberSessionId = memberRow?.session_id;
         if (memberSessionId) {
-          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, t.assignee, `[System: Task "${t.id}" was unblocked and is ready for you to start]`);
+          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, wakeTarget, `[System: Task "${t.id}" was unblocked and is ready for you to start]`);
           if (wake.woke) {
-            const memberModel = getMemberModel(deps.db, teamInfo.teamId, t.assignee);
+            const memberModel = getMemberModel(deps.db, teamInfo.teamId, wakeTarget);
             deps.client.session.promptAsync({
               sessionID: memberSessionId,
               parts: [{ type: "text", text: wake.text }],
               agent: wake.agent,
               synthetic: true,
               ...memberModel ? { model: memberModel } : {}
-            }).catch((err) => log(`tasks-complete:wake-member:failed err=${String(err)}`));
-            log(`tasks-complete:wake-member:ok member=${t.assignee} task=${t.id}`);
+            }).catch((err) => {
+              deps.db.run(
+                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+                [Date.now(), teamInfo.teamId, wakeTarget]
+              );
+              log(`tasks-complete:wake-member:failed member=${wakeTarget} err=${String(err)}`);
+            });
+            log(`tasks-complete:wake-member:ok member=${wakeTarget} task=${t.id}`);
             wokeMembers++;
           }
         }
@@ -2429,6 +2501,32 @@ async function executeTeamTasksReview(deps, args, sessionId) {
 }
 async function executeTeamTasksReject(deps, args, sessionId) {
   return executeTeamTasksComplete(deps, { ...args, action: "reject" }, sessionId);
+}
+
+// src/tools/team-standby.ts
+init_log();
+function setMemberStandby(db, teamId, memberName, reason) {
+  const result = db.run(
+    "UPDATE team_member SET execution_status = 'standby', status = 'ready', spawn_context = NULL, time_updated = ? WHERE team_id = ? AND name = ?",
+    [Date.now(), teamId, memberName]
+  );
+  if (result.changes === 0) {
+    throw new Error(`Member "${memberName}" not found in team`);
+  }
+  log(`member:standby name=${memberName} team=${teamId}${reason ? ` reason=${reason}` : ""}`);
+}
+async function executeTeamStandby(deps, args, sessionId) {
+  const teamInfo = requireTeamMember(deps, sessionId);
+  if (teamInfo.role === "lead") {
+    throw new Error("Only teammates can enter standby mode");
+  }
+  const memberName = teamInfo.memberName;
+  if (!memberName) {
+    throw new Error("Unknown member name for session");
+  }
+  setMemberStandby(deps.db, teamInfo.teamId, memberName, args.reason);
+  const reasonStr = args.reason ? ` (reason: ${args.reason})` : "";
+  return `Entered standby mode${reasonStr}. Execution suspended until dependencies are unblocked or a new message arrives.`;
 }
 
 // src/result-parser.ts
@@ -3371,6 +3469,18 @@ async function registerV2Tools(domain, deps) {
       execute: run(executeTeamClaim)
     });
     editor.add({
+      name: "team_standby",
+      description: "Suspend active execution and enter standby mode voluntarily until unblocked or awakened by new messages or task dependencies.",
+      input: {
+        type: "object",
+        properties: {
+          reason: str("Reason for entering standby (e.g. waiting for dependencies or reviews)")
+        },
+        additionalProperties: false
+      },
+      execute: run(executeTeamStandby)
+    });
+    editor.add({
       name: "team_results",
       description: "Retrieve full message content from teammates. Returns unread messages and marks them as read. Use this after receiving a truncated message notification.",
       input: {
@@ -3931,7 +4041,12 @@ function buildTeammateSystemPrompt(db, teamId, memberName, config) {
   const team = db.query("SELECT name FROM team WHERE id = ?").get(teamId);
   if (!team) return "";
   const lines = [
-    `You are "${memberName}", a teammate in team "${team.name}". Use team_message to communicate. ${leadReportDirective(config)}`
+    `You are "${memberName}", a teammate in team "${team.name}". Use team_message to communicate. ${leadReportDirective(config)}`,
+    "",
+    "ANTI-POLLING & EVENT-DRIVEN CONTRACT:",
+    "Do NOT poll team_tasks_list or team_status in loops waiting for task unblocking or peer work.",
+    "Operate purely event-driven: claim tasks using team_claim. If a task is blocked, claiming it pre-assigns and locks it to you; then stop and enter standby via team_standby.",
+    "The runtime automatically wakes you with a synthetic system prompt when dependent tasks are unblocked or peer messages arrive."
   ];
   const pendingMessages = db.query(
     "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND to_name = ? AND delivered = 0 ORDER BY time_created ASC"
@@ -6352,6 +6467,17 @@ var plugin = async (input) => {
           return result;
         }
       }),
+      team_standby: tool({
+        description: "Suspend active execution and enter standby mode voluntarily until unblocked or awakened by new messages or task dependencies.",
+        args: {
+          reason: tool.schema.string().optional().describe("Reason for entering standby")
+        },
+        async execute(args, ctx) {
+          const result = await executeTeamStandby(deps, args, ctx.sessionID);
+          ctx.metadata({ title: "Entered standby" });
+          return result;
+        }
+      }),
       team_results: tool({
         description: "Retrieve full message content from teammates. Returns unread messages and marks them as read. Use this after receiving a truncated message notification.",
         args: {
@@ -6466,7 +6592,12 @@ var index_default = {
   server: plugin
 };
 export {
+  buildLeadSystemPrompt,
+  buildTeammateSystemPrompt,
+  claimTask,
   index_default as default,
+  executeTeamClaim,
+  executeTeamStandby,
   executeTeamTasksReject,
   executeTeamTasksReview,
   hasActivePeerDialogue,
@@ -6474,6 +6605,7 @@ export {
   hasInReviewAssignedTasks,
   hasOtherActiveMembers,
   hasPendingBoardTasks,
+  setMemberStandby,
   shouldAlarmFastIdle,
   shouldNudgeIdleMember
 };

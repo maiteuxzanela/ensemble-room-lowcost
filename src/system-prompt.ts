@@ -190,6 +190,11 @@ export function buildTeammateSystemPrompt(db: Database, teamId: string, memberNa
 
   const lines = [
     `You are "${memberName}", a teammate in team "${team.name}". Use team_message to communicate. ${leadReportDirective(config)}`,
+    "",
+    "ANTI-POLLING & EVENT-DRIVEN CONTRACT:",
+    "Do NOT poll team_tasks_list or team_status in loops waiting for task unblocking or peer work.",
+    "Operate purely event-driven: claim tasks using team_claim. If a task is blocked, claiming it pre-assigns and locks it to you; then stop and enter standby via team_standby.",
+    "The runtime automatically wakes you with a synthetic system prompt when dependent tasks are unblocked or peer messages arrive.",
   ]
 
   // Deliver pending peer messages addressed to this teammate

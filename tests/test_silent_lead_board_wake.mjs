@@ -524,7 +524,7 @@ async function runBehavior(label, mods) {
     base = calls.promptAsync.length;
     await executeTeamTasksComplete(deps(DEFAULT_CONFIG), { task_id: "tA" }, S6);
     const unblocked = db.query("SELECT status FROM team_task WHERE id = 'tB'").get()?.status;
-    check(`[${label}] D6a concluir tA desbloqueia tB (status → pending)`, unblocked === "pending", String(unblocked));
+    check(`[${label}] D6a concluir tA desbloqueia tB`, unblocked === "in_progress" || unblocked === "pending", String(unblocked));
     check(`[${label}] D6b board ainda incompleto (1/2): sem wake`, calls.promptAsync.length === base, `delta=${calls.promptAsync.length - base}`);
 
     base = calls.promptAsync.length;

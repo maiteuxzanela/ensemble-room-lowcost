@@ -122,26 +122,50 @@ export async function executeTeamTasksComplete(
     })
 
     if (allResolved) {
-      deps.db.run("UPDATE team_task SET status = 'pending', time_updated = ? WHERE id = ?", [now, t.id])
+      const nextStatus = t.assignee ? "in_progress" : "pending"
+      deps.db.run("UPDATE team_task SET status = ?, time_updated = ? WHERE id = ?", [nextStatus, now, t.id])
       unblocked++
 
-      if (t.assignee) {
+      // Wake target: the pre-assigned assignee or an unassigned standby teammate
+      let wakeTarget = t.assignee
+      if (!wakeTarget) {
+        const standbyCandidate = deps.db.query(`
+          SELECT name FROM team_member
+          WHERE team_id = ? AND execution_status = 'standby'
+          AND name NOT IN (
+            SELECT assignee FROM team_task
+            WHERE team_id = ? AND assignee IS NOT NULL AND status IN ('in_progress', 'in_review', 'blocked')
+          )
+          ORDER BY time_updated ASC LIMIT 1
+        `).get(teamInfo.teamId, teamInfo.teamId) as { name: string } | null
+        if (standbyCandidate) {
+          wakeTarget = standbyCandidate.name
+        }
+      }
+
+      if (wakeTarget) {
         const memberRow = deps.db.query("SELECT session_id FROM team_member WHERE team_id = ? AND name = ?")
-          .get(teamInfo.teamId, t.assignee) as { session_id: string } | null
+          .get(teamInfo.teamId, wakeTarget) as { session_id: string } | null
         const memberSessionId = memberRow?.session_id
 
         if (memberSessionId) {
-          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, t.assignee, `[System: Task "${t.id}" was unblocked and is ready for you to start]`)
+          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, wakeTarget, `[System: Task "${t.id}" was unblocked and is ready for you to start]`)
           if (wake.woke) {
-            const memberModel = getMemberModel(deps.db, teamInfo.teamId, t.assignee)
+            const memberModel = getMemberModel(deps.db, teamInfo.teamId, wakeTarget)
             deps.client.session.promptAsync({
               sessionID: memberSessionId,
               parts: [{ type: "text", text: wake.text }],
               agent: wake.agent,
               synthetic: true,
               ...(memberModel ? { model: memberModel } : {})
-            }).catch(err => log(`tasks-complete:wake-member:failed err=${String(err)}`))
-            log(`tasks-complete:wake-member:ok member=${t.assignee} task=${t.id}`)
+            }).catch(err => {
+              deps.db.run(
+                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+                [Date.now(), teamInfo.teamId, wakeTarget]
+              )
+              log(`tasks-complete:wake-member:failed member=${wakeTarget} err=${String(err)}`)
+            })
+            log(`tasks-complete:wake-member:ok member=${wakeTarget} task=${t.id}`)
             wokeMembers++
           }
         }

@@ -5,30 +5,21 @@ import type { Database } from "../db"
 import { log } from "../log"
 
 /**
- * Consume the standby window of a member spawned with `standby: true`.
+ * Consume the standby window of a member in standby mode.
  *
- * A standby member exists in SQLite (`status='ready'`,
- * `execution_status='standby'`) but was never prompted at birth — the complete
- * initialization prompt lives in `team_member.spawn_context` (Migration 11).
- * The FIRST delivery to that member must re-attach it, or the teammate wakes
- * with no idea which team it belongs to, who its peers are, or what its task is.
+ * Supports both:
+ * 1. Birth Standby (`team_spawn` with `standby: true`):
+ *    The member was never prompted at birth — the complete initialization
+ *    prompt lives in `team_member.spawn_context` (Migration 11). The first
+ *    delivery prepends this context so the teammate knows its role and peers.
+ * 2. Runtime Standby (`team_standby`):
+ *    The member voluntarily suspended execution at runtime. `spawn_context` is
+ *    NULL so the wake delivery sends the bare unblock/message text directly.
  *
  * Returns:
- * - `text`: `spawn_context` prepended to `baseText` when THIS call consumes the
- *   standby window, otherwise `baseText` untouched;
- * - `woke`: true only for the call that performed the transition;
- * - `agent`: the member's agent, present only on wake — spawn normally passes
- *   `agent` on the first `promptAsync`, and a standby member never received
- *   one, so the wake prompt has to carry it.
- *
- * Fail-safe by construction:
- * - unknown member or not in standby → pass-through, no write;
- * - the transition is a guarded UPDATE (`... AND execution_status='standby'`),
- *   so exactly one delivery can ever consume the window — a concurrent second
- *   message sees `changes === 0` and delivers bare text instead of prepending
- *   the context twice;
- * - a NULL/blank `spawn_context` still transitions the member and just delivers
- *   the bare message rather than throwing on a missing prepend.
+ * - `text`: `spawn_context` prepended to `baseText` when present, otherwise `baseText`;
+ * - `woke`: true only for the atomic transition `standby` -> `starting`;
+ * - `agent`: the member's agent type.
  */
 export function resolveStandbyWake(
   db: Database,
@@ -57,7 +48,7 @@ export function resolveStandbyWake(
   }
 
   const context = row.spawn_context?.trim()
-  log(`standby:wake member=${memberName} team=${teamId} context=${context ? `${context.length} chars` : "none"}`)
+  log(`standby:wake member=${memberName} team=${teamId} context=${context ? `${context.length} chars` : "none"} runtime=${!context}`)
   return {
     text: context ? `${context}\n\n${baseText}` : baseText,
     woke: true,

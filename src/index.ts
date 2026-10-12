@@ -15,6 +15,9 @@ import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation
 // fast-idle decisions against a real SQLite database without reimplementing them.
 export { shouldNudgeIdleMember, shouldAlarmFastIdle, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
 export { executeTeamTasksReview, executeTeamTasksReject } from "./tools/team-tasks-complete"
+export { executeTeamStandby, setMemberStandby } from "./tools/team-standby"
+export { executeTeamClaim, claimTask } from "./tools/team-claim"
+export { buildTeammateSystemPrompt, buildLeadSystemPrompt } from "./system-prompt"
 import { notifyTeamEvent, notifyWorkingProgress, notifyLead } from "./notify"
 import { hasReportedCompletion } from "./messaging"
 import { getMemberModel } from "./member-model"
@@ -36,6 +39,7 @@ import { executeTeamTasksList } from "./tools/team-tasks-list"
 import { executeTeamTasksAdd } from "./tools/team-tasks-add"
 import { executeTeamTasksComplete } from "./tools/team-tasks-complete"
 import { executeTeamClaim } from "./tools/team-claim"
+import { executeTeamStandby } from "./tools/team-standby"
 import { executeTeamResults } from "./tools/team-results"
 import { executeTeamStatus } from "./tools/team-status"
 import { executeTeamView } from "./tools/team-view"
@@ -554,6 +558,18 @@ const plugin: Plugin = async (input) => {
         async execute(args, ctx) {
           const result = await executeTeamClaim(deps, args, ctx.sessionID)
           ctx.metadata({ title: `Claimed task` })
+          return result
+        },
+      }),
+
+      team_standby: tool({
+        description: "Suspend active execution and enter standby mode voluntarily until unblocked or awakened by new messages or task dependencies.",
+        args: {
+          reason: tool.schema.string().optional().describe("Reason for entering standby"),
+        },
+        async execute(args, ctx) {
+          const result = await executeTeamStandby(deps, args, ctx.sessionID)
+          ctx.metadata({ title: "Entered standby" })
           return result
         },
       }),

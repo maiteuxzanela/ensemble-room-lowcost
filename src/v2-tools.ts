@@ -7,6 +7,7 @@ import { executeTeamTasksList } from "./tools/team-tasks-list"
 import { executeTeamTasksAdd } from "./tools/team-tasks-add"
 import { executeTeamTasksComplete } from "./tools/team-tasks-complete"
 import { executeTeamClaim } from "./tools/team-claim"
+import { executeTeamStandby } from "./tools/team-standby"
 import { executeTeamResults } from "./tools/team-results"
 import { executeTeamShutdown } from "./tools/team-shutdown"
 import { executeTeamCleanup } from "./tools/team-cleanup"
@@ -244,6 +245,19 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
         additionalProperties: false,
       },
       execute: run(executeTeamClaim),
+    })
+
+    editor.add({
+      name: "team_standby",
+      description: "Suspend active execution and enter standby mode voluntarily until unblocked or awakened by new messages or task dependencies.",
+      input: {
+        type: "object",
+        properties: {
+          reason: str("Reason for entering standby (e.g. waiting for dependencies or reviews)"),
+        },
+        additionalProperties: false,
+      },
+      execute: run(executeTeamStandby),
     })
 
     editor.add({

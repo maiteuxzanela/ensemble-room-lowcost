@@ -25,11 +25,15 @@ export async function executeTeamBroadcast(
   // Collect all recipient session IDs (excluding sender)
   const recipients: Array<{ name: string; sessionId: string }> = []
 
-  // Add lead if sender is not lead
+  // Add lead if sender is not lead (unless silentLead is active, where lead is delivered passively via SQLite)
   if (teamInfo.role !== "lead") {
-    const leadSession = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?")
-      .get(teamInfo.teamId) as { lead_session_id: string } | null
-    if (leadSession) recipients.push({ name: "lead", sessionId: leadSession.lead_session_id })
+    if (!deps.config?.silentLead) {
+      const leadSession = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?")
+        .get(teamInfo.teamId) as { lead_session_id: string } | null
+      if (leadSession) recipients.push({ name: "lead", sessionId: leadSession.lead_session_id })
+    } else {
+      log(`team_broadcast:lead-silenced from=${senderName}`)
+    }
   }
 
   // Add all members except sender
@@ -42,10 +46,15 @@ export async function executeTeamBroadcast(
 
   // Fire-and-forget: deliver to all recipients. Message is already persisted in DB.
   // Skip completed teammates to prevent re-waking them (issue #3).
+  // Skip lead under silentLead mode (passive SQLite accumulation).
   const baseText = `[Team broadcast from ${senderName}]: ${args.text}`
   let delivered = 0
   let skipped = 0
   for (const recipient of recipients) {
+    if (recipient.name === "lead" && deps.config?.silentLead) {
+      skipped++
+      continue
+    }
     if (recipient.name !== "lead" && hasReportedCompletion(deps.db, teamInfo.teamId, recipient.name)) {
       skipped++
       continue

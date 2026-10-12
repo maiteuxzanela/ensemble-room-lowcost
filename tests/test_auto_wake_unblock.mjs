@@ -142,9 +142,9 @@ async function runSuite() {
   
   check("Mensagem de complete reflete unblock e wake", completeMsg.includes("unblocked 1 task") && completeMsg.includes("woke 1 member"));
 
-  // 4. Validar se a Task 2 ficou pending
+  // 4. Validar se a Task 2 ficou in_progress (pré-atribuída a worker2)
   const t2_final = db.query("SELECT * FROM team_task WHERE id = ?").get(t2.id);
-  check("Task 2 foi desbloqueada para pending", t2_final.status === "pending");
+  check("Task 2 foi desbloqueada para in_progress", t2_final.status === "in_progress");
 
   // 5. Validar se o Worker2 foi acordado
   const worker_final = db.query("SELECT * FROM team_member WHERE team_id = ? AND name = 'worker2'").get(TEAM_ID);

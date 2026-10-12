@@ -202,6 +202,7 @@ export async function executeTeamSpawn(
     "team_tasks_add",
     "team_tasks_complete",
     "team_claim",
+    "team_standby",
     "team_results",
     "team_status",
     "team_view",
@@ -333,7 +334,8 @@ export async function executeTeamSpawn(
       }
     } else {
       try {
-        claimedTaskContent = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name)
+        const claimResult = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name)
+        claimedTaskContent = claimResult.content
         log(`spawn:claim:ok name=${args.name} task=${args.claim_task}`)
       } catch (err) {
         claimWarning = err instanceof Error ? err.message : String(err)
@@ -391,6 +393,7 @@ export async function executeTeamSpawn(
       "- team_message: send a message to the lead or another teammate",
       "- team_broadcast: send a message to all team members",
       "- team_tasks_list: view the shared team task board",
+      "- team_standby: yield execution and enter standby mode until unblocked or messaged",
     )
   } else {
     context.push(
@@ -401,6 +404,7 @@ export async function executeTeamSpawn(
       "- team_tasks_add: add tasks to the shared board",
       "- team_tasks_complete: mark a task complete on the shared board",
       "- team_claim: claim a pending task from the shared board",
+      "- team_standby: yield execution and enter standby mode until unblocked or messaged",
     )
   }
 
