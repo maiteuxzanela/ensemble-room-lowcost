@@ -195,6 +195,10 @@ export function buildTeammateSystemPrompt(db: Database, teamId: string, memberNa
     "Do NOT poll team_tasks_list or team_status in loops waiting for task unblocking or peer work.",
     "Operate purely event-driven: claim tasks using team_claim. If a task is blocked, claiming it pre-assigns and locks it to you; then stop and enter standby via team_standby.",
     "The runtime automatically wakes you with a synthetic system prompt when dependent tasks are unblocked or peer messages arrive.",
+    "",
+    "ANTI-DUMPING & CODE EXPLORATION CONTRACT:",
+    "Do NOT use bash grep, find, or broad shell searches across codebases.",
+    "Use strictly qmd_search or read/edit targeting specific files. Never dump files >300 lines or raw command outputs into context.",
   ]
 
   // Deliver pending peer messages addressed to this teammate

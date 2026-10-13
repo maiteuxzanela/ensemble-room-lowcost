@@ -2,9 +2,11 @@ import type { Database } from "./db"
 import type { MemberRegistry, DescendantTracker } from "./state"
 import type { PluginClient } from "./types"
 import type { EnsembleConfig } from "./config"
+import { formatModelSelector, resolveFallbackChain, selectNextFallback } from "./config"
 import { notifyLead } from "./notify"
 import { releaseMemberTasks } from "./tasks"
 import { findTeamBySession } from "./types"
+import { log } from "./log"
 
 const TEAM_TOOL_PREFIX = "team_"
 
@@ -433,4 +435,129 @@ export function handleSessionErrorEvent(
     teamInfo.teamId,
     `Teammate "${teamInfo.memberName}" had a session error: ${errMsg}. Check their session for details. They may be stuck and need investigation or shutdown.`,
   )
+}
+
+/* ------------------------------------------------------------------ *
+ * Silent model failover on rate limit (429/retry) — zero-noise policy *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Minimum interval between failover ACTIONS (a model switch or an
+ * exhausted-chain lead notification) for the same member. Retry events for
+ * one rate-limit burst arrive attempt-after-attempt (1, 2, 3…) on the SAME
+ * in-flight model — advancing the chain per attempt would burn it in
+ * seconds, and notifying per attempt would flood the lead. One action per
+ * member per window keeps the burst silent after the first decision.
+ */
+export const FAILOVER_COOLDOWN_MS = 10 * 60 * 1000
+
+/**
+ * Last failover-action timestamp per `${teamId}:${memberName}`. Module-level
+ * like team-spawn's spawnFailures — one decision per member per cooldown
+ * window is process-wide in-memory state. Exported so deterministic suites
+ * can clear/rewind it without sleeping.
+ */
+export const failoverCooldown = new Map<string, number>()
+
+/** Outcome of a rate-limit failover evaluation (see handleRetryModelFailover). */
+export interface ModelFailoverDecision {
+  /**
+   * - "switched":  model swapped to the next fallback — silent, log-only.
+   * - "suppressed": a failover action already happened within the cooldown
+   *                 window (same burst) — nothing else to do, stay silent.
+   * - "exhausted": no fallback remains (chain empty, current model is the
+   *                 last entry, or fallback equals current) — lead notified.
+   */
+  action: "switched" | "suppressed" | "exhausted"
+  memberName: string
+  teamId: string
+  /** Selector stored before this decision (null when the server default was in use). */
+  fromModel: string | null
+  /** New selector persisted — only on "switched". */
+  toModel?: string
+}
+
+/**
+ * Silent model failover for a rate-limited (429/retry) teammate session.
+ *
+ * ZERO-NOISE MANDATE: when a fallback model exists, the lead is NOT woken —
+ * the switch is a DB update plus a log line. notifyLead fires ONLY when the
+ * chain is exhausted ("exhausted"), i.e. the fallback also failed or no
+ * fallback is configured. That is the single authorized noise path.
+ *
+ * Mechanics:
+ *   1. Registry lookup gates everything — non-member sessions are no-ops.
+ *   2. Shutdown-bound members never fail over (they are leaving anyway).
+ *   3. Cooldown (FAILOVER_COOLDOWN_MS) deduplicates one burst's retry
+ *      attempts into ONE action; the server keeps retrying the in-flight
+ *      request with the old model — the switch arms every SUBSEQUENT
+ *      delivery (team_message, standby wake, watchdog re-prompt) with the
+ *      fallback, because all delivery paths read team_member.model.
+ *   4. selectNextFallback walks the config chain forward; landing on
+ *      undefined means exhaustion and authorizes the lead wake.
+ *
+ * Never throws — safe to call from event handlers.
+ */
+export function handleRetryModelFailover(
+  db: Database,
+  registry: MemberRegistry,
+  client: PluginClient,
+  config: Required<EnsembleConfig>,
+  sessionId: string,
+  retryPayload?: RetryStatusPayload,
+): ModelFailoverDecision | undefined {
+  const entry = registry.getBySession(sessionId)
+  if (!entry) return undefined
+
+  const team = db.query("SELECT status FROM team WHERE id = ?").get(entry.teamId) as { status: string } | null
+  if (!team || team.status !== "active") return undefined
+
+  const member = db.query("SELECT model, status FROM team_member WHERE team_id = ? AND name = ?")
+    .get(entry.teamId, entry.memberName) as { model: string | null; status: string } | null
+  if (!member) return undefined
+  if (member.status === "shutdown" || member.status === "shutdown_requested" || member.status === "error") {
+    return undefined
+  }
+
+  const cooldownKey = `${entry.teamId}:${entry.memberName}`
+  const now = Date.now()
+  const lastAction = failoverCooldown.get(cooldownKey)
+  if (lastAction !== undefined && now - lastAction < FAILOVER_COOLDOWN_MS) {
+    log(`failover:suppressed member=${entry.memberName} remaining_ms=${FAILOVER_COOLDOWN_MS - (now - lastAction)}`)
+    return { action: "suppressed", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model }
+  }
+
+  const chain = resolveFallbackChain(config)
+  const next = selectNextFallback(chain, member.model)
+  if (!next) {
+    // Zero-noise exception — the ONLY lead wake in this path: the fallback
+    // also failed (current model is the chain's last entry) or no fallback
+    // is configured. The lead must decide (update config / respawn).
+    failoverCooldown.set(cooldownKey, now)
+    const detail = retryPayload?.action?.message ?? retryPayload?.message ?? "rate limited"
+    const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty"
+    notifyLead(
+      client,
+      db,
+      entry.teamId,
+      `Teammate "${entry.memberName}" is rate-limited on model "${member.model ?? "default"}" and the fallback chain is exhausted (${chainDesc}). Last error: ${detail}. Update fallbackModels/modelFallback in ensemble.json or respawn the teammate on another model.`,
+    )
+    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}]`)
+    return { action: "exhausted", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model }
+  }
+
+  const toSelector = formatModelSelector(next)
+  db.run(
+    "UPDATE team_member SET model = ?, time_updated = ? WHERE team_id = ? AND name = ?",
+    [toSelector, now, entry.teamId, entry.memberName],
+  )
+  failoverCooldown.set(cooldownKey, now)
+  log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} (silent — lead not woken)`)
+  return {
+    action: "switched",
+    memberName: entry.memberName,
+    teamId: entry.teamId,
+    fromModel: member.model,
+    toModel: toSelector,
+  }
 }

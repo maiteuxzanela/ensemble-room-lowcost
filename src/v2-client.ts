@@ -135,10 +135,19 @@ export function createV2Client(ctx: V2Context, deps: V2ClientDeps = {}): PluginC
         // V2 binds model at create/admission; the shared create signature has
         // no model slot, so apply it here (spawn is the only model passer).
         // Caught live: without this, teammates inherit the server default.
+        // The OpenCode selector's `#variant` suffix (thinking level, e.g.
+        // "low" in "google/antigravity-gemini-3.8-flash#low") must ride along
+        // as ModelRef.variant — V2 resolves variant overlays server-side at
+        // switch time. Discarding it would silently drop the thinking level
+        // the fallback chain (DEFAULT_MODEL_FALLBACK) pins.
         if (options.model) {
           await ctx.session.switchModel({
             sessionID: options.sessionID,
-            model: { providerID: options.model.providerID, id: options.model.modelID },
+            model: {
+              providerID: options.model.providerID,
+              id: options.model.modelID,
+              ...(options.model.variant ? { variant: options.model.variant } : {}),
+            },
           })
         }
         const text = joinParts(options.parts)

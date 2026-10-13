@@ -1,6 +1,142 @@
 import { readFileSync } from "node:fs"
 import path from "node:path"
 
+/**
+ * Structured fallback model reference (config-level).
+ * `model` is a "provider/model" selector WITHOUT variant suffix;
+ * `variant` (e.g. "low") is carried separately so it can be forwarded to
+ * `session.promptAsync` as `model.variant`.
+ */
+export interface ModelFallbackRef {
+  model: string
+  variant?: string
+}
+
+/** Canonical default fallback: cheap, always-available model with thinking level low. */
+export const DEFAULT_MODEL_FALLBACK: Readonly<ModelFallbackRef> = Object.freeze({
+  model: "google/antigravity-gemini-3.8-flash",
+  variant: "low",
+})
+
+/** Parsed OpenCode model selector: "provider/model" + optional "#variant". */
+export interface ParsedModelSelector {
+  providerID: string
+  modelID: string
+  variant?: string
+}
+
+/**
+ * Parse an OpenCode model selector into its parts.
+ * Format: `provider/model` (model may contain additional slashes) with an
+ * optional `#variant` suffix, e.g. "google/antigravity-gemini-3.8-flash#low".
+ * Returns undefined when provider or model is empty (malformed selector).
+ * Never throws — safe for config/delivery paths.
+ */
+export function parseModelSelector(selector: string): ParsedModelSelector | undefined {
+  let base = selector
+  let variant: string | undefined
+  const hash = selector.indexOf("#")
+  if (hash >= 0) {
+    base = selector.slice(0, hash)
+    const v = selector.slice(hash + 1).trim()
+    if (v) variant = v
+  }
+  const slash = base.indexOf("/")
+  if (slash <= 0 || slash === base.length - 1) return undefined
+  const providerID = base.slice(0, slash)
+  const modelID = base.slice(slash + 1)
+  if (!providerID || !modelID) return undefined
+  return variant ? { providerID, modelID, variant } : { providerID, modelID }
+}
+
+/** Format a fallback entry back into selector form: "provider/model[#variant]". */
+export function formatModelSelector(entry: ModelFallbackRef): string {
+  return entry.variant ? `${entry.model}#${entry.variant}` : entry.model
+}
+
+/**
+ * Resolve the ordered fallback chain used when the primary model is
+ * rate-limited (429/retry). Order:
+ *   1. `fallbackModels` (if non-empty) — each entry parsed via parseModelSelector,
+ *      malformed entries skipped, duplicates collapsed.
+ *   2. `modelFallback` (if it carries a model) — tolerates a "#variant" suffix
+ *      inside `model` as well as a separate `variant` field.
+ *   3. `DEFAULT_MODEL_FALLBACK` (google/antigravity-gemini-3.8-flash, variant low) —
+ *      guarantees the chain is never empty.
+ */
+export function resolveFallbackChain(config: EnsembleConfig): ModelFallbackRef[] {
+  const chain: ModelFallbackRef[] = []
+  const seen = new Set<string>()
+
+  for (const selector of config.fallbackModels ?? []) {
+    const parsed = parseModelSelector(selector)
+    if (!parsed) continue
+    const entry: ModelFallbackRef = {
+      model: `${parsed.providerID}/${parsed.modelID}`,
+      ...(parsed.variant ? { variant: parsed.variant } : {}),
+    }
+    const key = formatModelSelector(entry)
+    if (seen.has(key)) continue
+    seen.add(key)
+    chain.push(entry)
+  }
+  if (chain.length > 0) return chain
+
+  const mf = config.modelFallback
+  if (mf?.model) {
+    const parsed = parseModelSelector(mf.model)
+    const model = parsed ? `${parsed.providerID}/${parsed.modelID}` : mf.model
+    const variant = mf.variant || parsed?.variant
+    return [variant ? { model, variant } : { model }]
+  }
+
+  return [{ model: DEFAULT_MODEL_FALLBACK.model, variant: DEFAULT_MODEL_FALLBACK.variant }]
+}
+
+/**
+ * Pick the first chain entry whose selector differs from the primary model —
+ * a fallback equal to the primary would fail over into itself. With no
+ * primary, returns the head of the chain.
+ */
+export function selectFallbackModel(
+  chain: readonly ModelFallbackRef[],
+  primary?: string,
+): ModelFallbackRef | undefined {
+  if (chain.length === 0) return undefined
+  if (!primary) return chain[0]
+  const parsed = parseModelSelector(primary)
+  const primaryKey = parsed
+    ? formatModelSelector({ model: `${parsed.providerID}/${parsed.modelID}`, ...(parsed.variant ? { variant: parsed.variant } : {}) })
+    : primary
+  return chain.find((entry) => formatModelSelector(entry) !== primaryKey)
+}
+
+/**
+ * Walk the fallback chain FORWARD from the member's CURRENT model — the
+ * retry/rate-limit failover semantics (unlike selectFallbackModel, used at
+ * spawn time):
+ *   - current matches a chain entry → the NEXT entry; undefined when the
+ *     current model is already the LAST entry — "chain exhausted", which is
+ *     the only signal that authorizes waking the lead;
+ *   - current is outside the chain → the first entry that differs from it;
+ *   - no current model → the head of the chain.
+ * Never wraps around to the head: exhausting the chain must stay observable.
+ */
+export function selectNextFallback(
+  chain: readonly ModelFallbackRef[],
+  current?: string | null,
+): ModelFallbackRef | undefined {
+  if (chain.length === 0) return undefined
+  if (!current) return chain[0]
+  const parsed = parseModelSelector(current)
+  const key = parsed
+    ? formatModelSelector({ model: `${parsed.providerID}/${parsed.modelID}`, ...(parsed.variant ? { variant: parsed.variant } : {}) })
+    : current
+  const idx = chain.findIndex((entry) => formatModelSelector(entry) === key)
+  if (idx >= 0) return chain[idx + 1]
+  return chain.find((entry) => formatModelSelector(entry) !== key)
+}
+
 /** Plugin configuration shape. All fields optional — defaults applied. */
 export interface EnsembleConfig {
   /** Auto-merge worktree branches on cleanup (default: true) */
@@ -32,6 +168,20 @@ export interface EnsembleConfig {
   /** Lead asks user about model preferences before spawning (default: false) */
   promptForModels?: boolean
   /**
+   * Ordered chain of fallback model selectors tried when the primary model is
+   * rate-limited (429/retry). Each entry uses the OpenCode selector format
+   * "provider/model" with an optional "#variant" suffix, e.g.
+   * "google/antigravity-gemini-3.8-flash#low".
+   * Empty (default) resolves to `modelFallback`; see resolveFallbackChain().
+   */
+  fallbackModels?: string[]
+  /**
+   * Structured default fallback entry (model + variant) used when
+   * `fallbackModels` is empty. Default: google/antigravity-gemini-3.8-flash
+   * with variant "low" (see DEFAULT_MODEL_FALLBACK).
+   */
+  modelFallback?: ModelFallbackRef
+  /**
    * Silence lead wake-ups coming from team_message (default: true).
    * When active, lead-bound messages are persisted in SQLite only — the
    * `promptAsync` wake is suppressed and the lead is woken exclusively by the
@@ -56,6 +206,8 @@ export const DEFAULT_CONFIG: Required<EnsembleConfig> = {
   modelsByAgent: {},
   modelAssignment: "default",
   promptForModels: false,
+  fallbackModels: [],
+  modelFallback: { model: DEFAULT_MODEL_FALLBACK.model, variant: DEFAULT_MODEL_FALLBACK.variant },
   silentLead: true,
 }
 
@@ -83,6 +235,20 @@ function readConfigFile(filePath: string): Partial<EnsembleConfig> {
     }
     if (typeof raw.modelAssignment === "string" && ["default", "rotate", "random"].includes(raw.modelAssignment)) result.modelAssignment = raw.modelAssignment as "default" | "rotate" | "random"
     if (typeof raw.promptForModels === "boolean") result.promptForModels = raw.promptForModels
+    if (
+      Array.isArray(raw.fallbackModels)
+      && raw.fallbackModels.every((m: unknown) => typeof m === "string" && m.trim().length > 0)
+    ) {
+      result.fallbackModels = raw.fallbackModels as string[]
+    }
+    if (typeof raw.modelFallback === "object" && raw.modelFallback !== null && !Array.isArray(raw.modelFallback)) {
+      const mf = raw.modelFallback as Record<string, unknown>
+      if (typeof mf.model === "string" && mf.model.trim().length > 0) {
+        result.modelFallback = typeof mf.variant === "string" && mf.variant.trim().length > 0
+          ? { model: mf.model, variant: mf.variant }
+          : { model: mf.model }
+      }
+    }
     if (typeof raw.silentLead === "boolean") result.silentLead = raw.silentLead
     return result
   } catch (err) {

@@ -54,3 +54,55 @@ export async function deliverPrompt(
 export async function interruptTeammate(port: V2SessionPort, sessionID: string): Promise<unknown> {
   return port.interrupt({ sessionID })
 }
+
+/* ------------------------------------------------------------------ *
+ * In-flight prompt delivery tracking (forced model switch, #27).
+ *
+ * A `team_message` with `model` + `force: true` must interrupt an HTTP
+ * request that is stuck awaiting a response before the turn is restarted on
+ * the new model. Each delivery registers its AbortController here so a later
+ * forced switch can cancel it. The controller's signal reaches the SDK's
+ * fetch (RequestInit.signal), so aborting tears down the pending request.
+ *
+ * Keyed by sessionID: one session has at most one live delivery at a time —
+ * a newer delivery supersedes and aborts the previous one.
+ * ------------------------------------------------------------------ */
+
+/** Live prompt deliveries, keyed by sessionID. */
+const inflight = new Map<string, AbortController>()
+
+/**
+ * Register an AbortController for a new delivery to `sessionID`, aborting any
+ * prior in-flight delivery for the same session (it is superseded). Returns
+ * the controller — pass `controller.signal` to `session.promptAsync`.
+ */
+export function trackPrompt(sessionID: string): AbortController {
+  const prior = inflight.get(sessionID)
+  if (prior && !prior.signal.aborted) prior.abort()
+  const controller = new AbortController()
+  inflight.set(sessionID, controller)
+  return controller
+}
+
+/**
+ * Abort the in-flight delivery for `sessionID`, if any. Used by the forced
+ * model switch to tear down a stuck HTTP request before restarting the turn.
+ * Returns true when a live (non-aborted) request was actually cancelled.
+ */
+export function abortInflight(sessionID: string): boolean {
+  const controller = inflight.get(sessionID)
+  if (!controller) return false
+  inflight.delete(sessionID)
+  if (controller.signal.aborted) return false
+  controller.abort()
+  return true
+}
+
+/**
+ * Stop tracking a delivery once it settled (success, failure, or abort).
+ * Only clears the map entry if it still points at this controller, so a
+ * newer delivery's controller is never dropped by a stale settle.
+ */
+export function endTracked(sessionID: string, controller: AbortController): void {
+  if (inflight.get(sessionID) === controller) inflight.delete(sessionID)
+}

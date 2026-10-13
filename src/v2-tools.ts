@@ -106,7 +106,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
           name: str("Teammate name (lowercase alphanumeric with hyphens)"),
           agent: str("Agent type (e.g. 'build', 'plan', 'explore')"),
           prompt: str("Task instructions for the teammate"),
-          model: str("Model in provider/model format (optional, uses default)"),
+          model: str("Model in provider/model format (optional, uses default). Optional '#variant' suffix, e.g. provider/model#low"),
           claim_task: str("Task ID to auto-claim for this teammate (optional)"),
           worktree: bool("Create a git worktree for file isolation (default: true, set false for read-only agents)", true),
           plan_approval: bool("Require teammate to send a plan for approval before writing files (default: false)", false),

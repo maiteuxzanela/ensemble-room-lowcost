@@ -3,6 +3,7 @@ import { resolveRecipientSession } from "../types"
 import { requireTeamMember, resolveStandbyWake } from "./shared"
 import { sendMessage, markDelivered, hasReportedCompletion } from "../messaging"
 import { parseModelId, getMemberModel } from "../member-model"
+import { trackPrompt, abortInflight, endTracked } from "../v2-session"
 import { log } from "../log"
 
 /**
@@ -76,6 +77,16 @@ export async function executeTeamMessage(
     return `Message queued for ${args.to} — they haven't been spawned yet. It will be delivered when they join the team.`
   }
   if (!recipientSessionId) throw new Error(`Recipient "${args.to}" not found in team "${teamInfo.teamName}"`)
+
+  // Forced model switch (#27): when the lead pins a model AND passes force,
+  // any in-flight delivery to this recipient is a request the old model may
+  // be stuck on. Tear it down via its AbortController so the HTTP request
+  // awaiting a response is cancelled rather than left pending, then the
+  // message below restarts the turn immediately on the new model.
+  if (args.model !== undefined && args.force) {
+    const cancelled = abortInflight(recipientSessionId)
+    log(`team_message:force-model-abort to=${args.to} session=${recipientSessionId} cancelled=${cancelled}`)
+  }
 
   // Handle plan approval/rejection
   let messageText = text
@@ -179,14 +190,29 @@ export async function executeTeamMessage(
     `[Team message from ${senderName}]: ${messageText}`,
   )
   const recipientModel = getMemberModel(deps.db, teamInfo.teamId, args.to)
+  // Register this delivery's AbortController so a later forced model switch
+  // (model + force) can tear down the HTTP request if it gets stuck. The
+  // signal reaches the SDK fetch; we clear the entry once the request settles
+  // so a completed delivery can't be "cancelled" after the fact.
+  const controller = trackPrompt(recipientSessionId)
   deps.client.session.promptAsync({
     sessionID: recipientSessionId,
     parts: [{ type: "text", text: wake.text }],
     ...(wake.agent ? { agent: wake.agent } : {}),
     ...(recipientModel ? { model: recipientModel } : {}),
+    signal: controller.signal,
   }).then(() => {
+    endTracked(recipientSessionId, controller)
     markDelivered(deps.db, msgId)
   }).catch((err) => {
+    endTracked(recipientSessionId, controller)
+    // An aborted delivery is an intentional teardown (forced model switch or
+    // supersession), not a failure — the standby window must stay consumed so
+    // the follow-up restart isn't treated as a fresh wake.
+    if (controller.signal.aborted) {
+      log(`team_message:deliver:aborted to=${args.to} (in-flight request cancelled for forced model switch)`)
+      return
+    }
     log(`team_message:deliver:failed to=${args.to} err=${err instanceof Error ? err.message : String(err)}`)
     // Fail-safe: the wake consumed the standby window but the prompt never
     // landed. Give the window back so a retry (or the undelivered-message

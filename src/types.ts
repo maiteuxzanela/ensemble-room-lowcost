@@ -63,12 +63,24 @@ export interface PluginClient {
     promptAsync(options: {
       sessionID: string
       parts: Array<{ type: "text"; text: string }>
-      model?: { providerID: string; modelID: string }
+      /**
+       * Model selector. `variant` (e.g. "low") rides along in the prompt body —
+       * the SDK spreads the options into the POST body, and the server resolves
+       * variant overlays at request time (mirrors the plugin `chat.message`
+       * hook, which already surfaces `variant`).
+       */
+      model?: { providerID: string; modelID: string; variant?: string }
       agent?: string
       tools?: Record<string, boolean>
       system?: string
       /** V2: deliver as a synthetic (system) message instead of a user prompt. */
       synthetic?: boolean
+      /**
+       * Abort signal for the underlying HTTP request. Reaching the SDK's
+       * fetch as `RequestInit.signal`, so aborting tears down a pending
+       * delivery (used by the forced model switch in team_message).
+       */
+      signal?: AbortSignal
     }): Promise<unknown>
     abort(options: { sessionID: string }): Promise<unknown>
     status(): Promise<{ data?: Record<string, { type: string }> }>

@@ -7,13 +7,13 @@ import { deliverPrompt, type V2SessionPort } from "./v2-session"
 import type { V2Context } from "./v2-client"
 import { createV2Client } from "./v2-client"
 import { registerV2Tools } from "./v2-tools"
-import type { ToolDeps } from "./types"
+import type { PluginClient, ToolDeps } from "./types"
 import { ProgressTracker } from "./progress"
 import { checkToolIsolation, shouldNudgeIdleMember } from "./hooks"
 import { hasReportedCompletion } from "./messaging"
 import { rehydrateRegistry } from "./recovery"
 import { findTeamBySession } from "./types"
-import { loadConfig } from "./config"
+import { loadConfig, type EnsembleConfig } from "./config"
 import { TokenBucket } from "./rate-limit"
 import { ActivityBuffer, recordFromToolBefore, recordFromToolAfter } from "./activity"
 import { buildLeadSystemPrompt, buildTeammateSystemPrompt, buildTeamCompactionContext } from "./system-prompt"
@@ -160,8 +160,14 @@ export async function setupEnsemble(
   })
   const controller = new AbortController()
 
+  // Silent rate-limit failover context — the client is created AFTER the live
+  // event loop below starts (TDZ guard), so dispatch reads this holder, which
+  // is assigned once createV2Client lands. Until then retry events fall back
+  // to persist-only behavior (no failover, no crash).
+  let failoverCtx: { client: PluginClient; config: Required<EnsembleConfig> } | undefined
+
   const dispatch = async (event: V2EventLike): Promise<void> => {
-    const transition = dispatchV2Event(db, registry, tracker, event)
+    const transition = dispatchV2Event(db, registry, tracker, event, failoverCtx)
     // Idle-without-report nudge (parity with V1): a member that went idle
     // without ever messaging the lead gets ONE reminder to report via
     // team_message. Without this, weak models finish silently and the lead
@@ -324,6 +330,9 @@ export async function setupEnsemble(
   await ctx.shell.hook("create.before", () => undefined)
 
   const client = createV2Client(ctx, rpc ? { rpcEmitter: rpc } : {})
+  // Arm silent failover now that the client exists — retry events from here
+  // on can switch a rate-limited member's model without waking the lead.
+  failoverCtx = { client, config }
   const deps: ToolDeps = {
     db,
     registry,

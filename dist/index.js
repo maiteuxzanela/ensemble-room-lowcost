@@ -708,6 +708,147 @@ var PendingPurgeApprovals = class {
   }
 };
 
+// src/config.ts
+import { readFileSync } from "node:fs";
+import path2 from "node:path";
+var DEFAULT_MODEL_FALLBACK = Object.freeze({
+  model: "google/antigravity-gemini-3.8-flash",
+  variant: "low"
+});
+function parseModelSelector(selector) {
+  let base = selector;
+  let variant;
+  const hash = selector.indexOf("#");
+  if (hash >= 0) {
+    base = selector.slice(0, hash);
+    const v = selector.slice(hash + 1).trim();
+    if (v) variant = v;
+  }
+  const slash = base.indexOf("/");
+  if (slash <= 0 || slash === base.length - 1) return void 0;
+  const providerID = base.slice(0, slash);
+  const modelID = base.slice(slash + 1);
+  if (!providerID || !modelID) return void 0;
+  return variant ? { providerID, modelID, variant } : { providerID, modelID };
+}
+function formatModelSelector(entry) {
+  return entry.variant ? `${entry.model}#${entry.variant}` : entry.model;
+}
+function resolveFallbackChain(config) {
+  const chain = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const selector of config.fallbackModels ?? []) {
+    const parsed = parseModelSelector(selector);
+    if (!parsed) continue;
+    const entry = {
+      model: `${parsed.providerID}/${parsed.modelID}`,
+      ...parsed.variant ? { variant: parsed.variant } : {}
+    };
+    const key = formatModelSelector(entry);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    chain.push(entry);
+  }
+  if (chain.length > 0) return chain;
+  const mf = config.modelFallback;
+  if (mf?.model) {
+    const parsed = parseModelSelector(mf.model);
+    const model = parsed ? `${parsed.providerID}/${parsed.modelID}` : mf.model;
+    const variant = mf.variant || parsed?.variant;
+    return [variant ? { model, variant } : { model }];
+  }
+  return [{ model: DEFAULT_MODEL_FALLBACK.model, variant: DEFAULT_MODEL_FALLBACK.variant }];
+}
+function selectFallbackModel(chain, primary) {
+  if (chain.length === 0) return void 0;
+  if (!primary) return chain[0];
+  const parsed = parseModelSelector(primary);
+  const primaryKey = parsed ? formatModelSelector({ model: `${parsed.providerID}/${parsed.modelID}`, ...parsed.variant ? { variant: parsed.variant } : {} }) : primary;
+  return chain.find((entry) => formatModelSelector(entry) !== primaryKey);
+}
+function selectNextFallback(chain, current) {
+  if (chain.length === 0) return void 0;
+  if (!current) return chain[0];
+  const parsed = parseModelSelector(current);
+  const key = parsed ? formatModelSelector({ model: `${parsed.providerID}/${parsed.modelID}`, ...parsed.variant ? { variant: parsed.variant } : {} }) : current;
+  const idx = chain.findIndex((entry) => formatModelSelector(entry) === key);
+  if (idx >= 0) return chain[idx + 1];
+  return chain.find((entry) => formatModelSelector(entry) !== key);
+}
+var DEFAULT_CONFIG = {
+  mergeOnCleanup: true,
+  stallThresholdMs: 3e5,
+  stallMinSteps: 5,
+  stallTokenThreshold: 200,
+  timeoutMs: 30 * 60 * 1e3,
+  rateLimitCapacity: 10,
+  dashboardPort: 4747,
+  peerMessageLimit: 5,
+  peerMessageWindowMs: 3e5,
+  defaultModel: "",
+  modelPool: [],
+  modelsByAgent: {},
+  modelAssignment: "default",
+  promptForModels: false,
+  fallbackModels: [],
+  modelFallback: { model: DEFAULT_MODEL_FALLBACK.model, variant: DEFAULT_MODEL_FALLBACK.variant },
+  silentLead: true
+};
+function readConfigFile(filePath) {
+  try {
+    const text = readFileSync(filePath, "utf-8");
+    const raw = JSON.parse(text);
+    const result = {};
+    if (typeof raw.mergeOnCleanup === "boolean") result.mergeOnCleanup = raw.mergeOnCleanup;
+    if (typeof raw.stallThresholdMs === "number") result.stallThresholdMs = raw.stallThresholdMs;
+    if (typeof raw.stallMinSteps === "number") result.stallMinSteps = raw.stallMinSteps;
+    if (typeof raw.stallTokenThreshold === "number") result.stallTokenThreshold = raw.stallTokenThreshold;
+    if (typeof raw.timeoutMs === "number") result.timeoutMs = raw.timeoutMs;
+    if (typeof raw.rateLimitCapacity === "number") result.rateLimitCapacity = raw.rateLimitCapacity;
+    if (typeof raw.dashboardPort === "number") result.dashboardPort = raw.dashboardPort;
+    if (typeof raw.peerMessageLimit === "number") result.peerMessageLimit = raw.peerMessageLimit;
+    if (typeof raw.peerMessageWindowMs === "number") result.peerMessageWindowMs = raw.peerMessageWindowMs;
+    if (typeof raw.defaultModel === "string") result.defaultModel = raw.defaultModel;
+    if (Array.isArray(raw.modelPool) && raw.modelPool.every((m) => typeof m === "string")) result.modelPool = raw.modelPool;
+    if (typeof raw.modelsByAgent === "object" && raw.modelsByAgent !== null && !Array.isArray(raw.modelsByAgent)) {
+      const valid = Object.entries(raw.modelsByAgent).every(([, v]) => typeof v === "string");
+      if (valid) result.modelsByAgent = raw.modelsByAgent;
+    }
+    if (typeof raw.modelAssignment === "string" && ["default", "rotate", "random"].includes(raw.modelAssignment)) result.modelAssignment = raw.modelAssignment;
+    if (typeof raw.promptForModels === "boolean") result.promptForModels = raw.promptForModels;
+    if (Array.isArray(raw.fallbackModels) && raw.fallbackModels.every((m) => typeof m === "string" && m.trim().length > 0)) {
+      result.fallbackModels = raw.fallbackModels;
+    }
+    if (typeof raw.modelFallback === "object" && raw.modelFallback !== null && !Array.isArray(raw.modelFallback)) {
+      const mf = raw.modelFallback;
+      if (typeof mf.model === "string" && mf.model.trim().length > 0) {
+        result.modelFallback = typeof mf.variant === "string" && mf.variant.trim().length > 0 ? { model: mf.model, variant: mf.variant } : { model: mf.model };
+      }
+    }
+    if (typeof raw.silentLead === "boolean") result.silentLead = raw.silentLead;
+    return result;
+  } catch (err) {
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return {};
+    console.warn(`[ensemble] Invalid config at ${filePath}, using defaults`);
+    return {};
+  }
+}
+function loadConfig(projectDir) {
+  const homeDir = process.env.HOME ?? process.env.USERPROFILE ?? "";
+  const globalPath = path2.join(homeDir, ".config", "opencode", "ensemble.json");
+  const projectPath = path2.join(projectDir, ".opencode", "ensemble.json");
+  const global = readConfigFile(globalPath);
+  const project = readConfigFile(projectPath);
+  const merged = { ...DEFAULT_CONFIG, ...global, ...project };
+  const timeout = process.env.OPENCODE_ENSEMBLE_TIMEOUT;
+  if (timeout !== void 0) merged.timeoutMs = timeout === "0" ? 0 : parseInt(timeout, 10) || merged.timeoutMs;
+  const rateLimit = process.env.OPENCODE_ENSEMBLE_RATE_LIMIT;
+  if (rateLimit !== void 0) merged.rateLimitCapacity = rateLimit === "0" ? 0 : parseInt(rateLimit, 10) || merged.rateLimitCapacity;
+  const stall = process.env.STALL_THRESHOLD_MS;
+  if (stall !== void 0) merged.stallThresholdMs = stall === "0" ? 0 : parseInt(stall, 10) || merged.stallThresholdMs;
+  return merged;
+}
+
 // src/util.ts
 var NAME_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
 var counter = 0;
@@ -909,6 +1050,7 @@ function resolveRecipientSession(db, registry, teamId, recipientName) {
 }
 
 // src/hooks.ts
+init_log();
 var TEAM_TOOL_PREFIX = "team_";
 function handleSessionStatusEvent(db, registry, sessionId, status, retryPayload) {
   const entry = registry.getBySession(sessionId);
@@ -1081,9 +1223,67 @@ function handleSessionErrorEvent(db, registry, client, sessionId, error) {
     `Teammate "${teamInfo.memberName}" had a session error: ${errMsg}. Check their session for details. They may be stuck and need investigation or shutdown.`
   );
 }
+var FAILOVER_COOLDOWN_MS = 10 * 60 * 1e3;
+var failoverCooldown = /* @__PURE__ */ new Map();
+function handleRetryModelFailover(db, registry, client, config, sessionId, retryPayload) {
+  const entry = registry.getBySession(sessionId);
+  if (!entry) return void 0;
+  const team = db.query("SELECT status FROM team WHERE id = ?").get(entry.teamId);
+  if (!team || team.status !== "active") return void 0;
+  const member = db.query("SELECT model, status FROM team_member WHERE team_id = ? AND name = ?").get(entry.teamId, entry.memberName);
+  if (!member) return void 0;
+  if (member.status === "shutdown" || member.status === "shutdown_requested" || member.status === "error") {
+    return void 0;
+  }
+  const cooldownKey = `${entry.teamId}:${entry.memberName}`;
+  const now = Date.now();
+  const lastAction = failoverCooldown.get(cooldownKey);
+  if (lastAction !== void 0 && now - lastAction < FAILOVER_COOLDOWN_MS) {
+    log(`failover:suppressed member=${entry.memberName} remaining_ms=${FAILOVER_COOLDOWN_MS - (now - lastAction)}`);
+    return { action: "suppressed", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model };
+  }
+  const chain = resolveFallbackChain(config);
+  const next = selectNextFallback(chain, member.model);
+  if (!next) {
+    failoverCooldown.set(cooldownKey, now);
+    const detail = retryPayload?.action?.message ?? retryPayload?.message ?? "rate limited";
+    const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty";
+    notifyLead(
+      client,
+      db,
+      entry.teamId,
+      `Teammate "${entry.memberName}" is rate-limited on model "${member.model ?? "default"}" and the fallback chain is exhausted (${chainDesc}). Last error: ${detail}. Update fallbackModels/modelFallback in ensemble.json or respawn the teammate on another model.`
+    );
+    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}]`);
+    return { action: "exhausted", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model };
+  }
+  const toSelector = formatModelSelector(next);
+  db.run(
+    "UPDATE team_member SET model = ?, time_updated = ? WHERE team_id = ? AND name = ?",
+    [toSelector, now, entry.teamId, entry.memberName]
+  );
+  failoverCooldown.set(cooldownKey, now);
+  log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} (silent \u2014 lead not woken)`);
+  return {
+    action: "switched",
+    memberName: entry.memberName,
+    teamId: entry.teamId,
+    fromModel: member.model,
+    toModel: toSelector
+  };
+}
 
 // src/v2-events.ts
-function dispatchV2Event(db, registry, tracker, event) {
+function coerceRetryPayload(raw) {
+  if (typeof raw !== "object" || raw === null || raw.type !== "retry") return void 0;
+  return {
+    attempt: typeof raw.attempt === "number" ? raw.attempt : 0,
+    message: typeof raw.message === "string" ? raw.message : "rate limited",
+    next: typeof raw.next === "number" ? raw.next : Date.now(),
+    ...raw.action ? { action: raw.action } : {}
+  };
+}
+function dispatchV2Event(db, registry, tracker, event, failoverCtx) {
   const data = event.data ?? {};
   switch (event.type) {
     case "session.status": {
@@ -1093,7 +1293,12 @@ function dispatchV2Event(db, registry, tracker, event) {
         return handleSessionStatusEvent(db, registry, data.sessionID ?? "", status);
       }
       if (status === "retry") {
-        return handleSessionStatusEvent(db, registry, data.sessionID ?? "", "retry");
+        const payload = coerceRetryPayload(raw);
+        const transition = handleSessionStatusEvent(db, registry, data.sessionID ?? "", "retry", payload);
+        if (failoverCtx) {
+          handleRetryModelFailover(db, registry, failoverCtx.client, failoverCtx.config, data.sessionID ?? "", payload);
+        }
+        return transition;
       }
       return void 0;
     }
@@ -1114,11 +1319,16 @@ function dispatchV2Event(db, registry, tracker, event) {
       if (!data.sessionID) return void 0;
       const attempt = typeof data.attempt === "number" ? data.attempt : 0;
       const next = typeof data.at === "number" ? data.at : Date.now();
-      return handleSessionStatusEvent(db, registry, data.sessionID, "retry", {
+      const payload = {
         attempt,
         message: data.error?.message ?? "rate limited",
         next
-      });
+      };
+      const transition = handleSessionStatusEvent(db, registry, data.sessionID, "retry", payload);
+      if (failoverCtx) {
+        handleRetryModelFailover(db, registry, failoverCtx.client, failoverCtx.config, data.sessionID, payload);
+      }
+      return transition;
     }
     default:
       return void 0;
@@ -1128,6 +1338,25 @@ function dispatchV2Event(db, registry, tracker, event) {
 // src/v2-session.ts
 async function deliverPrompt(port, sessionID, text) {
   return port.prompt({ sessionID, text, delivery: "queue" });
+}
+var inflight = /* @__PURE__ */ new Map();
+function trackPrompt(sessionID) {
+  const prior = inflight.get(sessionID);
+  if (prior && !prior.signal.aborted) prior.abort();
+  const controller = new AbortController();
+  inflight.set(sessionID, controller);
+  return controller;
+}
+function abortInflight(sessionID) {
+  const controller = inflight.get(sessionID);
+  if (!controller) return false;
+  inflight.delete(sessionID);
+  if (controller.signal.aborted) return false;
+  controller.abort();
+  return true;
+}
+function endTracked(sessionID, controller) {
+  if (inflight.get(sessionID) === controller) inflight.delete(sessionID);
 }
 
 // src/v2-client.ts
@@ -1187,7 +1416,11 @@ function createV2Client(ctx, deps = {}) {
         if (options.model) {
           await ctx.session.switchModel({
             sessionID: options.sessionID,
-            model: { providerID: options.model.providerID, id: options.model.modelID }
+            model: {
+              providerID: options.model.providerID,
+              id: options.model.modelID,
+              ...options.model.variant ? { variant: options.model.variant } : {}
+            }
           });
         }
         const text = joinParts(options.parts);
@@ -1267,9 +1500,14 @@ function createV2Client(ctx, deps = {}) {
 
 // src/member-model.ts
 function parseModelId(model) {
-  const slash = model.indexOf("/");
-  if (slash <= 0 || slash === model.length - 1) return void 0;
-  return { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) };
+  const hash = model.indexOf("#");
+  const variant = hash >= 0 ? model.slice(hash + 1) : void 0;
+  const base = hash >= 0 ? model.slice(0, hash) : model;
+  const slash = base.indexOf("/");
+  if (slash <= 0 || slash === base.length - 1) return void 0;
+  const parsed = { providerID: base.slice(0, slash), modelID: base.slice(slash + 1) };
+  if (variant) parsed.variant = variant;
+  return parsed;
 }
 function getMemberModel(db, teamId, memberName) {
   const row = db.query("SELECT model FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
@@ -1790,6 +2028,20 @@ async function executeTeamSpawn(deps, args, sessionId) {
   permission.push(
     ...TEAM_TOOLS.map((t) => ({ permission: t, pattern: "*", action: "allow" }))
   );
+  const DENIED_TEAMMATE_TOOLS = [
+    "team_create",
+    "team_cleanup",
+    "team_merge",
+    "team_shutdown",
+    "openchamber",
+    "openchamber_web",
+    "task",
+    "todowrite",
+    "needle_verify_delivery"
+  ];
+  permission.push(
+    ...DENIED_TEAMMATE_TOOLS.map((t) => ({ permission: t, pattern: "*", action: "deny" }))
+  );
   permission.push({ permission: "execute", pattern: "*", action: "allow" });
   let childSessionId;
   try {
@@ -1845,6 +2097,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
   const memberCount = deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId).c;
   const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config);
   if (resolvedModel) log(`spawn:model name=${args.name} model=${resolvedModel}`);
+  const fallbackModel = selectFallbackModel(resolveFallbackChain(deps.config), resolvedModel);
+  if (fallbackModel) log(`spawn:fallback name=${args.name} fallback=${formatModelSelector(fallbackModel)}`);
   deps.db.run(
     `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, time_created, time_updated)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -2010,6 +2264,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
     "- Send ONE message to the lead via team_message describing the specific blocker.",
     "- Do NOT attempt workarounds or make assumptions. Wait for the lead's response.",
     "",
+    "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted read/edit or qmd_search. Keep command outputs concise.",
+    "",
     "Your plain text output is NOT visible to the team. You MUST use team_message to communicate."
   );
   context.push(
@@ -2028,7 +2284,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     );
     log(`spawn:standby:context-saved name=${args.name} chars=${contextStr.length}`);
   }
-  const modelParam = resolvedModel ? parseModelId(resolvedModel) : void 0;
+  const modelParam = resolvedModel ? parseModelSelector(resolvedModel) : void 0;
   if (resolvedModel && !modelParam) {
     log(`spawn:model:invalid name=${args.name} model=${resolvedModel} \u2014 expected "provider/model" format, falling back to default`);
   }
@@ -2135,6 +2391,10 @@ async function executeTeamMessage(deps, args, sessionId) {
     return `Message queued for ${args.to} \u2014 they haven't been spawned yet. It will be delivered when they join the team.`;
   }
   if (!recipientSessionId) throw new Error(`Recipient "${args.to}" not found in team "${teamInfo.teamName}"`);
+  if (args.model !== void 0 && args.force) {
+    const cancelled = abortInflight(recipientSessionId);
+    log(`team_message:force-model-abort to=${args.to} session=${recipientSessionId} cancelled=${cancelled}`);
+  }
   let messageText = text;
   if (args.approve || args.reject) {
     if (args.approve && args.reject) {
@@ -2203,14 +2463,22 @@ async function executeTeamMessage(deps, args, sessionId) {
     `[Team message from ${senderName}]: ${messageText}`
   );
   const recipientModel = getMemberModel(deps.db, teamInfo.teamId, args.to);
+  const controller = trackPrompt(recipientSessionId);
   deps.client.session.promptAsync({
     sessionID: recipientSessionId,
     parts: [{ type: "text", text: wake.text }],
     ...wake.agent ? { agent: wake.agent } : {},
-    ...recipientModel ? { model: recipientModel } : {}
+    ...recipientModel ? { model: recipientModel } : {},
+    signal: controller.signal
   }).then(() => {
+    endTracked(recipientSessionId, controller);
     markDelivered(deps.db, msgId);
   }).catch((err) => {
+    endTracked(recipientSessionId, controller);
+    if (controller.signal.aborted) {
+      log(`team_message:deliver:aborted to=${args.to} (in-flight request cancelled for forced model switch)`);
+      return;
+    }
     log(`team_message:deliver:failed to=${args.to} err=${err instanceof Error ? err.message : String(err)}`);
     if (wake.woke) {
       deps.db.run(
@@ -3337,7 +3605,7 @@ async function registerV2Tools(domain, deps) {
           name: str("Teammate name (lowercase alphanumeric with hyphens)"),
           agent: str("Agent type (e.g. 'build', 'plan', 'explore')"),
           prompt: str("Task instructions for the teammate"),
-          model: str("Model in provider/model format (optional, uses default)"),
+          model: str("Model in provider/model format (optional, uses default). Optional '#variant' suffix, e.g. provider/model#low"),
           claim_task: str("Task ID to auto-claim for this teammate (optional)"),
           worktree: bool("Create a git worktree for file isolation (default: true, set false for read-only agents)", true),
           plan_approval: bool("Require teammate to send a plan for approval before writing files (default: false)", false),
@@ -3687,72 +3955,6 @@ var ProgressTracker = class {
   }
 };
 
-// src/config.ts
-import { readFileSync } from "node:fs";
-import path2 from "node:path";
-var DEFAULT_CONFIG = {
-  mergeOnCleanup: true,
-  stallThresholdMs: 3e5,
-  stallMinSteps: 5,
-  stallTokenThreshold: 200,
-  timeoutMs: 30 * 60 * 1e3,
-  rateLimitCapacity: 10,
-  dashboardPort: 4747,
-  peerMessageLimit: 5,
-  peerMessageWindowMs: 3e5,
-  defaultModel: "",
-  modelPool: [],
-  modelsByAgent: {},
-  modelAssignment: "default",
-  promptForModels: false,
-  silentLead: true
-};
-function readConfigFile(filePath) {
-  try {
-    const text = readFileSync(filePath, "utf-8");
-    const raw = JSON.parse(text);
-    const result = {};
-    if (typeof raw.mergeOnCleanup === "boolean") result.mergeOnCleanup = raw.mergeOnCleanup;
-    if (typeof raw.stallThresholdMs === "number") result.stallThresholdMs = raw.stallThresholdMs;
-    if (typeof raw.stallMinSteps === "number") result.stallMinSteps = raw.stallMinSteps;
-    if (typeof raw.stallTokenThreshold === "number") result.stallTokenThreshold = raw.stallTokenThreshold;
-    if (typeof raw.timeoutMs === "number") result.timeoutMs = raw.timeoutMs;
-    if (typeof raw.rateLimitCapacity === "number") result.rateLimitCapacity = raw.rateLimitCapacity;
-    if (typeof raw.dashboardPort === "number") result.dashboardPort = raw.dashboardPort;
-    if (typeof raw.peerMessageLimit === "number") result.peerMessageLimit = raw.peerMessageLimit;
-    if (typeof raw.peerMessageWindowMs === "number") result.peerMessageWindowMs = raw.peerMessageWindowMs;
-    if (typeof raw.defaultModel === "string") result.defaultModel = raw.defaultModel;
-    if (Array.isArray(raw.modelPool) && raw.modelPool.every((m) => typeof m === "string")) result.modelPool = raw.modelPool;
-    if (typeof raw.modelsByAgent === "object" && raw.modelsByAgent !== null && !Array.isArray(raw.modelsByAgent)) {
-      const valid = Object.entries(raw.modelsByAgent).every(([, v]) => typeof v === "string");
-      if (valid) result.modelsByAgent = raw.modelsByAgent;
-    }
-    if (typeof raw.modelAssignment === "string" && ["default", "rotate", "random"].includes(raw.modelAssignment)) result.modelAssignment = raw.modelAssignment;
-    if (typeof raw.promptForModels === "boolean") result.promptForModels = raw.promptForModels;
-    if (typeof raw.silentLead === "boolean") result.silentLead = raw.silentLead;
-    return result;
-  } catch (err) {
-    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return {};
-    console.warn(`[ensemble] Invalid config at ${filePath}, using defaults`);
-    return {};
-  }
-}
-function loadConfig(projectDir) {
-  const homeDir = process.env.HOME ?? process.env.USERPROFILE ?? "";
-  const globalPath = path2.join(homeDir, ".config", "opencode", "ensemble.json");
-  const projectPath = path2.join(projectDir, ".opencode", "ensemble.json");
-  const global = readConfigFile(globalPath);
-  const project = readConfigFile(projectPath);
-  const merged = { ...DEFAULT_CONFIG, ...global, ...project };
-  const timeout = process.env.OPENCODE_ENSEMBLE_TIMEOUT;
-  if (timeout !== void 0) merged.timeoutMs = timeout === "0" ? 0 : parseInt(timeout, 10) || merged.timeoutMs;
-  const rateLimit = process.env.OPENCODE_ENSEMBLE_RATE_LIMIT;
-  if (rateLimit !== void 0) merged.rateLimitCapacity = rateLimit === "0" ? 0 : parseInt(rateLimit, 10) || merged.rateLimitCapacity;
-  const stall = process.env.STALL_THRESHOLD_MS;
-  if (stall !== void 0) merged.stallThresholdMs = stall === "0" ? 0 : parseInt(stall, 10) || merged.stallThresholdMs;
-  return merged;
-}
-
 // src/rate-limit.ts
 var TokenBucket = class {
   tokens;
@@ -4046,7 +4248,11 @@ function buildTeammateSystemPrompt(db, teamId, memberName, config) {
     "ANTI-POLLING & EVENT-DRIVEN CONTRACT:",
     "Do NOT poll team_tasks_list or team_status in loops waiting for task unblocking or peer work.",
     "Operate purely event-driven: claim tasks using team_claim. If a task is blocked, claiming it pre-assigns and locks it to you; then stop and enter standby via team_standby.",
-    "The runtime automatically wakes you with a synthetic system prompt when dependent tasks are unblocked or peer messages arrive."
+    "The runtime automatically wakes you with a synthetic system prompt when dependent tasks are unblocked or peer messages arrive.",
+    "",
+    "ANTI-DUMPING & CODE EXPLORATION CONTRACT:",
+    "Do NOT use bash grep, find, or broad shell searches across codebases.",
+    "Use strictly qmd_search or read/edit targeting specific files. Never dump files >300 lines or raw command outputs into context."
   ];
   const pendingMessages = db.query(
     "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND to_name = ? AND delivered = 0 ORDER BY time_created ASC"
@@ -5604,8 +5810,9 @@ async function setupEnsemble(ctx, options = {}) {
     refillIntervalMs: 1e3
   });
   const controller = new AbortController();
+  let failoverCtx;
   const dispatch = async (event) => {
-    const transition = dispatchV2Event(db, registry, tracker, event);
+    const transition = dispatchV2Event(db, registry, tracker, event, failoverCtx);
     if (transition && transition.to === "ready" && transition.from === "busy") {
       const entry = registry.getByName(transition.teamId, transition.memberName);
       if (entry) nudgeMember(transition.teamId, transition.memberName, entry.sessionId);
@@ -5717,6 +5924,7 @@ async function setupEnsemble(ctx, options = {}) {
   });
   await ctx.shell.hook("create.before", () => void 0);
   const client = createV2Client(ctx, rpc ? { rpcEmitter: rpc } : {});
+  failoverCtx = { client, config };
   const deps = {
     db,
     registry,
@@ -6202,10 +6410,12 @@ var plugin = async (input) => {
           } else if (transition.to === "busy") {
             progressTracker.recordBusyStart(sessionID);
           } else if (transition.to === "retry") {
+            const failover = handleRetryModelFailover(db, registry, client, config, sessionID, retryPayload);
+            const failoverInfo = failover?.action === "switched" ? ` \u2014 switched to ${failover.toModel}` : failover?.action === "exhausted" ? " \u2014 no fallback model left, lead notified" : "";
             try {
               await client.tui.showToast({
                 title: "Team",
-                message: `${transition.memberName} is being rate-limited`,
+                message: `${transition.memberName} is being rate-limited${failoverInfo}`,
                 variant: "warning",
                 duration: 3e3
               });
@@ -6592,6 +6802,7 @@ var index_default = {
   server: plugin
 };
 export {
+  FAILOVER_COOLDOWN_MS,
   buildLeadSystemPrompt,
   buildTeammateSystemPrompt,
   claimTask,
@@ -6600,6 +6811,8 @@ export {
   executeTeamStandby,
   executeTeamTasksReject,
   executeTeamTasksReview,
+  failoverCooldown,
+  handleRetryModelFailover,
   hasActivePeerDialogue,
   hasBlockedAssignedTasks,
   hasInReviewAssignedTasks,

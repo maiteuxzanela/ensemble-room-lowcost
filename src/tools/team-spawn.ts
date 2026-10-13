@@ -4,7 +4,12 @@ import { requireLead } from "./shared"
 import { claimTask } from "./team-claim"
 import { notifyLead } from "../notify"
 import { releaseMemberTasks } from "../tasks"
-import { parseModelId } from "../member-model"
+import {
+  formatModelSelector,
+  parseModelSelector,
+  resolveFallbackChain,
+  selectFallbackModel,
+} from "../config"
 import { log } from "../log"
 import type { EnsembleConfig } from "../config"
 import { getTeamResourceParts, teamWorktreeName } from "./merge-helper"
@@ -229,6 +234,22 @@ export async function executeTeamSpawn(
     ...TEAM_TOOLS.map(t => ({ permission: t, pattern: "*", action: "allow" as const })),
   )
 
+  // Deny lead-only and out-of-scope tools for teammates to eliminate tool schema bloat
+  const DENIED_TEAMMATE_TOOLS = [
+    "team_create",
+    "team_cleanup",
+    "team_merge",
+    "team_shutdown",
+    "openchamber",
+    "openchamber_web",
+    "task",
+    "todowrite",
+    "needle_verify_delivery",
+  ] as const
+  permission.push(
+    ...DENIED_TEAMMATE_TOOLS.map(t => ({ permission: t, pattern: "*", action: "deny" as const })),
+  )
+
   // Code Mode is the invocation path for plugin tools on V2 — without this,
   // read-only agents (deny-all policies like explore's) cannot reach any
   // team tool. Safe: nested calls inside execute still enforce their own
@@ -284,6 +305,13 @@ export async function executeTeamSpawn(
   const memberCount = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId) as { c: number }).c
   const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config)
   if (resolvedModel) log(`spawn:model name=${args.name} model=${resolvedModel}`)
+
+  // Resolve the rate-limit fallback chain (fallbackModels → modelFallback →
+  // google/antigravity-gemini-3.8-flash#low). Persisted nowhere: the chain is
+  // config-derived, so every delivery path recomputes the same result. The
+  // first entry differing from the primary is the one silent failover uses.
+  const fallbackModel = selectFallbackModel(resolveFallbackChain(deps.config), resolvedModel)
+  if (fallbackModel) log(`spawn:fallback name=${args.name} fallback=${formatModelSelector(fallbackModel)}`)
 
   deps.db.run(
     `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, time_created, time_updated)
@@ -466,6 +494,8 @@ export async function executeTeamSpawn(
     "- Send ONE message to the lead via team_message describing the specific blocker.",
     "- Do NOT attempt workarounds or make assumptions. Wait for the lead's response.",
     "",
+    "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted read/edit or qmd_search. Keep command outputs concise.",
+    "",
     "Your plain text output is NOT visible to the team. You MUST use team_message to communicate.",
   )
 
@@ -494,8 +524,11 @@ export async function executeTeamSpawn(
     log(`spawn:standby:context-saved name=${args.name} chars=${contextStr.length}`)
   }
 
-  // Model was already resolved before DB insert — just parse for promptAsync
-  const modelParam = resolvedModel ? parseModelId(resolvedModel) : undefined
+  // Model was already resolved before DB insert — just parse for promptAsync.
+  // parseModelSelector strips an optional "#variant" suffix so selectors like
+  // "google/antigravity-gemini-3.8-flash#low" reach the server as
+  // { providerID, modelID, variant: "low" } instead of a corrupted modelID.
+  const modelParam = resolvedModel ? parseModelSelector(resolvedModel) : undefined
   if (resolvedModel && !modelParam) {
     log(`spawn:model:invalid name=${args.name} model=${resolvedModel} — expected "provider/model" format, falling back to default`)
   }

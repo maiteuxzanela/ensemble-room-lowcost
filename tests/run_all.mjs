@@ -35,6 +35,10 @@ const SUITES = [
   { file: "test_auto_wake_unblock.mjs", label: "Auto-Wake de Subagentes no Desbloqueio" },
   { file: "test_cyclic_graph_loop.mjs", label: "Grafos Cíclicos & Trava da Guardiã Clara" },
   { file: "test_runtime_standby_unblock.mjs", label: "Runtime Standby & Auto-Wake Unblock" },
+  { file: "test_force_model_abort.mjs", label: "AbortController & Forced Model Switch" },
+  { file: "test_fallback_models.mjs", label: "Schema de Fallback de Modelo" },
+  { file: "test_rate_limit_failover.mjs", label: "Rate-Limit Failover Silencioso" },
+  { file: "test_failover_integration.mjs", label: "Integração do Failover + Variant no switchModel V2" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

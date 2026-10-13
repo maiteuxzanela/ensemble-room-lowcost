@@ -10,10 +10,13 @@ import { wrapThrowingClient } from "./client"
 import { recoverStaleMembers, recoverUndeliveredMessages, recoverOrphanedWorktrees, recoverOrphanedBranches, recoverOrphanedTeams, rehydrateRegistry } from "./recovery"
 import { MemberRegistry, DescendantTracker, PendingPurgeApprovals } from "./state"
 import { isWorktreeInstance } from "./util"
-import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, shouldAlarmFastIdle, handleSessionErrorEvent, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
+import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, shouldAlarmFastIdle, handleSessionErrorEvent, handleRetryModelFailover, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
 // Re-exported so test harnesses (and the dist bundle) can exercise the nudge /
 // fast-idle decisions against a real SQLite database without reimplementing them.
 export { shouldNudgeIdleMember, shouldAlarmFastIdle, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
+// Silent rate-limit failover (zero-noise) — exported for the deterministic
+// suites to drive and inspect the cooldown map without wall-clock sleeps.
+export { handleRetryModelFailover, failoverCooldown, FAILOVER_COOLDOWN_MS } from "./hooks"
 export { executeTeamTasksReview, executeTeamTasksReject } from "./tools/team-tasks-complete"
 export { executeTeamStandby, setMemberStandby } from "./tools/team-standby"
 export { executeTeamClaim, claimTask } from "./tools/team-claim"
@@ -240,11 +243,19 @@ const plugin: Plugin = async (input) => {
             // never detected as stalled until that call itself returns.
             progressTracker.recordBusyStart(sessionID)
           } else if (transition.to === "retry") {
-            // Teammate is being rate-limited — notify user
+            // Teammate is being rate-limited — evaluate SILENT model failover
+            // FIRST (zero-noise: "switched"/"suppressed" never wake the lead;
+            // only chain exhaustion does, inside handleRetryModelFailover).
+            const failover = handleRetryModelFailover(db, registry, client, config, sessionID, retryPayload)
+            const failoverInfo = failover?.action === "switched"
+              ? ` — switched to ${failover.toModel}`
+              : failover?.action === "exhausted"
+                ? " — no fallback model left, lead notified"
+                : ""
             try {
               await client.tui.showToast({
                 title: "Team",
-                message: `${transition.memberName} is being rate-limited`,
+                message: `${transition.memberName} is being rate-limited${failoverInfo}`,
                 variant: "warning",
                 duration: 3000,
               })
