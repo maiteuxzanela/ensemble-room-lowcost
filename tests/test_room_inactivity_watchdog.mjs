@@ -149,6 +149,12 @@ check(
   check("0.7 zero primitivas de mock no bundle", violations === 0);
 }
 
+check(
+  "0.8 guarda defensiva de membros ocupados implementada (src e dist)",
+  srcWatchdog.includes("status = 'busy' OR execution_status IN ('starting', 'running')") &&
+    distRaw.includes("status = 'busy' OR execution_status IN ('starting', 'running')"),
+);
+
 /* ================================================================== *
  * FIXTURES E TRANSPORTE DE SAÍDA                                     *
  * ================================================================== */
@@ -323,6 +329,53 @@ async function runRoomInactivityBehavior(label, mods) {
   calls.promptAsync.length = 0;
   await wd.checkRoomInactivity();
   check(`[${label}] 4.2 Sala ativa recentemente (< 30s): watchdog NÃO dispara`, calls.promptAsync.length === 0);
+
+  /* ================================================================ *
+   * 4.B MEMBRO ATIVAMENTE OCUPADO NA SALA: SUPRIME WAKE DA CLARA     *
+   * ================================================================ */
+  // Resetar mensagens para o passado para simular ociosidade da sala (> 30s)
+  db.run("UPDATE team_message SET time_created = ? WHERE team_id = ?", [inactiveTimestamp, TEAM]);
+  db.run("UPDATE team_member SET last_nudged_at = NULL, time_updated = ? WHERE team_id = ?", [inactiveTimestamp, TEAM]);
+
+  // Cenário 4.3: dev com status = 'busy' (executando tarefa longa)
+  db.run("UPDATE team_member SET status = 'busy', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = 'dev'", [inactiveTimestamp, TEAM]);
+  calls.promptAsync.length = 0;
+  await wd.checkRoomInactivity();
+  check(
+    `[${label}] 4.3 Membro com status = 'busy': watchdog NÃO dispara wake da Clara (zero wake)`,
+    calls.promptAsync.length === 0,
+    `calls=${calls.promptAsync.length}`,
+  );
+
+  // Cenário 4.4: dev com execution_status = 'running'
+  db.run("UPDATE team_member SET status = 'ready', execution_status = 'running', time_updated = ? WHERE team_id = ? AND name = 'dev'", [inactiveTimestamp, TEAM]);
+  calls.promptAsync.length = 0;
+  await wd.checkRoomInactivity();
+  check(
+    `[${label}] 4.4 Membro com execution_status = 'running': watchdog NÃO dispara wake da Clara (zero wake)`,
+    calls.promptAsync.length === 0,
+    `calls=${calls.promptAsync.length}`,
+  );
+
+  // Cenário 4.5: dev com execution_status = 'starting'
+  db.run("UPDATE team_member SET status = 'ready', execution_status = 'starting', time_updated = ? WHERE team_id = ? AND name = 'dev'", [inactiveTimestamp, TEAM]);
+  calls.promptAsync.length = 0;
+  await wd.checkRoomInactivity();
+  check(
+    `[${label}] 4.5 Membro com execution_status = 'starting': watchdog NÃO dispara wake da Clara (zero wake)`,
+    calls.promptAsync.length === 0,
+    `calls=${calls.promptAsync.length}`,
+  );
+
+  // Cenário 4.6: dev volta para 'ready' e 'idle' (não ocupado) -> agora a Clara DEVE ser acordada
+  db.run("UPDATE team_member SET status = 'ready', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = 'dev'", [inactiveTimestamp, TEAM]);
+  calls.promptAsync.length = 0;
+  await wd.checkRoomInactivity();
+  check(
+    `[${label}] 4.6 Membro em idle/ready (não ocupado): watchdog volta a disparar wake para a Clara`,
+    calls.promptAsync.length === 1,
+    `calls=${calls.promptAsync.length}`,
+  );
 
   /* ================================================================ *
    * 5. TODAS AS TAREFAS COMPLETAS/CANCELADAS: NÃO DISPARA             *

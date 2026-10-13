@@ -17,6 +17,7 @@ export { shouldNudgeIdleMember, shouldAlarmFastIdle, hasBlockedAssignedTasks, ha
 // Silent rate-limit failover (zero-noise) — exported for the deterministic
 // suites to drive and inspect the cooldown map without wall-clock sleeps.
 export { handleRetryModelFailover, failoverCooldown, FAILOVER_COOLDOWN_MS } from "./hooks"
+export { trackPrompt, abortInflight, endTracked } from "./v2-session"
 export { executeTeamTasksReview, executeTeamTasksReject } from "./tools/team-tasks-complete"
 export { executeTeamStandby, setMemberStandby } from "./tools/team-standby"
 export { executeTeamClaim, claimTask } from "./tools/team-claim"
@@ -250,7 +251,17 @@ const plugin: Plugin = async (input) => {
             // Teammate is being rate-limited — evaluate SILENT model failover
             // FIRST (zero-noise: "switched"/"suppressed" never wake the lead;
             // only chain exhaustion does, inside handleRetryModelFailover).
-            const failover = handleRetryModelFailover(db, registry, client, config, sessionID, retryPayload)
+            const failover = await handleRetryModelFailover(
+              db,
+              registry,
+              client,
+              config,
+              sessionID,
+              retryPayload,
+            ).catch((err) => {
+              log(`failover:event:failed session=${sessionID} err=${err instanceof Error ? err.message : String(err)}`)
+              return undefined
+            })
             const failoverInfo = failover?.action === "switched"
               ? ` — switched to ${failover.toModel}`
               : failover?.action === "exhausted"

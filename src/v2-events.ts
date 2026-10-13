@@ -2,6 +2,7 @@ import type { Database } from "./db"
 import type { MemberRegistry, DescendantTracker } from "./state"
 import type { PluginClient } from "./types"
 import type { EnsembleConfig } from "./config"
+import { log } from "./log"
 import {
   handleRetryModelFailover,
   handleSessionCreatedEvent,
@@ -84,7 +85,16 @@ export function dispatchV2Event(
         const payload = coerceRetryPayload(raw)
         const transition = handleSessionStatusEvent(db, registry, data.sessionID ?? "", "retry", payload)
         if (failoverCtx) {
-          handleRetryModelFailover(db, registry, failoverCtx.client, failoverCtx.config, data.sessionID ?? "", payload)
+          handleRetryModelFailover(
+            db,
+            registry,
+            failoverCtx.client,
+            failoverCtx.config,
+            data.sessionID ?? "",
+            payload,
+          ).catch((err) => {
+            log(`v2:failover:failed session=${data.sessionID} err=${err instanceof Error ? err.message : String(err)}`)
+          })
         }
         return transition
       }
@@ -116,7 +126,16 @@ export function dispatchV2Event(
       }
       const transition = handleSessionStatusEvent(db, registry, data.sessionID, "retry", payload)
       if (failoverCtx) {
-        handleRetryModelFailover(db, registry, failoverCtx.client, failoverCtx.config, data.sessionID, payload)
+        handleRetryModelFailover(
+          db,
+          registry,
+          failoverCtx.client,
+          failoverCtx.config,
+          data.sessionID,
+          payload,
+        ).catch((err) => {
+          log(`v2:failover:failed session=${data.sessionID} err=${err instanceof Error ? err.message : String(err)}`)
+        })
       }
       return transition
     }

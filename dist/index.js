@@ -708,6 +708,9 @@ var PendingPurgeApprovals = class {
   }
 };
 
+// src/v2-events.ts
+init_log();
+
 // src/config.ts
 import { readFileSync } from "node:fs";
 import path2 from "node:path";
@@ -874,6 +877,30 @@ function lastRoomActivity(db, teamId) {
   const team = db.query("SELECT time_created FROM team WHERE id = ?").get(teamId);
   if (typeof team?.time_created === "number" && Number.isFinite(team.time_created)) return team.time_created;
   return 0;
+}
+
+// src/v2-session.ts
+async function deliverPrompt(port, sessionID, text) {
+  return port.prompt({ sessionID, text, delivery: "queue" });
+}
+var inflight = /* @__PURE__ */ new Map();
+function trackPrompt(sessionID) {
+  const prior = inflight.get(sessionID);
+  if (prior && !prior.signal.aborted) prior.abort();
+  const controller = new AbortController();
+  inflight.set(sessionID, controller);
+  return controller;
+}
+function abortInflight(sessionID) {
+  const controller = inflight.get(sessionID);
+  if (!controller) return false;
+  inflight.delete(sessionID);
+  if (controller.signal.aborted) return false;
+  controller.abort();
+  return true;
+}
+function endTracked(sessionID, controller) {
+  if (inflight.get(sessionID) === controller) inflight.delete(sessionID);
 }
 
 // src/util.ts
@@ -1252,7 +1279,7 @@ function handleSessionErrorEvent(db, registry, client, sessionId, error) {
 }
 var FAILOVER_COOLDOWN_MS = 10 * 60 * 1e3;
 var failoverCooldown = /* @__PURE__ */ new Map();
-function handleRetryModelFailover(db, registry, client, config, sessionId, retryPayload) {
+async function handleRetryModelFailover(db, registry, client, config, sessionId, retryPayload) {
   const entry = registry.getBySession(sessionId);
   if (!entry) return void 0;
   const team = db.query("SELECT status FROM team WHERE id = ?").get(entry.teamId);
@@ -1291,6 +1318,33 @@ function handleRetryModelFailover(db, registry, client, config, sessionId, retry
   );
   failoverCooldown.set(cooldownKey, now);
   log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} (silent \u2014 lead not woken)`);
+  const cancelled = abortInflight(sessionId);
+  log(`failover:abort-inflight member=${entry.memberName} session=${sessionId} cancelled=${cancelled}`);
+  if (typeof client.session?.abort === "function") {
+    try {
+      await client.session.abort({ sessionID: sessionId });
+    } catch (err) {
+      log(`failover:abort:failed member=${entry.memberName} session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  const parsedModel = parseModelSelector(toSelector);
+  if (typeof client.session?.promptAsync === "function") {
+    try {
+      await client.session.promptAsync({
+        sessionID: sessionId,
+        parts: [
+          {
+            type: "text",
+            text: `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`
+          }
+        ],
+        ...parsedModel ? { model: parsedModel } : {},
+        synthetic: true
+      });
+    } catch (err) {
+      log(`failover:promptAsync:failed member=${entry.memberName} session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   return {
     action: "switched",
     memberName: entry.memberName,
@@ -1323,7 +1377,16 @@ function dispatchV2Event(db, registry, tracker, event, failoverCtx) {
         const payload = coerceRetryPayload(raw);
         const transition = handleSessionStatusEvent(db, registry, data.sessionID ?? "", "retry", payload);
         if (failoverCtx) {
-          handleRetryModelFailover(db, registry, failoverCtx.client, failoverCtx.config, data.sessionID ?? "", payload);
+          handleRetryModelFailover(
+            db,
+            registry,
+            failoverCtx.client,
+            failoverCtx.config,
+            data.sessionID ?? "",
+            payload
+          ).catch((err) => {
+            log(`v2:failover:failed session=${data.sessionID} err=${err instanceof Error ? err.message : String(err)}`);
+          });
         }
         return transition;
       }
@@ -1353,37 +1416,22 @@ function dispatchV2Event(db, registry, tracker, event, failoverCtx) {
       };
       const transition = handleSessionStatusEvent(db, registry, data.sessionID, "retry", payload);
       if (failoverCtx) {
-        handleRetryModelFailover(db, registry, failoverCtx.client, failoverCtx.config, data.sessionID, payload);
+        handleRetryModelFailover(
+          db,
+          registry,
+          failoverCtx.client,
+          failoverCtx.config,
+          data.sessionID,
+          payload
+        ).catch((err) => {
+          log(`v2:failover:failed session=${data.sessionID} err=${err instanceof Error ? err.message : String(err)}`);
+        });
       }
       return transition;
     }
     default:
       return void 0;
   }
-}
-
-// src/v2-session.ts
-async function deliverPrompt(port, sessionID, text) {
-  return port.prompt({ sessionID, text, delivery: "queue" });
-}
-var inflight = /* @__PURE__ */ new Map();
-function trackPrompt(sessionID) {
-  const prior = inflight.get(sessionID);
-  if (prior && !prior.signal.aborted) prior.abort();
-  const controller = new AbortController();
-  inflight.set(sessionID, controller);
-  return controller;
-}
-function abortInflight(sessionID) {
-  const controller = inflight.get(sessionID);
-  if (!controller) return false;
-  inflight.delete(sessionID);
-  if (controller.signal.aborted) return false;
-  controller.abort();
-  return true;
-}
-function endTracked(sessionID, controller) {
-  if (inflight.get(sessionID) === controller) inflight.delete(sessionID);
 }
 
 // src/v2-client.ts
@@ -1434,9 +1482,6 @@ function createV2Client(ctx, deps = {}) {
         return { data: { id: created.id } };
       },
       promptAsync: async (options) => {
-        if (options.synthetic) {
-          return ctx.session.synthetic({ sessionID: options.sessionID, text: joinParts(options.parts), delivery: "queue" });
-        }
         if (options.agent) {
           await ctx.session.switchAgent({ sessionID: options.sessionID, agent: options.agent });
         }
@@ -1449,6 +1494,9 @@ function createV2Client(ctx, deps = {}) {
               ...options.model.variant ? { variant: options.model.variant } : {}
             }
           });
+        }
+        if (options.synthetic) {
+          return ctx.session.synthetic({ sessionID: options.sessionID, text: joinParts(options.parts), delivery: "queue" });
         }
         const text = joinParts(options.parts);
         return ctx.session.prompt({ sessionID: options.sessionID, text, delivery: "queue" });
@@ -6324,6 +6372,10 @@ var Watchdog = class _Watchdog {
       ).get(team.id);
       const unfinishedCount = taskCountRow?.count ?? 0;
       if (unfinishedCount === 0) continue;
+      const busyMember = this.db.query(
+        "SELECT name FROM team_member WHERE team_id = ? AND name != 'clara' AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
+      ).get(team.id);
+      if (busyMember) continue;
       const lastActivity = lastRoomActivity(this.db, team.id);
       if (lastActivity <= 0) continue;
       const inactiveMs = now - lastActivity;
@@ -6600,7 +6652,17 @@ var plugin = async (input) => {
           } else if (transition.to === "busy") {
             progressTracker.recordBusyStart(sessionID);
           } else if (transition.to === "retry") {
-            const failover = handleRetryModelFailover(db, registry, client, config, sessionID, retryPayload);
+            const failover = await handleRetryModelFailover(
+              db,
+              registry,
+              client,
+              config,
+              sessionID,
+              retryPayload
+            ).catch((err) => {
+              log(`failover:event:failed session=${sessionID} err=${err instanceof Error ? err.message : String(err)}`);
+              return void 0;
+            });
             const failoverInfo = failover?.action === "switched" ? ` \u2014 switched to ${failover.toModel}` : failover?.action === "exhausted" ? " \u2014 no fallback model left, lead notified" : "";
             try {
               await client.tui.showToast({
@@ -6994,10 +7056,12 @@ var index_default = {
 export {
   FAILOVER_COOLDOWN_MS,
   Watchdog,
+  abortInflight,
   buildLeadSystemPrompt,
   buildTeammateSystemPrompt,
   claimTask,
   index_default as default,
+  endTracked,
   executeTeamClaim,
   executeTeamStandby,
   executeTeamTasksReject,
@@ -7012,5 +7076,6 @@ export {
   lastRoomActivity,
   setMemberStandby,
   shouldAlarmFastIdle,
-  shouldNudgeIdleMember
+  shouldNudgeIdleMember,
+  trackPrompt
 };

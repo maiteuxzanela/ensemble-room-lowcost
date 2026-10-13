@@ -133,14 +133,17 @@ async function runSuite() {
   };
   const leadWakes = [];
   const client = {
-    // notifyLead acorda o Lead via promptAsync; gravamos para provar zero-noise.
-    session: { promptAsync: async (o) => { leadWakes.push(o); return {}; } },
+    // notifyLead acorda o Lead via promptAsync; gravamos para provar zero-noise no Lead.
+    session: {
+      promptAsync: async (o) => { if (o.sessionID === "ses_lead") leadWakes.push(o); return {}; },
+      abort: async () => ({}),
+    },
     tui: { showToast: async () => ({}) },
   };
   const config = { ...DEFAULT_CONFIG, fallbackModels: [FALLBACK_MODEL] };
 
   /* ---------------- 2. Cenário: rate limit no modelo primário ---------------- */
-  const decision = handleRetryModelFailover(
+  const decision = await handleRetryModelFailover(
     db, registry, client, config, MEMBER_SESSION, { message: "429 rate limited" },
   );
 

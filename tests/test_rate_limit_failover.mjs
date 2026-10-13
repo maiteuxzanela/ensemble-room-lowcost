@@ -175,12 +175,12 @@ function makeDb() {
 
 /** Transport recorder — same seam homologado nas suítes existentes. */
 function makeClient() {
-  const calls = { promptAsync: [], showToast: [] };
+  const calls = { promptAsync: [], showToast: [], abort: [] };
   return {
     calls,
     session: {
       promptAsync: async (options) => { calls.promptAsync.push(options); return undefined; },
-      abort: async () => { throw new Error("unexpected session.abort in failover path"); },
+      abort: async (options) => { calls.abort.push(options); return undefined; },
       create: async () => { throw new Error("unexpected session.create in failover path"); },
     },
     tui: {
@@ -233,7 +233,7 @@ const leadMessages = (db, teamId) =>
     attempt: 1, message: "429 rate limited", next: Date.now() + 30_000,
   });
 
-  const decision = handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, {
+  const decision = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, {
     attempt: 1, message: "429 rate limited", next: Date.now() + 30_000,
   });
 
@@ -247,9 +247,9 @@ const leadMessages = (db, teamId) =>
     getMember(db, seed.teamId, seed.memberName).model === "google/antigravity-gemini-3.8-flash#low",
   );
   check(
-    "A3: ZERO-NOISE — nenhum promptAsync (lead não acordado) e nenhum toast",
-    client.calls.promptAsync.length === 0 && client.calls.showToast.length === 0,
-    `promptAsync=${client.calls.promptAsync.length} showToast=${client.calls.showToast.length}`,
+    "A3: ZERO-NOISE — nenhum promptAsync no lead (lead não acordado) e nenhum toast",
+    !client.calls.promptAsync.some((c) => c.sessionID === LEAD_SESSION) && client.calls.showToast.length === 0,
+    `leadWakes=${client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length} showToast=${client.calls.showToast.length}`,
   );
   check(
     "A4: ZERO-NOISE — nenhuma team_message persistida",
@@ -258,6 +258,12 @@ const leadMessages = (db, teamId) =>
   check(
     "A5: cooldown registrado para a chave do membro",
     failoverCooldown.has(`${seed.teamId}:${seed.memberName}`),
+  );
+  check(
+    "A6: FAILOVER ATIVO — abort e promptAsync disparados para a sessão do membro",
+    client.calls.abort.some((c) => c.sessionID === seed.sessionId)
+      && client.calls.promptAsync.some((c) => c.sessionID === seed.sessionId && c.synthetic === true),
+    `abort=${client.calls.abort.length} promptAsync=${client.calls.promptAsync.length}`,
   );
   db.close();
   failoverCooldown.clear();
@@ -272,9 +278,9 @@ const leadMessages = (db, teamId) =>
   const seed = seedMember(db, { memberName: "bia", sessionId: "sess-bia" });
   const cfg = { ...DEFAULT_CONFIG };
 
-  const first = handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 1, message: "429", next: Date.now() });
-  const second = handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 2, message: "429", next: Date.now() });
-  const third = handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 3, message: "429", next: Date.now() });
+  const first = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 1, message: "429", next: Date.now() });
+  const second = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 2, message: "429", next: Date.now() });
+  const third = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 3, message: "429", next: Date.now() });
 
   check(
     "B1: 1º retry → 'switched'; 2º e 3º (mesmo burst) → 'suppressed'",
@@ -286,8 +292,8 @@ const leadMessages = (db, teamId) =>
     getMember(db, seed.teamId, seed.memberName).model === "google/antigravity-gemini-3.8-flash#low",
   );
   check(
-    "B3: suppressed mantém zero-noise total",
-    client.calls.promptAsync.length === 0 && leadMessages(db, seed.teamId).length === 0,
+    "B3: suppressed mantém zero-noise total (zero wake no lead)",
+    !client.calls.promptAsync.some((c) => c.sessionID === LEAD_SESSION) && leadMessages(db, seed.teamId).length === 0,
   );
   db.close();
   failoverCooldown.clear();
@@ -306,7 +312,7 @@ const leadMessages = (db, teamId) =>
   });
   const cfg = { ...DEFAULT_CONFIG };
 
-  const decision = handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, {
+  const decision = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, {
     attempt: 1, message: "429 exceeded quota", next: Date.now() + 60_000,
   });
 
@@ -317,10 +323,9 @@ const leadMessages = (db, teamId) =>
   );
   check(
     "C2: EXATAMENTE 1 wake do lead (promptAsync synthetic na sessão do lead)",
-    client.calls.promptAsync.length === 1
-      && client.calls.promptAsync[0].sessionID === LEAD_SESSION
-      && client.calls.promptAsync[0].synthetic === true,
-    `wakes=${client.calls.promptAsync.length}`,
+    client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length === 1
+      && client.calls.promptAsync.find((c) => c.sessionID === LEAD_SESSION)?.synthetic === true,
+    `wakes=${client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length}`,
   );
   check(
     "C3: EXATAMENTE 1 team_message persistida system→lead (única exceção de ruído)",
@@ -336,10 +341,12 @@ const leadMessages = (db, teamId) =>
   );
 
   // Retry repetido no mesmo burst NÃO spama o lead (cooldown após a ação).
-  const again = handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 2, message: "429", next: Date.now() });
+  const again = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 2, message: "429", next: Date.now() });
   check(
     "C6: retry seguinte no burst → 'suppressed', lead NÃO é acordado de novo",
-    again?.action === "suppressed" && client.calls.promptAsync.length === 1 && leadMessages(db, seed.teamId).length === 1,
+    again?.action === "suppressed"
+      && client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length === 1
+      && leadMessages(db, seed.teamId).length === 1,
   );
   db.close();
   failoverCooldown.clear();
@@ -357,12 +364,12 @@ const leadMessages = (db, teamId) =>
   });
   const cfg = { ...DEFAULT_CONFIG, fallbackModels: ["prov/fb1#low", "prov/fb2"] };
 
-  const first = handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 1, message: "429", next: Date.now() });
+  const first = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 1, message: "429", next: Date.now() });
   // Simula término do cooldown (determinístico — sem sleep).
   failoverCooldown.set(`${seed.teamId}:${seed.memberName}`, Date.now() - FAILOVER_COOLDOWN_MS - 1_000);
-  const second = handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 1, message: "429", next: Date.now() });
+  const second = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 1, message: "429", next: Date.now() });
   failoverCooldown.set(`${seed.teamId}:${seed.memberName}`, Date.now() - FAILOVER_COOLDOWN_MS - 1_000);
-  const third = handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 1, message: "429", next: Date.now() });
+  const third = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 1, message: "429", next: Date.now() });
 
   check(
     "D1: primary → fb1#low → fb2 → esgotado (caminhamento progressivo)",
@@ -373,8 +380,8 @@ const leadMessages = (db, teamId) =>
   );
   check(
     "D2: apenas o esgotamento acorda o lead (1 wake, 1 mensagem)",
-    client.calls.promptAsync.length === 1 && leadMessages(db, seed.teamId).length === 1,
-    `wakes=${client.calls.promptAsync.length} msgs=${leadMessages(db, seed.teamId).length}`,
+    client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length === 1 && leadMessages(db, seed.teamId).length === 1,
+    `wakes=${client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length} msgs=${leadMessages(db, seed.teamId).length}`,
   );
   db.close();
   failoverCooldown.clear();
@@ -390,21 +397,21 @@ const leadMessages = (db, teamId) =>
 
   check(
     "E1: sessão não registrada → undefined, zero ação",
-    handleRetryModelFailover(db, new MemberRegistry(), client, cfg, "ghost-session") === undefined
-      && client.calls.promptAsync.length === 0,
+    (await handleRetryModelFailover(db, new MemberRegistry(), client, cfg, "ghost-session")) === undefined
+      && !client.calls.promptAsync.some((c) => c.sessionID === LEAD_SESSION),
   );
 
   const archived = seedMember(db, { teamId: "team-arch", memberName: "eva", sessionId: "sess-eva", teamStatus: "archived" });
   check(
     "E2: time arquivado → undefined, zero ação",
-    handleRetryModelFailover(db, archived.registry, client, cfg, archived.sessionId) === undefined
+    (await handleRetryModelFailover(db, archived.registry, client, cfg, archived.sessionId)) === undefined
       && getMember(db, "team-arch", "eva").model === "google/antigravity-gemini-3.8-flash",
   );
 
   const shutting = seedMember(db, { teamId: "team-shut", memberName: "fab", sessionId: "sess-fab", status: "shutdown_requested" });
   check(
     "E3: membro em shutdown_requested → undefined (não vale a pena fallover)",
-    handleRetryModelFailover(db, shutting.registry, client, cfg, shutting.sessionId) === undefined
+    (await handleRetryModelFailover(db, shutting.registry, client, cfg, shutting.sessionId)) === undefined
       && getMember(db, "team-shut", "fab").model === "google/antigravity-gemini-3.8-flash",
   );
   db.close();
@@ -473,8 +480,8 @@ const leadMessages = (db, teamId) =>
   // F4: zero-noise fim a fim pelo dispatch — nenhum wake do lead no switch.
   check(
     "F4: dispatch switched → zero promptAsync do lead (zero-noise fim a fim)",
-    client.calls.promptAsync.length === 0,
-    `wakes=${client.calls.promptAsync.length}`,
+    !client.calls.promptAsync.some((c) => c.sessionID === LEAD_SESSION),
+    `wakes=${client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length}`,
   );
 
   db.close(); db2.close(); db3.close();
@@ -501,13 +508,13 @@ const leadMessages = (db, teamId) =>
   const registry = new distMod.MemberRegistry();
   registry.register("team-dist", "zoe", "sess-zoe");
 
-  const decision = distMod.handleRetryModelFailover(db, registry, client, { ...distMod.DEFAULT_CONFIG }, "sess-zoe", { attempt: 1, message: "429", next: now });
+  const decision = await distMod.handleRetryModelFailover(db, registry, client, { ...distMod.DEFAULT_CONFIG }, "sess-zoe", { attempt: 1, message: "429", next: now });
   const stored = db.query("SELECT model FROM team_member WHERE team_id = 'team-dist' AND name = 'zoe'").get();
   check(
     "dist: switched silencioso idêntico ao src (default gemini-3.8-flash#low, zero wake)",
     decision?.action === "switched" && decision.toModel === "google/antigravity-gemini-3.8-flash#low"
       && stored.model === "google/antigravity-gemini-3.8-flash#low"
-      && client.calls.promptAsync.length === 0,
+      && !client.calls.promptAsync.some((c) => c.sessionID === LEAD_SESSION),
     JSON.stringify({ decision, stored }),
   );
   db.close();

@@ -2,7 +2,8 @@ import type { Database } from "./db"
 import type { MemberRegistry, DescendantTracker } from "./state"
 import type { PluginClient } from "./types"
 import type { EnsembleConfig } from "./config"
-import { formatModelSelector, resolveFallbackChain, selectNextFallback } from "./config"
+import { formatModelSelector, parseModelSelector, resolveFallbackChain, selectNextFallback } from "./config"
+import { abortInflight } from "./v2-session"
 import { notifyLead } from "./notify"
 import { releaseMemberTasks } from "./tasks"
 import { findTeamBySession } from "./types"
@@ -498,14 +499,14 @@ export interface ModelFailoverDecision {
  *
  * Never throws — safe to call from event handlers.
  */
-export function handleRetryModelFailover(
+export async function handleRetryModelFailover(
   db: Database,
   registry: MemberRegistry,
   client: PluginClient,
   config: Required<EnsembleConfig>,
   sessionId: string,
   retryPayload?: RetryStatusPayload,
-): ModelFailoverDecision | undefined {
+): Promise<ModelFailoverDecision | undefined> {
   const entry = registry.getBySession(sessionId)
   if (!entry) return undefined
 
@@ -553,6 +554,40 @@ export function handleRetryModelFailover(
   )
   failoverCooldown.set(cooldownKey, now)
   log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} (silent — lead not woken)`)
+
+  // 1. Cancel in-flight HTTP request controller
+  const cancelled = abortInflight(sessionId)
+  log(`failover:abort-inflight member=${entry.memberName} session=${sessionId} cancelled=${cancelled}`)
+
+  // 2. Actively abort the native OpenCode HTTP retry backoff loop
+  if (typeof client.session?.abort === "function") {
+    try {
+      await client.session.abort({ sessionID: sessionId })
+    } catch (err) {
+      log(`failover:abort:failed member=${entry.memberName} session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  // 3. Promptly resume the teammate's turn with the new fallback model
+  const parsedModel = parseModelSelector(toSelector)
+  if (typeof client.session?.promptAsync === "function") {
+    try {
+      await client.session.promptAsync({
+        sessionID: sessionId,
+        parts: [
+          {
+            type: "text",
+            text: `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`,
+          },
+        ],
+        ...(parsedModel ? { model: parsedModel } : {}),
+        synthetic: true,
+      })
+    } catch (err) {
+      log(`failover:promptAsync:failed member=${entry.memberName} session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
   return {
     action: "switched",
     memberName: entry.memberName,

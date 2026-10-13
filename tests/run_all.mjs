@@ -41,6 +41,7 @@ const SUITES = [
   { file: "test_failover_integration.mjs", label: "Integração do Failover + Variant no switchModel V2" },
   { file: "test_clara_lead_routing.mjs", label: "Roteamento e Auto-Wake da Guardiã Clara" },
   { file: "test_room_inactivity_watchdog.mjs", label: "Watchdog de Ociosidade da Sala & Despacho da Clara" },
+  { file: "test_retry_failover_active.mjs", label: "Failover Ativo de Modelo (Abort + Re-prompt)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

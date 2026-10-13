@@ -341,6 +341,11 @@ export class Watchdog {
       const unfinishedCount = taskCountRow?.count ?? 0
       if (unfinishedCount === 0) continue
 
+      const busyMember = this.db.query(
+        "SELECT name FROM team_member WHERE team_id = ? AND name != 'clara' AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
+      ).get(team.id) as { name: string } | null
+      if (busyMember) continue
+
       const lastActivity = lastRoomActivity(this.db, team.id)
       if (lastActivity <= 0) continue
 

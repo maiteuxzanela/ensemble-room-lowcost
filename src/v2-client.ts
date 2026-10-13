@@ -124,16 +124,11 @@ export function createV2Client(ctx: V2Context, deps: V2ClientDeps = {}): PluginC
         return { data: { id: created.id } }
       },
       promptAsync: async (options) => {
-        // Synthetic (system) messages render as persistent transcript entries
-        // instead of fake user turns — the native form for agent notifications.
-        if (options.synthetic) {
-          return ctx.session.synthetic({ sessionID: options.sessionID, text: joinParts(options.parts), delivery: "queue" })
-        }
         if (options.agent) {
           await ctx.session.switchAgent({ sessionID: options.sessionID, agent: options.agent })
         }
         // V2 binds model at create/admission; the shared create signature has
-        // no model slot, so apply it here (spawn is the only model passer).
+        // no model slot, so apply it here (spawn and failover pass model).
         // Caught live: without this, teammates inherit the server default.
         // The OpenCode selector's `#variant` suffix (thinking level, e.g.
         // "low" in "google/antigravity-gemini-3.8-flash#low") must ride along
@@ -149,6 +144,11 @@ export function createV2Client(ctx: V2Context, deps: V2ClientDeps = {}): PluginC
               ...(options.model.variant ? { variant: options.model.variant } : {}),
             },
           })
+        }
+        // Synthetic (system) messages render as persistent transcript entries
+        // instead of fake user turns — the native form for agent notifications.
+        if (options.synthetic) {
+          return ctx.session.synthetic({ sessionID: options.sessionID, text: joinParts(options.parts), delivery: "queue" })
         }
         const text = joinParts(options.parts)
         return ctx.session.prompt({ sessionID: options.sessionID, text, delivery: "queue" })
