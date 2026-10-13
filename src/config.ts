@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs"
 import path from "node:path"
+import type { Database } from "./db"
 
 /**
  * Structured fallback model reference (config-level).
@@ -188,6 +189,19 @@ export interface EnsembleConfig {
    * systematic board-complete event. Set to false to restore the legacy wake.
    */
   silentLead?: boolean
+  /**
+   * Room inactivity threshold in ms (default: 30000 = 30s).
+   * When the room has had no activity for this long while unfinished tasks
+   * remain on the board, the watchdog wakes Clara (the internal lead
+   * representative) to inspect/claim/nudge/unblock progress.
+   */
+  roomInactivityThresholdMs?: number
+  /**
+   * Room inactivity polling interval in ms (default: 5000 = 5s).
+   * Cadence of the watchdog's `checkRoomInactivity()` sweep. Independent from
+   * `roomInactivityThresholdMs` so detection granularity stays cheap.
+   */
+  roomInactivityCheckMs?: number
 }
 
 /** Default configuration values. */
@@ -209,6 +223,8 @@ export const DEFAULT_CONFIG: Required<EnsembleConfig> = {
   fallbackModels: [],
   modelFallback: { model: DEFAULT_MODEL_FALLBACK.model, variant: DEFAULT_MODEL_FALLBACK.variant },
   silentLead: true,
+  roomInactivityThresholdMs: 30_000,
+  roomInactivityCheckMs: 5_000,
 }
 
 /** Read a JSON config file, returning an empty object on missing/invalid. */
@@ -250,6 +266,8 @@ function readConfigFile(filePath: string): Partial<EnsembleConfig> {
       }
     }
     if (typeof raw.silentLead === "boolean") result.silentLead = raw.silentLead
+    if (typeof raw.roomInactivityThresholdMs === "number") result.roomInactivityThresholdMs = raw.roomInactivityThresholdMs
+    if (typeof raw.roomInactivityCheckMs === "number") result.roomInactivityCheckMs = raw.roomInactivityCheckMs
     return result
   } catch (err) {
     if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return {}
@@ -281,5 +299,55 @@ export function loadConfig(projectDir: string): Required<EnsembleConfig> {
   const stall = process.env.STALL_THRESHOLD_MS
   if (stall !== undefined) merged.stallThresholdMs = stall === "0" ? 0 : (parseInt(stall, 10) || merged.stallThresholdMs)
 
+  const roomInactivityThreshold = process.env.ROOM_INACTIVITY_THRESHOLD_MS ?? process.env.OPENCODE_ENSEMBLE_ROOM_INACTIVITY_THRESHOLD_MS
+  if (roomInactivityThreshold !== undefined) {
+    merged.roomInactivityThresholdMs = roomInactivityThreshold === "0" ? 0 : (parseInt(roomInactivityThreshold, 10) || merged.roomInactivityThresholdMs)
+  }
+
+  const roomInactivityCheck = process.env.ROOM_INACTIVITY_CHECK_MS ?? process.env.OPENCODE_ENSEMBLE_ROOM_INACTIVITY_CHECK_MS
+  if (roomInactivityCheck !== undefined) {
+    merged.roomInactivityCheckMs = roomInactivityCheck === "0" ? 0 : (parseInt(roomInactivityCheck, 10) || merged.roomInactivityCheckMs)
+  }
+
   return merged
+}
+
+/**
+ * Latest activity timestamp (epoch ms) for a room/team, read from the SQLite
+ * sources of truth. Derived from the GREATEST of:
+ *   1. `team_message.time_created` — message traffic in the room;
+ *   2. `team_member.time_updated`  — member state transitions driven by team
+ *      tools (spawn, claim, wake, standby, retries...);
+ *   3. `team_task.time_updated`    — task-board updates (add/claim/complete).
+ * When the room has no recorded activity in any of those tables, falls back to
+ * `team.time_created` (room creation) so a brand-new room never reports 0 —
+ * `Date.now() - 0` would look infinitely stale and fire the inactivity wake
+ * immediately. Returns 0 only when the team itself does not exist.
+ *
+ * Used by the room-inactivity watchdog (`checkRoomInactivity`) against
+ * `roomInactivityThresholdMs` to decide when to wake Clara.
+ *
+ * @param db Initialized Ensemble database (see createDb).
+ * @param teamId Team/room id (team.id).
+ * @returns Epoch ms of the last observed room activity, or 0 if unknown team.
+ */
+export function lastRoomActivity(db: Database, teamId: string): number {
+  const row = db.query(
+    `SELECT MAX(ts) AS ts FROM (
+       SELECT MAX(time_created) AS ts FROM team_message WHERE team_id = ?
+       UNION ALL
+       SELECT MAX(time_updated) AS ts FROM team_member WHERE team_id = ?
+       UNION ALL
+       SELECT MAX(time_updated) AS ts FROM team_task WHERE team_id = ?
+     )`,
+  ).get(teamId, teamId, teamId) as { ts: number | null } | null
+
+  if (typeof row?.ts === "number" && Number.isFinite(row.ts)) return row.ts
+
+  const team = db.query("SELECT time_created FROM team WHERE id = ?").get(teamId) as
+    | { time_created: number }
+    | null
+  if (typeof team?.time_created === "number" && Number.isFinite(team.time_created)) return team.time_created
+
+  return 0
 }

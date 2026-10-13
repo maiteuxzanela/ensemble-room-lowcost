@@ -57,7 +57,54 @@ export async function executeTeamTasksComplete(
       "UPDATE team_task SET status = 'in_review', assignee = ?, review_notes = ?, time_updated = ? WHERE id = ?",
       [assignee, notes ?? task.review_notes ?? null, now, args.task_id],
     )
-    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}`
+
+    // Auto-wake Clara (Guardiã do Quality Gate) for review if present in team and not caller
+    let claraNotified = false
+    if (caller !== "clara") {
+      const claraMember = deps.db.query(
+        "SELECT session_id, execution_status, agent FROM team_member WHERE team_id = ? AND name = 'clara'"
+      ).get(teamInfo.teamId) as { session_id: string; execution_status: string; agent: string } | null
+
+      if (claraMember?.session_id) {
+        deps.db.run(
+          "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
+          [now, teamInfo.teamId],
+        )
+
+        const baseWakeText = `[System: Task "${args.task_id}" was submitted for review by ${caller}${notes ? ` (notes: ${notes})` : ""}]`
+        let promptText = baseWakeText
+        let promptAgent: string | undefined = claraMember.agent
+
+        if (claraMember.execution_status === "standby") {
+          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, "clara", baseWakeText)
+          if (wake.woke) {
+            promptText = wake.text
+            promptAgent = wake.agent ?? claraMember.agent
+          }
+        }
+
+        const claraModel = getMemberModel(deps.db, teamInfo.teamId, "clara")
+        deps.client.session.promptAsync({
+          sessionID: claraMember.session_id,
+          parts: [{ type: "text", text: promptText }],
+          agent: promptAgent,
+          synthetic: true,
+          ...(claraModel ? { model: claraModel } : {}),
+        }).catch((err) => {
+          if (claraMember.execution_status === "standby") {
+            deps.db.run(
+              "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
+              [Date.now(), teamInfo.teamId],
+            )
+          }
+          log(`tasks-complete:wake-clara:failed err=${String(err)}`)
+        })
+        log(`tasks-complete:wake-clara:ok task=${args.task_id} sessionID=${claraMember.session_id}`)
+        claraNotified = true
+      }
+    }
+
+    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${claraNotified ? " (notified clara for review)" : ""}`
   }
 
   // Flow 2: Reject review (in_review -> in_progress)

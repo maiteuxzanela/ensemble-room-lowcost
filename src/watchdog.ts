@@ -10,6 +10,8 @@ import { hasReportedCompletion } from "./messaging"
 import { getMemberModel } from "./member-model"
 import { notifyLead } from "./notify"
 import { log } from "./log"
+import { lastRoomActivity } from "./config"
+import { resolveStandbyWake } from "./tools/shared"
 
 interface WatchdogOpts {
   db: Database
@@ -33,6 +35,10 @@ interface WatchdogOpts {
   peerMessageLimit?: number
   /** Time window for peer message rate limiting in ms. */
   peerMessageWindowMs?: number
+  /** Room inactivity threshold in ms (default: 30000 = 30s, 0 disables). */
+  roomInactivityThresholdMs?: number
+  /** Room inactivity polling interval in ms (default: 5000 = 5s). */
+  roomInactivityCheckMs?: number
 }
 
 const requireSessionModule = createRequire(import.meta.url)
@@ -126,7 +132,10 @@ export class Watchdog {
   private readonly cwd?: string
   private readonly peerMessageLimit: number
   private readonly peerMessageWindowMs: number
+  private readonly roomInactivityThresholdMs: number
+  private readonly roomInactivityCheckMs: number
   private timer: ReturnType<typeof setInterval> | undefined
+  private roomInactivityTimer: ReturnType<typeof setInterval> | undefined
 
   constructor(opts: WatchdogOpts) {
     this.db = opts.db
@@ -141,6 +150,8 @@ export class Watchdog {
     this.cwd = opts.cwd
     this.peerMessageLimit = opts.peerMessageLimit ?? 0
     this.peerMessageWindowMs = opts.peerMessageWindowMs ?? 300_000
+    this.roomInactivityThresholdMs = opts.roomInactivityThresholdMs ?? 30_000
+    this.roomInactivityCheckMs = opts.roomInactivityCheckMs ?? 5_000
   }
 
   private static STALE_THRESHOLD_MS = Number(process.env.STALE_WORKTREE_THRESHOLD_MS) || 300_000
@@ -312,11 +323,92 @@ export class Watchdog {
     }
   }
 
+  /** Check for room inactivity and wake Clara to inspect and drive progress. */
+  async checkRoomInactivity(): Promise<void> {
+    if (this.roomInactivityThresholdMs === 0) return
+
+    const activeTeams = this.db.query(
+      "SELECT id, name FROM team WHERE status = 'active'"
+    ).all() as Array<{ id: string; name: string }>
+
+    const now = Date.now()
+
+    for (const team of activeTeams) {
+      // Check unfinished tasks on the board
+      const taskCountRow = this.db.query(
+        "SELECT COUNT(*) as count FROM team_task WHERE team_id = ? AND status IN ('pending', 'in_progress', 'in_review', 'blocked')"
+      ).get(team.id) as { count: number } | null
+      const unfinishedCount = taskCountRow?.count ?? 0
+      if (unfinishedCount === 0) continue
+
+      const lastActivity = lastRoomActivity(this.db, team.id)
+      if (lastActivity <= 0) continue
+
+      const inactiveMs = now - lastActivity
+      if (inactiveMs < this.roomInactivityThresholdMs) continue
+
+      // Clara lookup
+      const clara = this.db.query(
+        "SELECT session_id, execution_status, agent, last_nudged_at FROM team_member WHERE team_id = ? AND name = 'clara'"
+      ).get(team.id) as { session_id: string; execution_status: string; agent: string; last_nudged_at: number | null } | null
+
+      if (!clara?.session_id) continue
+
+      // Cooldown / Re-wake suppression:
+      // If Clara was already nudged/woken for inactivity, and no activity occurred since then,
+      // don't re-wake within roomInactivityThresholdMs.
+      if (clara.last_nudged_at) {
+        const activeSinceNudge = lastActivity > clara.last_nudged_at
+        if (!activeSinceNudge && (now - clara.last_nudged_at < this.roomInactivityThresholdMs)) {
+          continue
+        }
+      }
+
+      // Update last_nudged_at and reset reported_to_lead
+      this.db.run(
+        "UPDATE team_member SET last_nudged_at = ?, reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
+        [now, now, team.id],
+      )
+
+      const wakeText = `[System: Room has been inactive for ${Math.round(inactiveMs / 1000)}s with ${unfinishedCount} unfinished task(s). Inspect the board, unblock, claim, or nudge teammates to drive progress.]`
+      let promptText = wakeText
+      let promptAgent: string | undefined = clara.agent
+
+      if (clara.execution_status === "standby") {
+        const wake = resolveStandbyWake(this.db, team.id, "clara", wakeText)
+        if (wake.woke) {
+          promptText = wake.text
+          promptAgent = wake.agent ?? clara.agent
+        }
+      }
+
+      const claraModel = getMemberModel(this.db, team.id, "clara")
+      this.client.session.promptAsync({
+        sessionID: clara.session_id,
+        parts: [{ type: "text", text: promptText }],
+        agent: promptAgent,
+        synthetic: true,
+        ...(claraModel ? { model: claraModel } : {}),
+      }).catch((err) => {
+        if (clara.execution_status === "standby") {
+          this.db.run(
+            "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
+            [Date.now(), team.id],
+          )
+        }
+        log(`watchdog:room-inactivity:wake-clara:failed team=${team.id} err=${err instanceof Error ? err.message : String(err)}`)
+      })
+
+      log(`watchdog:room-inactivity:wake-clara team=${team.id} inactiveMs=${inactiveMs}`)
+    }
+  }
+
   /** Run a single check for stale busy members. */
   async check(): Promise<void> {
     await this.cleanupStaleWorktrees()
     await this.checkStalled()
     await this.checkChatty()
+    await this.checkRoomInactivity()
     if (this.ttlMs === 0) return
 
     const cutoff = Date.now() - this.ttlMs
@@ -407,8 +499,16 @@ export class Watchdog {
 
   /** Start the periodic check. Runs stale worktree GC regardless of TTL setting. */
   start(): void {
-    if (this.timer) return
-    this.timer = setInterval(() => this.check(), this.checkIntervalMs)
+    if (!this.timer) {
+      this.timer = setInterval(() => this.check(), this.checkIntervalMs)
+    }
+    if (!this.roomInactivityTimer && this.roomInactivityCheckMs > 0 && this.roomInactivityThresholdMs > 0) {
+      this.roomInactivityTimer = setInterval(() => {
+        this.checkRoomInactivity().catch((err) => {
+          log(`watchdog:room-inactivity:err err=${err instanceof Error ? err.message : String(err)}`)
+        })
+      }, this.roomInactivityCheckMs)
+    }
   }
 
   /** Stop the periodic check. */
@@ -417,10 +517,14 @@ export class Watchdog {
       clearInterval(this.timer)
       this.timer = undefined
     }
+    if (this.roomInactivityTimer) {
+      clearInterval(this.roomInactivityTimer)
+      this.roomInactivityTimer = undefined
+    }
   }
 
   /** Whether the watchdog is currently running. */
   isRunning(): boolean {
-    return this.timer !== undefined
+    return this.timer !== undefined || this.roomInactivityTimer !== undefined
   }
 }

@@ -141,6 +141,59 @@ export async function executeTeamMessage(
   if (isToLead) {
     if (deps.config?.silentLead) {
       log(`team_message:lead-silenced from=${senderName}`)
+
+      // CC & Wake Clara (room representative / internal lead) when silentLead is active
+      if (senderName !== "clara") {
+        const claraMember = deps.db.query(
+          "SELECT session_id, execution_status, agent FROM team_member WHERE team_id = ? AND name = 'clara'"
+        ).get(teamInfo.teamId) as { session_id: string; execution_status: string; agent: string } | null
+
+        if (claraMember?.session_id) {
+          const now = Date.now()
+          deps.db.run(
+            "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
+            [now, teamInfo.teamId],
+          )
+
+          sendMessage(deps.db, {
+            teamId: teamInfo.teamId,
+            from: senderName,
+            to: "clara",
+            content: `[CC Lead] ${messageText}`,
+          })
+
+          const baseWakeText = `[System: Message from ${senderName} to lead: ${messageText}]`
+          let promptText = baseWakeText
+          let promptAgent: string | undefined = claraMember.agent
+
+          if (claraMember.execution_status === "standby") {
+            const wake = resolveStandbyWake(deps.db, teamInfo.teamId, "clara", baseWakeText)
+            if (wake.woke) {
+              promptText = wake.text
+              promptAgent = wake.agent ?? claraMember.agent
+            }
+          }
+
+          const claraModel = getMemberModel(deps.db, teamInfo.teamId, "clara")
+          deps.client.session.promptAsync({
+            sessionID: claraMember.session_id,
+            parts: [{ type: "text", text: promptText }],
+            agent: promptAgent,
+            synthetic: true,
+            ...(claraModel ? { model: claraModel } : {}),
+          }).catch((err) => {
+            if (claraMember.execution_status === "standby") {
+              deps.db.run(
+                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
+                [Date.now(), teamInfo.teamId],
+              )
+            }
+            log(`team_message:wake-clara-cc:failed from=${senderName} err=${err instanceof Error ? err.message : String(err)}`)
+          })
+          log(`team_message:lead-silenced:cc-clara from=${senderName} sessionID=${claraMember.session_id}`)
+        }
+      }
+
       return `Message sent to ${args.to}.`
     }
     log(`team_message:wake-lead from=${senderName} recipientSession=${recipientSessionId}`)

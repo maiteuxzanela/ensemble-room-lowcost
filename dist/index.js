@@ -792,7 +792,9 @@ var DEFAULT_CONFIG = {
   promptForModels: false,
   fallbackModels: [],
   modelFallback: { model: DEFAULT_MODEL_FALLBACK.model, variant: DEFAULT_MODEL_FALLBACK.variant },
-  silentLead: true
+  silentLead: true,
+  roomInactivityThresholdMs: 3e4,
+  roomInactivityCheckMs: 5e3
 };
 function readConfigFile(filePath) {
   try {
@@ -826,6 +828,8 @@ function readConfigFile(filePath) {
       }
     }
     if (typeof raw.silentLead === "boolean") result.silentLead = raw.silentLead;
+    if (typeof raw.roomInactivityThresholdMs === "number") result.roomInactivityThresholdMs = raw.roomInactivityThresholdMs;
+    if (typeof raw.roomInactivityCheckMs === "number") result.roomInactivityCheckMs = raw.roomInactivityCheckMs;
     return result;
   } catch (err) {
     if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return {};
@@ -846,7 +850,30 @@ function loadConfig(projectDir) {
   if (rateLimit !== void 0) merged.rateLimitCapacity = rateLimit === "0" ? 0 : parseInt(rateLimit, 10) || merged.rateLimitCapacity;
   const stall = process.env.STALL_THRESHOLD_MS;
   if (stall !== void 0) merged.stallThresholdMs = stall === "0" ? 0 : parseInt(stall, 10) || merged.stallThresholdMs;
+  const roomInactivityThreshold = process.env.ROOM_INACTIVITY_THRESHOLD_MS ?? process.env.OPENCODE_ENSEMBLE_ROOM_INACTIVITY_THRESHOLD_MS;
+  if (roomInactivityThreshold !== void 0) {
+    merged.roomInactivityThresholdMs = roomInactivityThreshold === "0" ? 0 : parseInt(roomInactivityThreshold, 10) || merged.roomInactivityThresholdMs;
+  }
+  const roomInactivityCheck = process.env.ROOM_INACTIVITY_CHECK_MS ?? process.env.OPENCODE_ENSEMBLE_ROOM_INACTIVITY_CHECK_MS;
+  if (roomInactivityCheck !== void 0) {
+    merged.roomInactivityCheckMs = roomInactivityCheck === "0" ? 0 : parseInt(roomInactivityCheck, 10) || merged.roomInactivityCheckMs;
+  }
   return merged;
+}
+function lastRoomActivity(db, teamId) {
+  const row = db.query(
+    `SELECT MAX(ts) AS ts FROM (
+       SELECT MAX(time_created) AS ts FROM team_message WHERE team_id = ?
+       UNION ALL
+       SELECT MAX(time_updated) AS ts FROM team_member WHERE team_id = ?
+       UNION ALL
+       SELECT MAX(time_updated) AS ts FROM team_task WHERE team_id = ?
+     )`
+  ).get(teamId, teamId, teamId);
+  if (typeof row?.ts === "number" && Number.isFinite(row.ts)) return row.ts;
+  const team = db.query("SELECT time_created FROM team WHERE id = ?").get(teamId);
+  if (typeof team?.time_created === "number" && Number.isFinite(team.time_created)) return team.time_created;
+  return 0;
 }
 
 // src/util.ts
@@ -2433,6 +2460,51 @@ async function executeTeamMessage(deps, args, sessionId) {
   if (isToLead) {
     if (deps.config?.silentLead) {
       log(`team_message:lead-silenced from=${senderName}`);
+      if (senderName !== "clara") {
+        const claraMember = deps.db.query(
+          "SELECT session_id, execution_status, agent FROM team_member WHERE team_id = ? AND name = 'clara'"
+        ).get(teamInfo.teamId);
+        if (claraMember?.session_id) {
+          const now = Date.now();
+          deps.db.run(
+            "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
+            [now, teamInfo.teamId]
+          );
+          sendMessage(deps.db, {
+            teamId: teamInfo.teamId,
+            from: senderName,
+            to: "clara",
+            content: `[CC Lead] ${messageText}`
+          });
+          const baseWakeText = `[System: Message from ${senderName} to lead: ${messageText}]`;
+          let promptText = baseWakeText;
+          let promptAgent = claraMember.agent;
+          if (claraMember.execution_status === "standby") {
+            const wake2 = resolveStandbyWake(deps.db, teamInfo.teamId, "clara", baseWakeText);
+            if (wake2.woke) {
+              promptText = wake2.text;
+              promptAgent = wake2.agent ?? claraMember.agent;
+            }
+          }
+          const claraModel = getMemberModel(deps.db, teamInfo.teamId, "clara");
+          deps.client.session.promptAsync({
+            sessionID: claraMember.session_id,
+            parts: [{ type: "text", text: promptText }],
+            agent: promptAgent,
+            synthetic: true,
+            ...claraModel ? { model: claraModel } : {}
+          }).catch((err) => {
+            if (claraMember.execution_status === "standby") {
+              deps.db.run(
+                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
+                [Date.now(), teamInfo.teamId]
+              );
+            }
+            log(`team_message:wake-clara-cc:failed from=${senderName} err=${err instanceof Error ? err.message : String(err)}`);
+          });
+          log(`team_message:lead-silenced:cc-clara from=${senderName} sessionID=${claraMember.session_id}`);
+        }
+      }
       return `Message sent to ${args.to}.`;
     }
     log(`team_message:wake-lead from=${senderName} recipientSession=${recipientSessionId}`);
@@ -2624,7 +2696,47 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
       "UPDATE team_task SET status = 'in_review', assignee = ?, review_notes = ?, time_updated = ? WHERE id = ?",
       [assignee, notes ?? task.review_notes ?? null, now, args.task_id]
     );
-    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}`;
+    let claraNotified = false;
+    if (caller !== "clara") {
+      const claraMember = deps.db.query(
+        "SELECT session_id, execution_status, agent FROM team_member WHERE team_id = ? AND name = 'clara'"
+      ).get(teamInfo.teamId);
+      if (claraMember?.session_id) {
+        deps.db.run(
+          "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
+          [now, teamInfo.teamId]
+        );
+        const baseWakeText = `[System: Task "${args.task_id}" was submitted for review by ${caller}${notes ? ` (notes: ${notes})` : ""}]`;
+        let promptText = baseWakeText;
+        let promptAgent = claraMember.agent;
+        if (claraMember.execution_status === "standby") {
+          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, "clara", baseWakeText);
+          if (wake.woke) {
+            promptText = wake.text;
+            promptAgent = wake.agent ?? claraMember.agent;
+          }
+        }
+        const claraModel = getMemberModel(deps.db, teamInfo.teamId, "clara");
+        deps.client.session.promptAsync({
+          sessionID: claraMember.session_id,
+          parts: [{ type: "text", text: promptText }],
+          agent: promptAgent,
+          synthetic: true,
+          ...claraModel ? { model: claraModel } : {}
+        }).catch((err) => {
+          if (claraMember.execution_status === "standby") {
+            deps.db.run(
+              "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
+              [Date.now(), teamInfo.teamId]
+            );
+          }
+          log(`tasks-complete:wake-clara:failed err=${String(err)}`);
+        });
+        log(`tasks-complete:wake-clara:ok task=${args.task_id} sessionID=${claraMember.session_id}`);
+        claraNotified = true;
+      }
+    }
+    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${claraNotified ? " (notified clara for review)" : ""}`;
   }
   const isReject = args.action === "reject" || args.action === "reject_review" || task.status === "in_review" && (args.action === "in_progress" || args.status === "in_progress");
   if (isReject) {
@@ -6005,9 +6117,6 @@ function wrapThrowingClient(raw) {
   };
 }
 
-// src/index.ts
-init_log();
-
 // src/watchdog.ts
 init_merge_helper();
 import { createRequire as createRequire2 } from "node:module";
@@ -6060,7 +6169,10 @@ var Watchdog = class _Watchdog {
   cwd;
   peerMessageLimit;
   peerMessageWindowMs;
+  roomInactivityThresholdMs;
+  roomInactivityCheckMs;
   timer;
+  roomInactivityTimer;
   constructor(opts) {
     this.db = opts.db;
     this.client = opts.client;
@@ -6074,6 +6186,8 @@ var Watchdog = class _Watchdog {
     this.cwd = opts.cwd;
     this.peerMessageLimit = opts.peerMessageLimit ?? 0;
     this.peerMessageWindowMs = opts.peerMessageWindowMs ?? 3e5;
+    this.roomInactivityThresholdMs = opts.roomInactivityThresholdMs ?? 3e4;
+    this.roomInactivityCheckMs = opts.roomInactivityCheckMs ?? 5e3;
   }
   static STALE_THRESHOLD_MS = Number(process.env.STALE_WORKTREE_THRESHOLD_MS) || 3e5;
   /** Clean up worktrees and workspaces for shutdown/error members past the stale threshold. */
@@ -6197,11 +6311,72 @@ var Watchdog = class _Watchdog {
       log(`watchdog:chatty member=${member.name} limit=${this.peerMessageLimit}`);
     }
   }
+  /** Check for room inactivity and wake Clara to inspect and drive progress. */
+  async checkRoomInactivity() {
+    if (this.roomInactivityThresholdMs === 0) return;
+    const activeTeams = this.db.query(
+      "SELECT id, name FROM team WHERE status = 'active'"
+    ).all();
+    const now = Date.now();
+    for (const team of activeTeams) {
+      const taskCountRow = this.db.query(
+        "SELECT COUNT(*) as count FROM team_task WHERE team_id = ? AND status IN ('pending', 'in_progress', 'in_review', 'blocked')"
+      ).get(team.id);
+      const unfinishedCount = taskCountRow?.count ?? 0;
+      if (unfinishedCount === 0) continue;
+      const lastActivity = lastRoomActivity(this.db, team.id);
+      if (lastActivity <= 0) continue;
+      const inactiveMs = now - lastActivity;
+      if (inactiveMs < this.roomInactivityThresholdMs) continue;
+      const clara = this.db.query(
+        "SELECT session_id, execution_status, agent, last_nudged_at FROM team_member WHERE team_id = ? AND name = 'clara'"
+      ).get(team.id);
+      if (!clara?.session_id) continue;
+      if (clara.last_nudged_at) {
+        const activeSinceNudge = lastActivity > clara.last_nudged_at;
+        if (!activeSinceNudge && now - clara.last_nudged_at < this.roomInactivityThresholdMs) {
+          continue;
+        }
+      }
+      this.db.run(
+        "UPDATE team_member SET last_nudged_at = ?, reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
+        [now, now, team.id]
+      );
+      const wakeText = `[System: Room has been inactive for ${Math.round(inactiveMs / 1e3)}s with ${unfinishedCount} unfinished task(s). Inspect the board, unblock, claim, or nudge teammates to drive progress.]`;
+      let promptText = wakeText;
+      let promptAgent = clara.agent;
+      if (clara.execution_status === "standby") {
+        const wake = resolveStandbyWake(this.db, team.id, "clara", wakeText);
+        if (wake.woke) {
+          promptText = wake.text;
+          promptAgent = wake.agent ?? clara.agent;
+        }
+      }
+      const claraModel = getMemberModel(this.db, team.id, "clara");
+      this.client.session.promptAsync({
+        sessionID: clara.session_id,
+        parts: [{ type: "text", text: promptText }],
+        agent: promptAgent,
+        synthetic: true,
+        ...claraModel ? { model: claraModel } : {}
+      }).catch((err) => {
+        if (clara.execution_status === "standby") {
+          this.db.run(
+            "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
+            [Date.now(), team.id]
+          );
+        }
+        log(`watchdog:room-inactivity:wake-clara:failed team=${team.id} err=${err instanceof Error ? err.message : String(err)}`);
+      });
+      log(`watchdog:room-inactivity:wake-clara team=${team.id} inactiveMs=${inactiveMs}`);
+    }
+  }
   /** Run a single check for stale busy members. */
   async check() {
     await this.cleanupStaleWorktrees();
     await this.checkStalled();
     await this.checkChatty();
+    await this.checkRoomInactivity();
     if (this.ttlMs === 0) return;
     const cutoff = Date.now() - this.ttlMs;
     const stale = this.db.query(
@@ -6267,8 +6442,16 @@ var Watchdog = class _Watchdog {
   }
   /** Start the periodic check. Runs stale worktree GC regardless of TTL setting. */
   start() {
-    if (this.timer) return;
-    this.timer = setInterval(() => this.check(), this.checkIntervalMs);
+    if (!this.timer) {
+      this.timer = setInterval(() => this.check(), this.checkIntervalMs);
+    }
+    if (!this.roomInactivityTimer && this.roomInactivityCheckMs > 0 && this.roomInactivityThresholdMs > 0) {
+      this.roomInactivityTimer = setInterval(() => {
+        this.checkRoomInactivity().catch((err) => {
+          log(`watchdog:room-inactivity:err err=${err instanceof Error ? err.message : String(err)}`);
+        });
+      }, this.roomInactivityCheckMs);
+    }
   }
   /** Stop the periodic check. */
   stop() {
@@ -6276,14 +6459,19 @@ var Watchdog = class _Watchdog {
       clearInterval(this.timer);
       this.timer = void 0;
     }
+    if (this.roomInactivityTimer) {
+      clearInterval(this.roomInactivityTimer);
+      this.roomInactivityTimer = void 0;
+    }
   }
   /** Whether the watchdog is currently running. */
   isRunning() {
-    return this.timer !== void 0;
+    return this.timer !== void 0 || this.roomInactivityTimer !== void 0;
   }
 };
 
 // src/index.ts
+init_log();
 var DEFAULT_RATE_LIMIT_REFILL = 2;
 var DEFAULT_RATE_LIMIT_INTERVAL_MS = 1e3;
 var DEFAULT_WATCHDOG_CHECK_MS = 60 * 1e3;
@@ -6353,7 +6541,9 @@ var plugin = async (input) => {
     stallTokenThreshold: config.stallTokenThreshold,
     cwd: input.directory,
     peerMessageLimit: config.peerMessageLimit,
-    peerMessageWindowMs: config.peerMessageWindowMs
+    peerMessageWindowMs: config.peerMessageWindowMs,
+    roomInactivityThresholdMs: config.roomInactivityThresholdMs,
+    roomInactivityCheckMs: config.roomInactivityCheckMs
   });
   watchdog.start();
   return {
@@ -6803,6 +6993,7 @@ var index_default = {
 };
 export {
   FAILOVER_COOLDOWN_MS,
+  Watchdog,
   buildLeadSystemPrompt,
   buildTeammateSystemPrompt,
   claimTask,
@@ -6818,6 +7009,7 @@ export {
   hasInReviewAssignedTasks,
   hasOtherActiveMembers,
   hasPendingBoardTasks,
+  lastRoomActivity,
   setMemberStandby,
   shouldAlarmFastIdle,
   shouldNudgeIdleMember

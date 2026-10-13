@@ -39,6 +39,8 @@ const SUITES = [
   { file: "test_fallback_models.mjs", label: "Schema de Fallback de Modelo" },
   { file: "test_rate_limit_failover.mjs", label: "Rate-Limit Failover Silencioso" },
   { file: "test_failover_integration.mjs", label: "Integração do Failover + Variant no switchModel V2" },
+  { file: "test_clara_lead_routing.mjs", label: "Roteamento e Auto-Wake da Guardiã Clara" },
+  { file: "test_room_inactivity_watchdog.mjs", label: "Watchdog de Ociosidade da Sala & Despacho da Clara" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

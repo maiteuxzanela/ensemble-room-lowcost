@@ -21,6 +21,8 @@ export { executeTeamTasksReview, executeTeamTasksReject } from "./tools/team-tas
 export { executeTeamStandby, setMemberStandby } from "./tools/team-standby"
 export { executeTeamClaim, claimTask } from "./tools/team-claim"
 export { buildTeammateSystemPrompt, buildLeadSystemPrompt } from "./system-prompt"
+export { lastRoomActivity } from "./config"
+export { Watchdog } from "./watchdog"
 import { notifyTeamEvent, notifyWorkingProgress, notifyLead } from "./notify"
 import { hasReportedCompletion } from "./messaging"
 import { getMemberModel } from "./member-model"
@@ -169,6 +171,8 @@ const plugin: Plugin = async (input) => {
     cwd: input.directory,
     peerMessageLimit: config.peerMessageLimit,
     peerMessageWindowMs: config.peerMessageWindowMs,
+    roomInactivityThresholdMs: config.roomInactivityThresholdMs,
+    roomInactivityCheckMs: config.roomInactivityCheckMs,
   })
   watchdog.start()
 

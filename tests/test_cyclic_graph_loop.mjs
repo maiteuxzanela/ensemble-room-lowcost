@@ -268,7 +268,8 @@ async function runCyclicGraphSuite() {
   check("Tarefa X transicionou para in_review", currentTask.status === "in_review");
   check("review_notes gravado no SQLite", currentTask.review_notes === "PR inicial implementado com testes básicos");
   check("rejection_count inicial é 0", currentTask.rejection_count === 0);
-  check("Lead NÃO foi acordado prematuramente com tarefa in_review", tc.calls.promptAsync.length === 0);
+  check("Lead NÃO foi acordado prematuramente com tarefa in_review", !tc.calls.promptAsync.some(c => c.sessionID === LEAD_SESSION));
+  check("Clara foi acordada para revisão", tc.calls.promptAsync.some(c => c.sessionID === CLARA_SESSION));
 
   // C. Clara rejeita a entrega com apontamentos de qualidade
   const rejectRes = await executeTeamTasksComplete(
