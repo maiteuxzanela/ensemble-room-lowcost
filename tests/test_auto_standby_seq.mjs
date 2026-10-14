@@ -165,8 +165,38 @@ async function runSuite() {
   check("Clara teve spawn_context gravado com prompt", memberClara && memberClara.spawn_context !== null && memberClara.spawn_context.includes("Auditar Quality Gate"));
   check("Clara consumiu ZERO tokens ao nascer (zero promptAsync)", mc.calls.promptAsync.length === 0, `chamadas=${mc.calls.promptAsync.length}`);
 
-  // 4. Validar override: Clara com standby: false explícito não entra em standby
+  // 4. Trava de unicidade da Guardiã (Quality Gate): segunda instância
+  // clara-family ("clara-override", agent "clara") é rejeitada de forma
+  // determinística enquanto a Guardiã original estiver ativa.
   const promptBeforeOverride = mc.calls.promptAsync.length;
+  let guardianLockError = null;
+  try {
+    await executeTeamSpawn(deps, {
+      name: "clara-override",
+      agent: "clara",
+      prompt: "Auditar imediatamente sem standby",
+      standby: false
+    }, LEAD_SESSION);
+  } catch (err) {
+    guardianLockError = err instanceof Error ? err.message : String(err);
+  }
+  check(
+    "Segunda Guardiã bloqueada pela trava de unicidade",
+    guardianLockError !== null && guardianLockError.includes("Guardiã do Quality Gate 'clara' já está ativa na equipe 'tauto'"),
+    guardianLockError ?? "sem erro"
+  );
+  check(
+    "Mensagem determinística explicita a exclusividade do Quality Gate",
+    guardianLockError !== null && guardianLockError.includes("não admitem instâncias concorrentes")
+  );
+  const blockedMember = db.query("SELECT * FROM team_member WHERE team_id = ? AND name = 'clara-override'").get(TEAM_ID);
+  check("Guardiã bloqueada não registrou membro no SQLite", !blockedMember);
+  check("Guardiã bloqueada não disparou promptAsync", mc.calls.promptAsync.length === promptBeforeOverride, `delta=${mc.calls.promptAsync.length - promptBeforeOverride}`);
+
+  // 4b. Override standby: false segue válido quando NÃO há Guardiã concorrente
+  // ativa (a original foi aposentada para 'shutdown' — estado não-ativo).
+  db.run("UPDATE team_member SET status = 'shutdown', time_updated = ? WHERE team_id = ? AND name = 'clara'", [Date.now(), TEAM_ID]);
+  const promptBeforeOverride2 = mc.calls.promptAsync.length;
   const resClaraOverride = await executeTeamSpawn(deps, {
     name: "clara-override",
     agent: "clara",
@@ -178,7 +208,7 @@ async function runSuite() {
   const memberClaraOverride = db.query("SELECT * FROM team_member WHERE team_id = ? AND name = 'clara-override'").get(TEAM_ID);
   check("Clara com standby: false NÃO está em standby", memberClaraOverride && memberClaraOverride.execution_status !== "standby", `execution_status=${memberClaraOverride?.execution_status}`);
   check("Clara com standby: false NÃO tem spawn_context", memberClaraOverride && (memberClaraOverride.spawn_context === null || memberClaraOverride.spawn_context === undefined));
-  check("Clara com standby: false disparou promptAsync imediatamente", mc.calls.promptAsync.length === promptBeforeOverride + 1, `delta=${mc.calls.promptAsync.length - promptBeforeOverride}`);
+  check("Clara com standby: false disparou promptAsync imediatamente", mc.calls.promptAsync.length === promptBeforeOverride2 + 1, `delta=${mc.calls.promptAsync.length - promptBeforeOverride2}`);
 }
 
 await runSuite();

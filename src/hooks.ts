@@ -396,6 +396,55 @@ export function shouldAlarmFastIdle(
   return msgCount === 0
 }
 
+/** Neutral correction message when tasks remain under review. */
+export const IN_REVIEW_NUDGE_MESSAGE =
+  "[System]: Tasks remain in review on the board. You must call team_tasks_complete to approve or reject the review, and report the outcome to the lead via team_message."
+
+/** Maximum nudge attempts per team:member:taskId before cooldown permanently stops. */
+export const MAX_IN_REVIEW_NUDGES = 2
+
+/** In-memory tracking of in-review nudges for dedup and cooldown: Map<`${teamId}:${memberName}:${taskId}`, count> */
+export const inReviewNudges = new Map<string, number>()
+
+/**
+ * Check if an idle/ready member should be nudged regarding tasks currently under review.
+ * - Developers/submitters must NOT be nudged: they wait passively for review.
+ * - Only 'clara' (Quality Gate reviewer) is nudged for tasks in 'in_review'.
+ * - Returns the taskId to nudge for, or false if suppressed/no eligible tasks.
+ * - Applies a cooldown/dedup limit (default MAX_IN_REVIEW_NUDGES = 2 attempts per team:member:taskId).
+ */
+export function shouldNudgeInReviewTasks(
+  db: Database,
+  teamId: string,
+  memberName: string,
+): string | false {
+  // Only Clara (Quality Gate reviewer) should be nudged about in_review tasks.
+  // Standard developers waiting passively for review must not receive in_review nudges.
+  if (memberName !== "clara") return false
+
+  const member = db.query("SELECT status, execution_status FROM team_member WHERE team_id = ? AND name = ?")
+    .get(teamId, memberName) as { status: string; execution_status: string } | null
+  if (!member || member.status !== "ready") return false
+  if (member.execution_status === "standby") return false
+
+  // For Clara, check all tasks with status 'in_review' on the board
+  const candidateTasks = db.query(
+    "SELECT id FROM team_task WHERE team_id = ? AND status = 'in_review' ORDER BY time_updated ASC"
+  ).all(teamId) as Array<{ id: string }>
+
+  if (candidateTasks.length === 0) return false
+
+  for (const t of candidateTasks) {
+    const key = `${teamId}:${memberName}:${t.id}`
+    const attempts = inReviewNudges.get(key) ?? 0
+    if (attempts < MAX_IN_REVIEW_NUDGES) {
+      return t.id
+    }
+  }
+
+  return false
+}
+
 /** Shape of an error attached to a session.error event. Subset of the SDK's union. */
 export interface SessionErrorPayload {
   name?: string

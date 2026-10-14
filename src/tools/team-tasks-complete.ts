@@ -1,6 +1,7 @@
 import type { ToolDeps } from "../types"
 import { requireTeamMember, resolveStandbyWake } from "./shared"
 import { getMemberModel } from "../member-model"
+import { inReviewNudges } from "../hooks"
 import { log } from "../log"
 
 export interface TeamTasksCompleteArgs {
@@ -57,6 +58,9 @@ export async function executeTeamTasksComplete(
       "UPDATE team_task SET status = 'in_review', assignee = ?, review_notes = ?, time_updated = ? WHERE id = ?",
       [assignee, notes ?? task.review_notes ?? null, now, args.task_id],
     )
+
+    // Reset in-review nudge cooldown for Clara when a task is submitted or resubmitted for review
+    inReviewNudges.delete(`${teamInfo.teamId}:clara:${args.task_id}`)
 
     // Auto-wake Clara (Guardiã do Quality Gate) for review if present in team and not caller
     let claraNotified = false

@@ -532,8 +532,8 @@ function getDbPath(env = process.env) {
   const home = env.HOME ?? env.USERPROFILE ?? "~";
   return path.join(home, ".config", "opencode", "ensemble.db");
 }
-function createDb(path5) {
-  const db = openDatabase(path5);
+function createDb(path6) {
+  const db = openDatabase(path6);
   db.exec("PRAGMA journal_mode=WAL");
   db.exec("PRAGMA foreign_keys=ON");
   applyMigrations(db);
@@ -905,6 +905,7 @@ function endTracked(sessionID, controller) {
 
 // src/util.ts
 var NAME_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+var MEMBER_NAME_PATTERN = /^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$/;
 var counter = 0;
 function generateId(prefix) {
   const time = Date.now().toString(36);
@@ -935,7 +936,7 @@ function isWorktreeInstance(directory) {
 function validateMemberName(name) {
   if (name.toLowerCase() === "lead") return `Name "lead" is reserved`;
   if (name.length < 1 || name.length > 64) return "Member name must be 1-64 characters";
-  if (!NAME_PATTERN.test(name)) return "Member name must be lowercase alphanumeric with hyphens only";
+  if (!MEMBER_NAME_PATTERN.test(name)) return "Member name must be lowercase alphanumeric with hyphens or underscores only";
   return void 0;
 }
 
@@ -1264,6 +1265,27 @@ function shouldAlarmFastIdle(db, teamId, memberName, now = Date.now()) {
   if (now - member.time_created >= 15e3) return false;
   const msgCount = db.query("SELECT COUNT(*) as c FROM team_message WHERE team_id = ? AND from_name = ?").get(teamId, memberName).c;
   return msgCount === 0;
+}
+var IN_REVIEW_NUDGE_MESSAGE = "[System]: Tasks remain in review on the board. You must call team_tasks_complete to approve or reject the review, and report the outcome to the lead via team_message.";
+var MAX_IN_REVIEW_NUDGES = 2;
+var inReviewNudges = /* @__PURE__ */ new Map();
+function shouldNudgeInReviewTasks(db, teamId, memberName) {
+  if (memberName !== "clara") return false;
+  const member = db.query("SELECT status, execution_status FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
+  if (!member || member.status !== "ready") return false;
+  if (member.execution_status === "standby") return false;
+  const candidateTasks = db.query(
+    "SELECT id FROM team_task WHERE team_id = ? AND status = 'in_review' ORDER BY time_updated ASC"
+  ).all(teamId);
+  if (candidateTasks.length === 0) return false;
+  for (const t of candidateTasks) {
+    const key = `${teamId}:${memberName}:${t.id}`;
+    const attempts = inReviewNudges.get(key) ?? 0;
+    if (attempts < MAX_IN_REVIEW_NUDGES) {
+      return t.id;
+    }
+  }
+  return false;
 }
 function handleSessionErrorEvent(db, registry, client, sessionId, error) {
   if (!sessionId) return;
@@ -1956,10 +1978,39 @@ async function executeTeamClaim(deps, args, sessionId) {
 // src/tools/team-spawn.ts
 init_log();
 init_merge_helper();
+import { existsSync, readFileSync as readFileSync2 } from "node:fs";
+import os from "node:os";
+import path3 from "node:path";
 var spawnFailures = /* @__PURE__ */ new Map();
-function resolveModel(explicitModel, agentType, teamMemberCount, config) {
+function resolveBasePersona(memberName) {
+  return (memberName.split(/[-_]/)[0] ?? memberName).toLowerCase();
+}
+var MAX_PERSONA_CONTEXT_CHARS = 2400;
+function readBasePersonaFile(basePersonaName) {
+  try {
+    const file = path3.join(os.homedir(), ".config", "opencode", "agent", `${basePersonaName}.md`);
+    if (!existsSync(file)) return null;
+    const body = readFileSync2(file, "utf-8").trim();
+    if (!body) return null;
+    return body.length > MAX_PERSONA_CONTEXT_CHARS ? `${body.slice(0, MAX_PERSONA_CONTEXT_CHARS)}
+... (truncated)` : body;
+  } catch {
+    return null;
+  }
+}
+function resolveModel(explicitModel, agentType, teamMemberCount, config, memberName) {
   if (explicitModel) return explicitModel;
-  if (config.modelsByAgent[agentType]) return config.modelsByAgent[agentType];
+  const lookupKeys = [];
+  if (memberName) {
+    lookupKeys.push(memberName);
+    const basePersonaName = resolveBasePersona(memberName);
+    if (basePersonaName !== memberName) lookupKeys.push(basePersonaName);
+  }
+  lookupKeys.push(agentType);
+  for (const key of lookupKeys) {
+    const model = config.modelsByAgent[key];
+    if (model) return model;
+  }
   if (config.modelAssignment === "rotate" && config.modelPool.length > 0) {
     return config.modelPool[teamMemberCount % config.modelPool.length];
   }
@@ -1995,6 +2046,19 @@ async function executeTeamSpawn(deps, args, sessionId) {
   }
   const existing = deps.db.query("SELECT name FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, args.name);
   if (existing) throw new Error(`Teammate "${args.name}" already exists in team "${teamInfo.teamName}"`);
+  const basePersonaName = resolveBasePersona(args.name);
+  const isQualityGate = agent === "clara" || basePersonaName === "clara";
+  if (isQualityGate) {
+    const activeMembers = deps.db.query(
+      "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
+    ).all(teamInfo.teamId, args.name);
+    const concurrent = activeMembers.find((m) => resolveBasePersona(m.name) === "clara");
+    if (concurrent) {
+      throw new Error(
+        `Guardi\xE3 do Quality Gate 'clara' j\xE1 est\xE1 ativa na equipe '${teamInfo.teamName}' (inst\xE2ncia ativa: '${concurrent.name}'). Pap\xE9is de auditoria do Quality Gate s\xE3o exclusivos e n\xE3o admitem inst\xE2ncias concorrentes.`
+      );
+    }
+  }
   const isReadOnly = agent === "plan" || agent === "explore";
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory);
   const usePlanApproval = args.plan_approval === true;
@@ -2010,7 +2074,6 @@ async function executeTeamSpawn(deps, args, sessionId) {
       log(`spawn:auto-standby member=${args.name} task=${args.claim_task} reason=task_blocked`);
     }
   }
-  const isQualityGate = agent === "clara" || args.name.toLowerCase() === "clara";
   if (!autoStandby && isQualityGate && args.standby !== false) {
     const otherMembersCount = deps.db.query(
       "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
@@ -2170,7 +2233,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
   const planApproval = usePlanApproval ? "pending" : "none";
   const now = Date.now();
   const memberCount = deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId).c;
-  const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config);
+  const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config, args.name);
   if (resolvedModel) log(`spawn:model name=${args.name} model=${resolvedModel}`);
   const fallbackModel = selectFallbackModel(resolveFallbackChain(deps.config), resolvedModel);
   if (fallbackModel) log(`spawn:fallback name=${args.name} fallback=${formatModelSelector(fallbackModel)}`);
@@ -2231,6 +2294,24 @@ async function executeTeamSpawn(deps, args, sessionId) {
     `You are "${args.name}", a teammate in team "${teamInfo.teamName}".`,
     `Your agent type is "${agent}".`
   ];
+  if (basePersonaName !== args.name.toLowerCase()) {
+    const personaFile = readBasePersonaFile(basePersonaName);
+    const canonicalMember = deps.db.query(
+      "SELECT name FROM team_member WHERE team_id = ? AND name = ? AND status NOT IN ('shutdown', 'error')"
+    ).get(teamInfo.teamId, basePersonaName);
+    if (personaFile || canonicalMember) {
+      context.push(
+        "",
+        `Multi-instance persona: "${args.name}" is an instance of the canonical base persona "${basePersonaName}" (convention <persona>-<suffix>). Inherit its persona rules; keep one shared persona identity across instances.`
+      );
+      if (canonicalMember) {
+        context.push(`Canonical persona member "${canonicalMember.name}" is active in this team \u2014 coordinate with it as the same persona.`);
+      }
+      if (personaFile) {
+        context.push("", `Base persona context (${basePersonaName}.md):`, personaFile);
+      }
+    }
+  }
   const otherMembers = deps.db.query(
     "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
   ).all(teamInfo.teamId, args.name);
@@ -2340,6 +2421,10 @@ async function executeTeamSpawn(deps, args, sessionId) {
     "- Do NOT attempt workarounds or make assumptions. Wait for the lead's response.",
     "",
     "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted read/edit or qmd_search. Keep command outputs concise.",
+    "",
+    "MANDATORY CLOSING RULE: Approval without tools does not exist. It is strictly forbidden to finish your response with only plain text or Markdown. When concluding any task or audit/review, you MUST execute:",
+    "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' if submitting for review)",
+    "2. team_message(to: 'lead', text: '<task-result>...')",
     "",
     "Your plain text output is NOT visible to the team. You MUST use team_message to communicate."
   );
@@ -2744,6 +2829,7 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
       "UPDATE team_task SET status = 'in_review', assignee = ?, review_notes = ?, time_updated = ? WHERE id = ?",
       [assignee, notes ?? task.review_notes ?? null, now, args.task_id]
     );
+    inReviewNudges.delete(`${teamInfo.teamId}:clara:${args.task_id}`);
     let claraNotified = false;
     if (caller !== "clara") {
       const claraMember = deps.db.query(
@@ -5975,7 +6061,23 @@ async function setupEnsemble(ctx, options = {}) {
     const transition = dispatchV2Event(db, registry, tracker, event, failoverCtx);
     if (transition && transition.to === "ready" && transition.from === "busy") {
       const entry = registry.getByName(transition.teamId, transition.memberName);
-      if (entry) nudgeMember(transition.teamId, transition.memberName, entry.sessionId);
+      if (entry) {
+        nudgeMember(transition.teamId, transition.memberName, entry.sessionId);
+        const reviewTaskId = shouldNudgeInReviewTasks(db, transition.teamId, transition.memberName);
+        if (reviewTaskId) {
+          const key = `${transition.teamId}:${transition.memberName}:${reviewTaskId}`;
+          const currentCount = inReviewNudges.get(key) ?? 0;
+          inReviewNudges.set(key, currentCount + 1);
+          vlog(`nudge:in-review-tasks name=${transition.memberName} task=${reviewTaskId} attempt=${currentCount + 1}`);
+          void deliverPrompt(
+            ctx.session,
+            entry.sessionId,
+            IN_REVIEW_NUDGE_MESSAGE
+          ).catch((err) => {
+            vlog(`nudge:in-review-tasks:failed name=${transition.memberName} err=${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+      }
     }
     if (transition && rpc) {
       await emitMemberEvent(rpc, transition).catch(() => {
@@ -6119,7 +6221,7 @@ async function setupEnsemble(ctx, options = {}) {
 // src/index.ts
 import { tool } from "@opencode-ai/plugin";
 import { OpencodeClient } from "@opencode-ai/sdk/v2";
-import path4 from "node:path";
+import path5 from "node:path";
 import { mkdirSync } from "node:fs";
 
 // src/client.ts
@@ -6168,12 +6270,12 @@ function wrapThrowingClient(raw) {
 // src/watchdog.ts
 init_merge_helper();
 import { createRequire as createRequire2 } from "node:module";
-import path3 from "node:path";
+import path4 from "node:path";
 init_log();
 var requireSessionModule = createRequire2(import.meta.url);
 function sessionStorePath(env = process.env) {
   const home = env.HOME ?? env.USERPROFILE ?? "~";
-  return path3.join(home, ".local", "share", "opencode", "opencode.db");
+  return path4.join(home, ".local", "share", "opencode", "opencode.db");
 }
 function openSessionStore(dbPath) {
   if (typeof process.versions.bun === "string") {
@@ -6529,7 +6631,7 @@ var DEFAULT_RATE_LIMIT_INTERVAL_MS = 1e3;
 var DEFAULT_WATCHDOG_CHECK_MS = 60 * 1e3;
 var plugin = async (input) => {
   const dbPath = getDbPath();
-  mkdirSync(path4.dirname(dbPath), { recursive: true });
+  mkdirSync(path5.dirname(dbPath), { recursive: true });
   const db = createDb(dbPath);
   const config = loadConfig(input.directory);
   const registry = new MemberRegistry();
@@ -6645,6 +6747,22 @@ var plugin = async (input) => {
                 ...nudgeModel ? { model: nudgeModel } : {}
               }).catch((err) => {
                 log(`nudge:idle-without-report:failed name=${transition.memberName} team=${transition.teamId} err=${err instanceof Error ? err.message : String(err)}`);
+              });
+            }
+            const reviewTaskId = shouldNudgeInReviewTasks(db, transition.teamId, transition.memberName);
+            if (reviewTaskId) {
+              const reviewNudgeKey = `${transition.teamId}:${transition.memberName}:${reviewTaskId}`;
+              const currentCount = inReviewNudges.get(reviewNudgeKey) ?? 0;
+              inReviewNudges.set(reviewNudgeKey, currentCount + 1);
+              log(`nudge:in-review-tasks name=${transition.memberName} task=${reviewTaskId} attempt=${currentCount + 1}`);
+              const nudgeModel = getMemberModel(db, transition.teamId, transition.memberName);
+              client.session.promptAsync({
+                sessionID,
+                parts: [{ type: "text", text: IN_REVIEW_NUDGE_MESSAGE }],
+                ...nudgeModel ? { model: nudgeModel } : {},
+                synthetic: true
+              }).catch((err) => {
+                log(`nudge:in-review-tasks:failed name=${transition.memberName} team=${transition.teamId} err=${err instanceof Error ? err.message : String(err)}`);
               });
             }
           } else if (transition.to === "error") {
@@ -7055,6 +7173,7 @@ var index_default = {
 };
 export {
   FAILOVER_COOLDOWN_MS,
+  IN_REVIEW_NUDGE_MESSAGE,
   Watchdog,
   abortInflight,
   buildLeadSystemPrompt,
@@ -7073,9 +7192,11 @@ export {
   hasInReviewAssignedTasks,
   hasOtherActiveMembers,
   hasPendingBoardTasks,
+  inReviewNudges,
   lastRoomActivity,
   setMemberStandby,
   shouldAlarmFastIdle,
   shouldNudgeIdleMember,
+  shouldNudgeInReviewTasks,
   trackPrompt
 };

@@ -9,7 +9,7 @@ import { createV2Client } from "./v2-client"
 import { registerV2Tools } from "./v2-tools"
 import type { PluginClient, ToolDeps } from "./types"
 import { ProgressTracker } from "./progress"
-import { checkToolIsolation, shouldNudgeIdleMember } from "./hooks"
+import { checkToolIsolation, shouldNudgeIdleMember, shouldNudgeInReviewTasks, inReviewNudges, IN_REVIEW_NUDGE_MESSAGE } from "./hooks"
 import { hasReportedCompletion } from "./messaging"
 import { rehydrateRegistry } from "./recovery"
 import { findTeamBySession } from "./types"
@@ -174,7 +174,25 @@ export async function setupEnsemble(
     // waits forever — the exact failure seen live on 2026-09-14.
     if (transition && transition.to === "ready" && transition.from === "busy") {
       const entry = registry.getByName(transition.teamId, transition.memberName)
-      if (entry) nudgeMember(transition.teamId, transition.memberName, entry.sessionId)
+      if (entry) {
+        nudgeMember(transition.teamId, transition.memberName, entry.sessionId)
+
+        // In-review tasks nudge: if tasks remain in review and member went idle without completing/rejecting
+        const reviewTaskId = shouldNudgeInReviewTasks(db, transition.teamId, transition.memberName)
+        if (reviewTaskId) {
+          const key = `${transition.teamId}:${transition.memberName}:${reviewTaskId}`
+          const currentCount = inReviewNudges.get(key) ?? 0
+          inReviewNudges.set(key, currentCount + 1)
+          vlog(`nudge:in-review-tasks name=${transition.memberName} task=${reviewTaskId} attempt=${currentCount + 1}`)
+          void deliverPrompt(
+            ctx.session as unknown as V2SessionPort,
+            entry.sessionId,
+            IN_REVIEW_NUDGE_MESSAGE,
+          ).catch((err) => {
+            vlog(`nudge:in-review-tasks:failed name=${transition.memberName} err=${err instanceof Error ? err.message : String(err)}`)
+          })
+        }
+      }
     }
     if (transition && rpc) {
       await emitMemberEvent(rpc, transition).catch(() => {

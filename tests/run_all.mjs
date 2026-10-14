@@ -42,6 +42,8 @@ const SUITES = [
   { file: "test_clara_lead_routing.mjs", label: "Roteamento e Auto-Wake da Guardiã Clara" },
   { file: "test_room_inactivity_watchdog.mjs", label: "Watchdog de Ociosidade da Sala & Despacho da Clara" },
   { file: "test_retry_failover_active.mjs", label: "Failover Ativo de Modelo (Abort + Re-prompt)" },
+  { file: "test_in_review_idle_nudge.mjs", label: "Nudge de Correção Automática em Silêncio com Tarefas sob Review" },
+  { file: "test_multi_instance_spawn.mjs", label: "Instâncias Múltiplas de Persona & Trava da Guardiã" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

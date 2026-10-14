@@ -10,10 +10,10 @@ import { wrapThrowingClient } from "./client"
 import { recoverStaleMembers, recoverUndeliveredMessages, recoverOrphanedWorktrees, recoverOrphanedBranches, recoverOrphanedTeams, rehydrateRegistry } from "./recovery"
 import { MemberRegistry, DescendantTracker, PendingPurgeApprovals } from "./state"
 import { isWorktreeInstance } from "./util"
-import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, shouldAlarmFastIdle, handleSessionErrorEvent, handleRetryModelFailover, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
+import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, shouldAlarmFastIdle, shouldNudgeInReviewTasks, inReviewNudges, IN_REVIEW_NUDGE_MESSAGE, handleSessionErrorEvent, handleRetryModelFailover, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
 // Re-exported so test harnesses (and the dist bundle) can exercise the nudge /
 // fast-idle decisions against a real SQLite database without reimplementing them.
-export { shouldNudgeIdleMember, shouldAlarmFastIdle, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
+export { shouldNudgeIdleMember, shouldAlarmFastIdle, shouldNudgeInReviewTasks, inReviewNudges, IN_REVIEW_NUDGE_MESSAGE, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
 // Silent rate-limit failover (zero-noise) — exported for the deterministic
 // suites to drive and inspect the cooldown map without wall-clock sleeps.
 export { handleRetryModelFailover, failoverCooldown, FAILOVER_COOLDOWN_MS } from "./hooks"
@@ -237,6 +237,24 @@ const plugin: Plugin = async (input) => {
                 ...(nudgeModel ? { model: nudgeModel } : {}),
               }).catch((err) => {
                 log(`nudge:idle-without-report:failed name=${transition.memberName} team=${transition.teamId} err=${err instanceof Error ? err.message : String(err)}`)
+              })
+            }
+
+            // In-review tasks nudge: if tasks remain in review and member went idle without completing/rejecting
+            const reviewTaskId = shouldNudgeInReviewTasks(db, transition.teamId, transition.memberName)
+            if (reviewTaskId) {
+              const reviewNudgeKey = `${transition.teamId}:${transition.memberName}:${reviewTaskId}`
+              const currentCount = inReviewNudges.get(reviewNudgeKey) ?? 0
+              inReviewNudges.set(reviewNudgeKey, currentCount + 1)
+              log(`nudge:in-review-tasks name=${transition.memberName} task=${reviewTaskId} attempt=${currentCount + 1}`)
+              const nudgeModel = getMemberModel(db, transition.teamId, transition.memberName)
+              client.session.promptAsync({
+                sessionID,
+                parts: [{ type: "text", text: IN_REVIEW_NUDGE_MESSAGE }],
+                ...(nudgeModel ? { model: nudgeModel } : {}),
+                synthetic: true,
+              }).catch((err) => {
+                log(`nudge:in-review-tasks:failed name=${transition.memberName} team=${transition.teamId} err=${err instanceof Error ? err.message : String(err)}`)
               })
             }
           } else if (transition.to === "error") {

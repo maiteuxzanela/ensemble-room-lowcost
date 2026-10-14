@@ -13,22 +13,71 @@ import {
 import { log } from "../log"
 import type { EnsembleConfig } from "../config"
 import { getTeamResourceParts, teamWorktreeName } from "./merge-helper"
+import { existsSync, readFileSync } from "node:fs"
+import os from "node:os"
+import path from "node:path"
 
 /** Tracks consecutive spawn failures per team for circuit breaker. */
 export const spawnFailures = new Map<string, { count: number; lastError: string }>()
 
 /**
+ * Multi-instance convention `<persona>-<suffix>` / `<persona>_<suffix>`.
+ * Returns the canonical lowercase base persona of a member name:
+ * "cris-1", "cris_2" and "cris" all resolve to "cris".
+ */
+export function resolveBasePersona(memberName: string): string {
+  return (memberName.split(/[-_]/)[0] ?? memberName).toLowerCase()
+}
+
+/** Maximum chars of a canonical persona file inlined into spawn context (anti-dumping). */
+const MAX_PERSONA_CONTEXT_CHARS = 2400
+
+/**
+ * Read the canonical persona definition (`~/.config/opencode/agent/<base>.md`)
+ * for a base persona. Returns null when the persona does not exist or reading
+ * fails — never throws (persona context is enrichment, not a hard dependency).
+ */
+export function readBasePersonaFile(basePersonaName: string): string | null {
+  try {
+    const file = path.join(os.homedir(), ".config", "opencode", "agent", `${basePersonaName}.md`)
+    if (!existsSync(file)) return null
+    const body = readFileSync(file, "utf-8").trim()
+    if (!body) return null
+    return body.length > MAX_PERSONA_CONTEXT_CHARS
+      ? `${body.slice(0, MAX_PERSONA_CONTEXT_CHARS)}\n... (truncated)`
+      : body
+  } catch {
+    return null
+  }
+}
+
+/**
  * Resolve which model to use for a spawned agent.
- * Priority: explicit arg > modelsByAgent > rotation/random > defaultModel > undefined.
+ * Priority: explicit arg > modelsByAgent[memberName] > modelsByAgent[basePersona] >
+ * modelsByAgent[agentType] > rotation/random > defaultModel > undefined.
+ *
+ * The memberName lookup makes multi-instance members (`cris-1`) inherit the
+ * model bound to their canonical persona (`cris`) without config changes.
  */
 export function resolveModel(
   explicitModel: string | undefined,
   agentType: string,
   teamMemberCount: number,
   config: Required<EnsembleConfig>,
+  memberName?: string,
 ): string | undefined {
   if (explicitModel) return explicitModel
-  if (config.modelsByAgent[agentType]) return config.modelsByAgent[agentType]
+  const lookupKeys: string[] = []
+  if (memberName) {
+    lookupKeys.push(memberName)
+    const basePersonaName = resolveBasePersona(memberName)
+    if (basePersonaName !== memberName) lookupKeys.push(basePersonaName)
+  }
+  lookupKeys.push(agentType)
+  for (const key of lookupKeys) {
+    const model = config.modelsByAgent[key]
+    if (model) return model
+  }
   if (config.modelAssignment === "rotate" && config.modelPool.length > 0) {
     return config.modelPool[teamMemberCount % config.modelPool.length]
   }
@@ -95,6 +144,27 @@ export async function executeTeamSpawn(
     .get(teamInfo.teamId, args.name)
   if (existing) throw new Error(`Teammate "${args.name}" already exists in team "${teamInfo.teamName}"`)
 
+  // Multi-instance normalization: "cris-1"/"cris_1" → base persona "cris".
+  const basePersonaName = resolveBasePersona(args.name)
+
+  // Quality Gate uniqueness lock (Guardiã Clara): audit roles are exclusive.
+  // Any member that IS or RESOLVES TO the "clara" base persona (name `clara`,
+  // instance `clara-2`/`clara_2`, or agent "clara") is rejected while another
+  // active clara-family member exists in the same team. Deterministic,
+  // fail-fast (before any worktree/session side effect).
+  const isQualityGate = agent === "clara" || basePersonaName === "clara"
+  if (isQualityGate) {
+    const activeMembers = deps.db.query(
+      "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
+    ).all(teamInfo.teamId, args.name) as Array<{ name: string }>
+    const concurrent = activeMembers.find((m) => resolveBasePersona(m.name) === "clara")
+    if (concurrent) {
+      throw new Error(
+        `Guardiã do Quality Gate 'clara' já está ativa na equipe '${teamInfo.teamName}' (instância ativa: '${concurrent.name}'). Papéis de auditoria do Quality Gate são exclusivos e não admitem instâncias concorrentes.`,
+      )
+    }
+  }
+
   const isReadOnly = agent === "plan" || agent === "explore"
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory)
   const usePlanApproval = args.plan_approval === true
@@ -115,10 +185,10 @@ export async function executeTeamSpawn(
   }
 
   // Semantic Auto-Standby for Quality Gate Guardian (clara):
-  // If agent is clara (or agent === "clara" or name === "clara") and the team
-  // has other active members or pending tasks on the board, Clara must be born
-  // in standby unless args.standby === false is explicitly passed.
-  const isQualityGate = agent === "clara" || args.name.toLowerCase() === "clara"
+  // If agent is clara (or agent === "clara" or the base persona of the name is
+  // "clara") and the team has other active members or pending tasks on the
+  // board, Clara must be born in standby unless args.standby === false is
+  // explicitly passed.
   if (!autoStandby && isQualityGate && args.standby !== false) {
     const otherMembersCount = (deps.db.query(
       "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
@@ -303,7 +373,7 @@ export async function executeTeamSpawn(
   const now = Date.now()
   // Resolve model before DB insert so the stored value matches what promptAsync uses
   const memberCount = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId) as { c: number }).c
-  const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config)
+  const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config, args.name)
   if (resolvedModel) log(`spawn:model name=${args.name} model=${resolvedModel}`)
 
   // Resolve the rate-limit fallback chain (fallbackModels → modelFallback →
@@ -377,6 +447,29 @@ export async function executeTeamSpawn(
     `You are "${args.name}", a teammate in team "${teamInfo.teamName}".`,
     `Your agent type is "${agent}".`,
   ]
+
+  // Multi-instance inheritance: a child instance ("cris-1"/"cris_1") receives
+  // the base persona context whenever the canonical persona exists — either as
+  // the persona definition file (~/.config/opencode/agent/<base>.md) or as an
+  // active canonical member of this team.
+  if (basePersonaName !== args.name.toLowerCase()) {
+    const personaFile = readBasePersonaFile(basePersonaName)
+    const canonicalMember = deps.db.query(
+      "SELECT name FROM team_member WHERE team_id = ? AND name = ? AND status NOT IN ('shutdown', 'error')"
+    ).get(teamInfo.teamId, basePersonaName) as { name: string } | null
+    if (personaFile || canonicalMember) {
+      context.push(
+        "",
+        `Multi-instance persona: "${args.name}" is an instance of the canonical base persona "${basePersonaName}" (convention <persona>-<suffix>). Inherit its persona rules; keep one shared persona identity across instances.`,
+      )
+      if (canonicalMember) {
+        context.push(`Canonical persona member "${canonicalMember.name}" is active in this team — coordinate with it as the same persona.`)
+      }
+      if (personaFile) {
+        context.push("", `Base persona context (${basePersonaName}.md):`, personaFile)
+      }
+    }
+  }
 
   // Show other teammates so this agent knows who to message
   const otherMembers = deps.db.query(
@@ -495,6 +588,10 @@ export async function executeTeamSpawn(
     "- Do NOT attempt workarounds or make assumptions. Wait for the lead's response.",
     "",
     "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted read/edit or qmd_search. Keep command outputs concise.",
+    "",
+    "MANDATORY CLOSING RULE: Approval without tools does not exist. It is strictly forbidden to finish your response with only plain text or Markdown. When concluding any task or audit/review, you MUST execute:",
+    "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' if submitting for review)",
+    "2. team_message(to: 'lead', text: '<task-result>...')",
     "",
     "Your plain text output is NOT visible to the team. You MUST use team_message to communicate.",
   )

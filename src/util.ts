@@ -1,4 +1,6 @@
 const NAME_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/
+/** Member names additionally accept "_" so the multi-instance convention `<persona>_<suffix>` is valid. */
+const MEMBER_NAME_PATTERN = /^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$/
 
 let counter = 0
 
@@ -49,12 +51,13 @@ export function isWorktreeInstance(directory: string): boolean {
 }
 
 /**
- * Validate a member name. Same rules as team name, plus "lead" is reserved.
+ * Validate a member name. Same rules as team name, plus "lead" is reserved
+ * and "_" is allowed for the multi-instance convention `<persona>_<suffix>`.
  * Returns an error message string if invalid, undefined if valid.
  */
 export function validateMemberName(name: string): string | undefined {
   if (name.toLowerCase() === "lead") return `Name "lead" is reserved`
   if (name.length < 1 || name.length > 64) return "Member name must be 1-64 characters"
-  if (!NAME_PATTERN.test(name)) return "Member name must be lowercase alphanumeric with hyphens only"
+  if (!MEMBER_NAME_PATTERN.test(name)) return "Member name must be lowercase alphanumeric with hyphens or underscores only"
   return undefined
 }
