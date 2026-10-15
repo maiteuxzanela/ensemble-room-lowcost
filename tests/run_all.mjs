@@ -52,6 +52,7 @@ const SUITES = [
   { file: "test_agent_identity_nudges.mjs", label: "HARNESS-17 (Identidade do agent nos 4 nudges secundários)" },
   { file: "test_hugo_sdet_integration.mjs", label: "Hugo/SDET (Standby default, Trava de Exclusividade & Paridade V1↔V2)" },
   { file: "test_decision_lead_anti_redundancy.mjs", label: "HARNESS-22 (decision_lead, Pausa da Clara & Anti-Redundância)" },
+  { file: "test_global_agent_injection.mjs", label: "HARNESS-21 (Injeção Global de Persona: choke point V1 + transporte V2)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

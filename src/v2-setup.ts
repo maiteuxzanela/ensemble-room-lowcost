@@ -4,6 +4,7 @@ import type { MemberRegistry, DescendantTracker } from "./state"
 import { MemberRegistry as MemberRegistryImpl, DescendantTracker as DescendantTrackerImpl, PendingPurgeApprovals } from "./state"
 import { dispatchV2Event, type V2EventLike } from "./v2-events"
 import { deliverPrompt, type V2SessionPort } from "./v2-session"
+import { resolveAgentForSession } from "./member-model"
 import type { V2Context } from "./v2-client"
 import { createV2Client } from "./v2-client"
 import { registerV2Tools } from "./v2-tools"
@@ -127,10 +128,14 @@ export async function setupEnsemble(
       memberName,
     ])
     vlog(`nudge:idle-without-report name=${memberName}`)
+    // HARNESS-21 (V2 family): re-assert the target's persona — V2 `prompt` has
+    // no `agent` slot, so deliverPrompt switches it first. Unknown session →
+    // undefined → delivered verbatim.
     void deliverPrompt(
       ctx.session as unknown as V2SessionPort,
       sessionId,
       "[System]: You completed your work but did not report results. Send your findings to the lead via team_message now.",
+      resolveAgentForSession(db, sessionId),
     ).catch((err) => {
       vlog(`nudge:idle-without-report:failed name=${memberName} err=${err instanceof Error ? err.message : String(err)}`)
     })
@@ -184,10 +189,12 @@ export async function setupEnsemble(
           const currentCount = inReviewNudges.get(key) ?? 0
           inReviewNudges.set(key, currentCount + 1)
           vlog(`nudge:in-review-tasks name=${transition.memberName} task=${reviewTaskId} attempt=${currentCount + 1}`)
+          // HARNESS-21 (V2 family): same persona re-assertion as the idle nudge.
           void deliverPrompt(
             ctx.session as unknown as V2SessionPort,
             entry.sessionId,
             IN_REVIEW_NUDGE_MESSAGE,
+            resolveAgentForSession(db, entry.sessionId),
           ).catch((err) => {
             vlog(`nudge:in-review-tasks:failed name=${transition.memberName} err=${err instanceof Error ? err.message : String(err)}`)
           })

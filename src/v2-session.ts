@@ -17,6 +17,18 @@ export interface V2SessionPort {
   }): Promise<{ id: string }>
   prompt(input: { sessionID: string; text: string; delivery?: "steer" | "queue" }): Promise<unknown>
   interrupt(input: { sessionID: string }): Promise<unknown>
+  /**
+   * Bind the persona a session runs as (`SessionSwitchAgentInput` on the
+   * server). This is the ONLY way to re-assert identity on V2: `ctx.session
+   * .prompt` carries no `agent` field — its input is `{ sessionID, text,
+   * files?, agents?, skills?, metadata?, delivery?, resume? }` (see
+   * `@opencode/client` `SessionPromptInput`), so an `agent` key on `prompt`
+   * would be silently stripped by the Effect schema and the server would
+   * rebind the session to the installation default (`dante`). Optional in this
+   * port so read-only fakes that never deliver a persona degrade to verbatim
+   * delivery instead of throwing.
+   */
+  switchAgent?(input: { sessionID: string; agent: string }): Promise<unknown>
 }
 
 /** Input for spawning a teammate session on V2. */
@@ -41,12 +53,28 @@ export async function createTeammateSession(
   return created.id
 }
 
-/** Deliver a system text to a session. Uses queue delivery (spike-verified). */
+/**
+ * Deliver a system text to a session. Uses queue delivery (spike-verified).
+ *
+ * Identity hardening (HARNESS-21, V2 family): when `agent` is provided the
+ * persona is re-asserted via `switchAgent` BEFORE the prompt — the V2 analogue
+ * of the `agent` field the V1 choke point (`wrapThrowingClient`) injects on
+ * `promptAsync`. This closes the V2 gap where a nudge/wake omitted `agent` and
+ * the server silently rebound the session to the default (`dante`), stealing
+ * the member's persona and exclusive tool permissions.
+ *
+ * `agent` is injected only when truthy: an unknown/omitted resolver result
+ * (sub-agent or isolated reviewer session) is delivered verbatim — never
+ * resequenced into an arbitrary persona. If the port lacks `switchAgent`
+ * (structural fake), the text is still delivered, just without a persona bind.
+ */
 export async function deliverPrompt(
   port: V2SessionPort,
   sessionID: string,
   text: string,
+  agent?: string,
 ): Promise<unknown> {
+  if (agent) await port.switchAgent?.({ sessionID, agent })
   return port.prompt({ sessionID, text, delivery: "queue" })
 }
 

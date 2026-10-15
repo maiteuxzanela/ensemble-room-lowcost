@@ -33,7 +33,7 @@ export { lastRoomActivity } from "./config"
 export { Watchdog } from "./watchdog"
 import { notifyTeamEvent, notifyWorkingProgress, notifyLead } from "./notify"
 import { hasReportedCompletion } from "./messaging"
-import { getMemberModel } from "./member-model"
+import { getMemberModel, resolveAgentForSession } from "./member-model"
 import { buildLeadSystemPrompt, buildTeammateSystemPrompt, buildTeamCompactionContext } from "./system-prompt"
 import { log, initLog } from "./log"
 import { findTeamBySession } from "./types"
@@ -96,7 +96,12 @@ const plugin: Plugin = async (input) => {
   const pluginTransport = (input.client as unknown as { _client: V2Transport })._client
   const rawClient = new OpencodeClient({ client: pluginTransport })
   initLog(rawClient)
-  const client = wrapThrowingClient(rawClient)
+  // HARNESS-21: wire the persona resolver into the single client choke point.
+  // Every `client.session.promptAsync` the plugin makes now gets the resolved
+  // `agent` injected when the caller omitted it — by construction, not by
+  // per-call-site discipline. This closes the legacy gaps (idle-without-report,
+  // wake-lead) and any future path without touching their call sites.
+  const client = wrapThrowingClient(rawClient, (sessionID) => resolveAgentForSession(db, sessionID))
   const deps: ToolDeps = { db, registry, tracker, purgeApprovals, client, directory: input.directory, config, progressTracker }
 
   // Recovery only runs for the main project instance — NOT for teammate worktree instances.

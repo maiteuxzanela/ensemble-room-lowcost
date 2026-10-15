@@ -949,7 +949,8 @@ function lastRoomActivity(db, teamId) {
 }
 
 // src/v2-session.ts
-async function deliverPrompt(port, sessionID, text) {
+async function deliverPrompt(port, sessionID, text, agent) {
+  if (agent) await port.switchAgent?.({ sessionID, agent });
   return port.prompt({ sessionID, text, delivery: "queue" });
 }
 var inflight = /* @__PURE__ */ new Map();
@@ -1708,6 +1709,31 @@ function dispatchV2Event(db, registry, tracker, event, failoverCtx) {
   }
 }
 
+// src/member-model.ts
+function parseModelId(model) {
+  const hash = model.indexOf("#");
+  const variant = hash >= 0 ? model.slice(hash + 1) : void 0;
+  const base = hash >= 0 ? model.slice(0, hash) : model;
+  const slash = base.indexOf("/");
+  if (slash <= 0 || slash === base.length - 1) return void 0;
+  const parsed = { providerID: base.slice(0, slash), modelID: base.slice(slash + 1) };
+  if (variant) parsed.variant = variant;
+  return parsed;
+}
+function getMemberModel(db, teamId, memberName) {
+  const row = db.query("SELECT model FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
+  if (!row?.model) return void 0;
+  return parseModelId(row.model);
+}
+function resolveAgentForSession(db, sessionID) {
+  if (!sessionID) return void 0;
+  const member = db.query("SELECT agent FROM team_member WHERE session_id = ?").get(sessionID);
+  if (member?.agent) return member.agent;
+  const lead = db.query("SELECT lead_agent FROM team WHERE lead_session_id = ?").get(sessionID);
+  if (lead) return lead.lead_agent ?? "dante";
+  return void 0;
+}
+
 // src/v2-client.ts
 init_process();
 var DIR_WORKSPACE_PREFIX = "v2dir:";
@@ -1845,23 +1871,6 @@ function createV2Client(ctx, deps = {}) {
       })
     }
   };
-}
-
-// src/member-model.ts
-function parseModelId(model) {
-  const hash = model.indexOf("#");
-  const variant = hash >= 0 ? model.slice(hash + 1) : void 0;
-  const base = hash >= 0 ? model.slice(0, hash) : model;
-  const slash = base.indexOf("/");
-  if (slash <= 0 || slash === base.length - 1) return void 0;
-  const parsed = { providerID: base.slice(0, slash), modelID: base.slice(slash + 1) };
-  if (variant) parsed.variant = variant;
-  return parsed;
-}
-function getMemberModel(db, teamId, memberName) {
-  const row = db.query("SELECT model FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
-  if (!row?.model) return void 0;
-  return parseModelId(row.model);
 }
 
 // src/recovery.ts
@@ -6399,7 +6408,8 @@ async function setupEnsemble(ctx, options = {}) {
     void deliverPrompt(
       ctx.session,
       sessionId,
-      "[System]: You completed your work but did not report results. Send your findings to the lead via team_message now."
+      "[System]: You completed your work but did not report results. Send your findings to the lead via team_message now.",
+      resolveAgentForSession(db, sessionId)
     ).catch((err) => {
       vlog(`nudge:idle-without-report:failed name=${memberName} err=${err instanceof Error ? err.message : String(err)}`);
     });
@@ -6437,7 +6447,8 @@ async function setupEnsemble(ctx, options = {}) {
           void deliverPrompt(
             ctx.session,
             entry.sessionId,
-            IN_REVIEW_NUDGE_MESSAGE
+            IN_REVIEW_NUDGE_MESSAGE,
+            resolveAgentForSession(db, entry.sessionId)
           ).catch((err) => {
             vlog(`nudge:in-review-tasks:failed name=${transition.memberName} err=${err instanceof Error ? err.message : String(err)}`);
           });
@@ -6603,12 +6614,32 @@ function throwing(fn) {
     return result;
   };
 }
-function wrapThrowingClient(raw) {
+function throwingPromptAsync(fn, agentResolver) {
+  return async (...args) => {
+    const [params, ...rest] = args;
+    let effectiveParams = params;
+    if (agentResolver && params && typeof params === "object") {
+      const injected = params;
+      const agent = injected.agent;
+      const hasExplicitAgent = agent !== void 0 && agent !== null && !(typeof agent === "string" && agent.length === 0);
+      if (!hasExplicitAgent && typeof injected.sessionID === "string" && injected.sessionID.length > 0) {
+        const resolved = agentResolver(injected.sessionID);
+        if (resolved) effectiveParams = { ...params, agent: resolved };
+      }
+    }
+    const result = await fn(effectiveParams, ...rest);
+    if (result && typeof result === "object" && "error" in result && result.error !== void 0) {
+      throw new Error(extractError(result.error));
+    }
+    return result;
+  };
+}
+function wrapThrowingClient(raw, agentResolver) {
   const r = raw;
   return {
     session: {
       create: throwing(r.session.create.bind(r.session)),
-      promptAsync: throwing(r.session.promptAsync.bind(r.session)),
+      promptAsync: throwingPromptAsync(r.session.promptAsync.bind(r.session), agentResolver),
       abort: throwing(r.session.abort.bind(r.session)),
       status: throwing(r.session.status.bind(r.session)),
       messages: throwing(r.session.messages.bind(r.session)),
@@ -7029,7 +7060,7 @@ var plugin = async (input) => {
   const pluginTransport = input.client._client;
   const rawClient = new OpencodeClient({ client: pluginTransport });
   initLog(rawClient);
-  const client = wrapThrowingClient(rawClient);
+  const client = wrapThrowingClient(rawClient, (sessionID) => resolveAgentForSession(db, sessionID));
   const deps = { db, registry, tracker, purgeApprovals, client, directory: input.directory, config, progressTracker };
   if (!isWorktreeInstance(input.directory)) {
     log("init:recovery:start (main instance)");
