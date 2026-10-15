@@ -38,12 +38,17 @@ const SUITES = [
   { file: "test_force_model_abort.mjs", label: "AbortController & Forced Model Switch" },
   { file: "test_fallback_models.mjs", label: "Schema de Fallback de Modelo" },
   { file: "test_rate_limit_failover.mjs", label: "Rate-Limit Failover Silencioso" },
+  { file: "test_per_agent_fallback.mjs", label: "Fallback de Modelo Por-Agente (Per-Agent + Sessão Isolada)" },
+  { file: "test_fallback_hardening.mjs", label: "Fallback Hardening (Variant default + HARNESS-13/15)" },
   { file: "test_failover_integration.mjs", label: "Integração do Failover + Variant no switchModel V2" },
   { file: "test_clara_lead_routing.mjs", label: "Roteamento e Auto-Wake da Guardiã Clara" },
   { file: "test_room_inactivity_watchdog.mjs", label: "Watchdog de Ociosidade da Sala & Despacho da Clara" },
   { file: "test_retry_failover_active.mjs", label: "Failover Ativo de Modelo (Abort + Re-prompt)" },
   { file: "test_in_review_idle_nudge.mjs", label: "Nudge de Correção Automática em Silêncio com Tarefas sob Review" },
   { file: "test_multi_instance_spawn.mjs", label: "Instâncias Múltiplas de Persona & Trava da Guardiã" },
+  { file: "test_agnostic_qa_role.mjs", label: "Papel Agnóstico do Quality Gate (Migration 14)" },
+  { file: "test_model_aware_wakes.mjs", label: "Wake Ciente de Modelo (F1 board-complete + F2 watchdog/spawn)" },
+  { file: "test_harness16_unblock_wake.mjs", label: "HARNESS-16 (Wake Incondicional do Assignee + Watchdog de Inatividade)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

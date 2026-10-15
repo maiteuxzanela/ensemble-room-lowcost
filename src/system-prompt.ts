@@ -197,8 +197,8 @@ export function buildTeammateSystemPrompt(db: Database, teamId: string, memberNa
     "The runtime automatically wakes you with a synthetic system prompt when dependent tasks are unblocked or peer messages arrive.",
     "",
     "ANTI-DUMPING & CODE EXPLORATION CONTRACT:",
-    "Do NOT use bash grep, find, or broad shell searches across codebases.",
-    "Use strictly qmd_search or read/edit targeting specific files. Never dump files >300 lines or raw command outputs into context.",
+    "Do NOT use bash grep, find, or broad shell scans across codebases.",
+    "Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit on specific files. Never dump files >300 lines or raw command outputs into context.",
   ]
 
   // Deliver pending peer messages addressed to this teammate

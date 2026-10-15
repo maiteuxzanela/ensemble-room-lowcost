@@ -134,7 +134,62 @@ Toda alteração neste repositório segue **obrigatoriamente** o ciclo abaixo, n
 
 ---
 
-## 5. Governança
+## 5. Failover de Modelo por Rate-Limit (cadeias por agente, contrato de variante, seams)
+
+Quando o OpenCode responde 429/retry no modelo de uma sessão, o plugin **caminha para frente** numa cadeia de fallback configurada. Três donos de código: `src/config.ts` (resolução de cadeia + seleção do próximo), `src/hooks.ts` (seams membro/isolado/lead), `src/notify.ts` (wake ciente de modelo).
+
+### 5.1 Contrato do servidor sobre `model.variant` — `"default"` = SEM variante
+
+O servidor OpenCode reporta `model.variant === "default"` quando um modelo **não tem variante**. `"default"` é o **marcador de ausência**, não um nível de pensamento (que são `low` / `medium` / `high`). Um membro spawnado sem variante explícita aparece, portanto, como o seletor `provider/model#default`.
+
+Contrato imposto em `src/config.ts` (constante `VARIANT_ABSENT_SENTINEL`):
+
+- `parseModelSelector`: `#default` é tratado como ausente — `"p/m#default"` parseia para o mesmo resultado de `"p/m"` (sem `variant`);
+- `formatModelSelector`: **nunca** emite `#default`;
+- `selectNextFallback` / `selectFallbackModel`: normalizam o `current`/`primary` **antes** de casar com a cadeia (`stripDefaultVariant`);
+- `resolveFallbackChain`: normaliza também um `modelFallback.variant: "default"` vindo do `ensemble.json`.
+
+**Por quê (achado 1 da auditoria):** sem isso, a chave `"p/m#default"` nunca iguala uma entrada da cadeia (`"p/m#low"`), o `findIndex` devolve `-1` e o failover cai no ramo "atual fora da cadeia" → reinicia no `chain[0]` **a cada retry**: **loop infinito de troca de modelo**, sem progresso e sem exaustão observável.
+
+### 5.2 Cadeia global × cadeia por agente (`fallbackModelsByAgent`)
+
+Ordem de resolução em `resolveFallbackChainForAgent(config, agent)`:
+
+1. `fallbackModelsByAgent[agent]` — chave **exata** (não vazia);
+2. `fallbackModelsByAgent[resolveBasePersona(agent)]` — **simetria multi-instância**: `"diana-x"` / `"diana_2"` herdam a cadeia de `"diana"` (mesma convenção de `src/tools/team-spawn.ts`);
+3. cadeia global `resolveFallbackChain(config)` → `fallbackModels` → `modelFallback` → `DEFAULT_MODEL_FALLBACK` (`google/antigravity-gemini-3.8-flash#low`).
+
+A cadeia resultante **nunca é vazia**: entradas malformadas são descartadas e duplicatas colapsam (`chainFromSelectors`); uma chave existente mas vazia/malformada cai para o próximo degrau em vez de retornar `[]`.
+
+Em `loadConfig`, `DEFAULT → global → project` é aplicado com dois desvios do spread raso (que substitui o valor inteiro):
+
+- `deniedTools`: união aditiva (listas de negação acumulam, deduplicadas);
+- `fallbackModelsByAgent`: **merge por chave de agente** — um `ensemble.json` de projeto parcial (ex.: só `"build"`) **não apaga** as cadeias globais irmãs (ex.: `"diana"`); só agentes redeclarados são sobrepostos.
+
+Cadeias dedicadas por persona ficam em `~/.config/opencode/ensemble.json` (globais), ex.: Diana em cadeia própria (`opencode-go/gemini-4-argon-contributor` → `opencode-go/gpt-6-luna` → `google/antigravity-gemini-3.8-flash#high`) e demais especialistas na cadeia econômica (`opencode/mimo-v2.6-flash-free` → `opencode-go/mimo-v2.6-flash` → `opencode-go/claude-haiku-5-5` → `google/antigravity-gemini-3.8-flash#low`).
+
+### 5.3 Três seams de failover: membro × isolado × lead
+
+| Seam | Quem | Cadeia | Efeitos |
+|---|---|---|---|
+| **Membro** | sessão registrada em `team_member` (`handleRetryModelFailover`) | `fallbackModelsByAgent[member.agent]` → global | switch **persistido** em `team_member.model` (todas as rotas de entrega passam a usar o novo modelo); `abortInflight` + `session.abort`; membros em shutdown nunca sofrem failover |
+| **Isolado** | sessão **não-membro** (ex.: sessão cega de revisão da Diana) | **exigida** `fallbackModelsByAgent[agent]` explícita — a cadeia global **nunca sequestra** a sessão | descoberta de `agent` via `retryPayload.agent` → `session.get`; **zero escrita** no banco; cooldown `isolated:${sessionId}` |
+| **Lead** | sessão `lead_session_id` (`handleIsolatedSessionFailover`, HARNESS-15) | **exigida** cadeia explícita em `fallbackModelsByAgent[agent]` do lead (a global nunca sequestra) | relaxamento da guarda anti-lead; **nenhuma escrita** em `team_member`/`team`; agent do lead preservado no `promptAsync` |
+
+Regras comuns aos três: cooldown `FAILOVER_COOLDOWN_MS` comprime **um burst em uma única ação**; o `promptAsync` de relançamento passa o **`agent` explícito** (`member.agent` / agent descoberto / agent do lead) — omiti-lo faz o servidor assumir o agente padrão e sobrescrever `session.agent`.
+
+### 5.4 Zero-noise (HARNESS-13): exaustão NÃO acorda o lead
+
+`selectNextFallback` devolve `undefined` quando o modelo atual **já é a última entrada** da cadeia ("exaustão"). Esse é o único sinal que autorizava um `notifyLead` — e **deixou de autorizá-lo** (HARNESS-13, `src/hooks.ts`): o ramo de exaustão mantém apenas **log + retorno da decisão `exhausted` + cooldown**, sem wake. O lead é despertado exclusivamente pelo evento sistemático de fechamento de board (Blindagem 5, §2) — nunca por conteúdo textual.
+
+- Caminho **isolado** nunca acorda lead (sessão sem time); a decisão `exhausted` sobe como sinal para a camada de wiring exibir toast ao usuário.
+- Racional: acordar o orquestrador por rate-limit multiplicava tokens por tentativa; a cadeia esgotada é observável no log e no dashboard sem interromper o repouso do lead.
+
+**Homologação determinística (sem mocks):** `tests/test_fallback_models.mjs`, `test_rate_limit_failover.mjs`, `test_per_agent_fallback.mjs`, `test_failover_integration.mjs`, `test_retry_failover_active.mjs`, `test_force_model_abort.mjs`.
+
+---
+
+## 6. Governança
 
 - **Homologação obrigatória:** toda entrega passa por `node --check dist/index.js` + `node tests/run_all.mjs` antes de qualquer commit.
 - **Sem polling:** wake do lead é exclusivamente event-driven (fechamento de board); monitoramento passivo via dashboard (`:4747`) / task board.

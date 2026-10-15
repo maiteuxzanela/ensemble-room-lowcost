@@ -27,9 +27,34 @@ export interface ParsedModelSelector {
 }
 
 /**
+ * Sentinel for "NO variant" in the OpenCode server contract.
+ *
+ * The OpenCode server reports `model.variant === "default"` whenever a bound
+ * model carries NO variant — it is the ABSENCE marker, not a real thinking
+ * level ("low"/"medium"/"high"). A member spawned without an explicit variant
+ * therefore surfaces as the selector "provider/model#default".
+ *
+ * Contract enforced across this module:
+ *   - `parseModelSelector` treats `#default` as absent (variant: undefined),
+ *     so "p/m#default" parses exactly like "p/m";
+ *   - `formatModelSelector` NEVER emits `#default`;
+ *   - `selectNextFallback` / `selectFallbackModel` normalize the incoming
+ *     current/primary selector before matching the chain.
+ *
+ * Why it matters (Diana achado 1): round-tripping the sentinel produced
+ * keys like "p/m#default" that never equal a configured chain entry
+ * ("p/m#low"), so `findIndex` returned -1 and failover fell into the
+ * "current outside the chain" branch, restarting at `chain[0]` on every
+ * retry — an infinite switch loop with zero progress.
+ */
+const VARIANT_ABSENT_SENTINEL = "default"
+
+/**
  * Parse an OpenCode model selector into its parts.
  * Format: `provider/model` (model may contain additional slashes) with an
  * optional `#variant` suffix, e.g. "google/antigravity-gemini-3.8-flash#low".
+ * The server's absence sentinel `#default` is normalized away (see
+ * VARIANT_ABSENT_SENTINEL): "provider/model#default" → {providerID, modelID}.
  * Returns undefined when provider or model is empty (malformed selector).
  * Never throws — safe for config/delivery paths.
  */
@@ -40,7 +65,8 @@ export function parseModelSelector(selector: string): ParsedModelSelector | unde
   if (hash >= 0) {
     base = selector.slice(0, hash)
     const v = selector.slice(hash + 1).trim()
-    if (v) variant = v
+    // "default" is the server's "no variant" sentinel — never a real variant.
+    if (v && v !== VARIANT_ABSENT_SENTINEL) variant = v
   }
   const slash = base.indexOf("/")
   if (slash <= 0 || slash === base.length - 1) return undefined
@@ -50,9 +76,56 @@ export function parseModelSelector(selector: string): ParsedModelSelector | unde
   return variant ? { providerID, modelID, variant } : { providerID, modelID }
 }
 
-/** Format a fallback entry back into selector form: "provider/model[#variant]". */
+/**
+ * Format a fallback entry back into selector form: "provider/model[#variant]".
+ * The `#default` absence sentinel is NEVER emitted — formatting
+ * `{ model: "p/m", variant: "default" }` yields "p/m", keeping every selector
+ * produced here comparable with configured chain entries.
+ */
 export function formatModelSelector(entry: ModelFallbackRef): string {
-  return entry.variant ? `${entry.model}#${entry.variant}` : entry.model
+  return entry.variant && entry.variant !== VARIANT_ABSENT_SENTINEL
+    ? `${entry.model}#${entry.variant}`
+    : entry.model
+}
+
+/**
+ * Strip the `#default` absence sentinel from a raw selector BEFORE it is
+ * matched against a fallback chain. Defence in depth for the failover loop:
+ * even a selector that would bypass `parseModelSelector`'s normalization still
+ * collapses to its variant-less form, so the chain walk locates the current
+ * entry instead of restarting at `chain[0]`.
+ */
+function stripDefaultVariant(selector: string): string {
+  const hash = selector.indexOf("#")
+  if (hash < 0) return selector
+  return selector.slice(hash + 1).trim() === VARIANT_ABSENT_SENTINEL
+    ? selector.slice(0, hash)
+    : selector
+}
+
+/**
+ * Parse ordered model selectors into a deduped ModelFallbackRef chain.
+ * Malformed entries are skipped; duplicates (by formatted selector) collapse
+ * keeping first occurrence. Shared by the global and per-agent chains so the
+ * rigor stays identical.
+ */
+function chainFromSelectors(selectors: readonly string[]): ModelFallbackRef[] {
+  const chain: ModelFallbackRef[] = []
+  const seen = new Set<string>()
+
+  for (const selector of selectors) {
+    const parsed = parseModelSelector(selector)
+    if (!parsed) continue
+    const entry: ModelFallbackRef = {
+      model: `${parsed.providerID}/${parsed.modelID}`,
+      ...(parsed.variant ? { variant: parsed.variant } : {}),
+    }
+    const key = formatModelSelector(entry)
+    if (seen.has(key)) continue
+    seen.add(key)
+    chain.push(entry)
+  }
+  return chain
 }
 
 /**
@@ -66,32 +139,78 @@ export function formatModelSelector(entry: ModelFallbackRef): string {
  *      guarantees the chain is never empty.
  */
 export function resolveFallbackChain(config: EnsembleConfig): ModelFallbackRef[] {
-  const chain: ModelFallbackRef[] = []
-  const seen = new Set<string>()
-
-  for (const selector of config.fallbackModels ?? []) {
-    const parsed = parseModelSelector(selector)
-    if (!parsed) continue
-    const entry: ModelFallbackRef = {
-      model: `${parsed.providerID}/${parsed.modelID}`,
-      ...(parsed.variant ? { variant: parsed.variant } : {}),
-    }
-    const key = formatModelSelector(entry)
-    if (seen.has(key)) continue
-    seen.add(key)
-    chain.push(entry)
-  }
+  const chain = chainFromSelectors(config.fallbackModels ?? [])
   if (chain.length > 0) return chain
 
   const mf = config.modelFallback
   if (mf?.model) {
     const parsed = parseModelSelector(mf.model)
     const model = parsed ? `${parsed.providerID}/${parsed.modelID}` : mf.model
-    const variant = mf.variant || parsed?.variant
+    // mf.variant may carry the "#default" absence sentinel straight from
+    // ensemble.json — normalize it so the chain never forwards a fake variant.
+    const rawVariant = mf.variant?.trim() || parsed?.variant
+    const variant = rawVariant && rawVariant !== VARIANT_ABSENT_SENTINEL ? rawVariant : undefined
     return [variant ? { model, variant } : { model }]
   }
 
   return [{ model: DEFAULT_MODEL_FALLBACK.model, variant: DEFAULT_MODEL_FALLBACK.variant }]
+}
+
+/**
+ * Local mirror of `resolveBasePersona` (src/tools/team-spawn.ts): the
+ * multi-instance convention `<persona>-<suffix>` / `<persona>_<suffix>` →
+ * canonical lowercase base persona ("diana-x" / "diana_2" → "diana").
+ *
+ * Deliberately duplicated as a one-liner instead of imported: `config` is a
+ * LOWER-level module that tools/team-spawn already imports (config ⇄
+ * tools/team-spawn would be an ESM import cycle). Keep in sync with
+ * team-spawn's and qa-role.ts's copies if the naming convention changes.
+ */
+function resolveBasePersona(memberName: string): string {
+  return (memberName.split(/[-_]/)[0] ?? memberName).toLowerCase()
+}
+
+/**
+ * Resolve the fallback chain for a SPECIFIC agent, honoring the per-agent
+ * override map `fallbackModelsByAgent`:
+ *   1. `fallbackModelsByAgent[agent]` (if present AND non-empty) — parsed with
+ *      the exact same rigor as the global chain (parseModelSelector, malformed
+ *      skipped, duplicates collapsed via chainFromSelectors).
+ *   2. Otherwise `fallbackModelsByAgent[resolveBasePersona(agent)]` — SYMMETRY
+ *      with src/tools/team-spawn.ts:405-408: a suffixed agent type ("diana-x",
+ *      "diana_2") that has no exact key inherits its canonical base persona's
+ *      chain ("diana"), so multi-instance agents never silently degrade to the
+ *      global chain.
+ *   3. Otherwise delegates to `resolveFallbackChain(config)` (global chain →
+ *      modelFallback → DEFAULT_MODEL_FALLBACK), so the result is never empty.
+ *
+ * `agent` null/undefined → plain global chain. An agent key that exists but
+ * maps to an empty (or fully malformed) list falls through to the base-persona
+ * key and then to the global chain rather than returning an empty chain —
+ * failover must never be empty.
+ */
+export function resolveFallbackChainForAgent(
+  config: EnsembleConfig,
+  agent?: string | null,
+): ModelFallbackRef[] {
+  if (agent) {
+    const selectors = config.fallbackModelsByAgent?.[agent]
+    if (Array.isArray(selectors) && selectors.length > 0) {
+      const chain = chainFromSelectors(selectors)
+      if (chain.length > 0) return chain
+    }
+
+    // Base-persona symmetry with team-spawn: "diana-x" inherits "diana".
+    const basePersona = resolveBasePersona(agent)
+    if (basePersona !== agent) {
+      const baseSelectors = config.fallbackModelsByAgent?.[basePersona]
+      if (Array.isArray(baseSelectors) && baseSelectors.length > 0) {
+        const chain = chainFromSelectors(baseSelectors)
+        if (chain.length > 0) return chain
+      }
+    }
+  }
+  return resolveFallbackChain(config)
 }
 
 /**
@@ -105,10 +224,11 @@ export function selectFallbackModel(
 ): ModelFallbackRef | undefined {
   if (chain.length === 0) return undefined
   if (!primary) return chain[0]
-  const parsed = parseModelSelector(primary)
+  const normalized = stripDefaultVariant(primary.trim())
+  const parsed = parseModelSelector(normalized)
   const primaryKey = parsed
     ? formatModelSelector({ model: `${parsed.providerID}/${parsed.modelID}`, ...(parsed.variant ? { variant: parsed.variant } : {}) })
-    : primary
+    : normalized
   return chain.find((entry) => formatModelSelector(entry) !== primaryKey)
 }
 
@@ -122,6 +242,13 @@ export function selectFallbackModel(
  *   - current is outside the chain → the first entry that differs from it;
  *   - no current model → the head of the chain.
  * Never wraps around to the head: exhausting the chain must stay observable.
+ *
+ * `current` is normalized BEFORE matching: the OpenCode server reports
+ * `variant: "default"` for variant-less models, so a member on
+ * "provider/model" can surface as "provider/model#default". Without
+ * normalization that key misses the chain (findIndex → -1) and the walk
+ * restarts at `chain[0]` on every retry — an infinite failover loop
+ * (Diana achado 1). See VARIANT_ABSENT_SENTINEL.
  */
 export function selectNextFallback(
   chain: readonly ModelFallbackRef[],
@@ -129,10 +256,11 @@ export function selectNextFallback(
 ): ModelFallbackRef | undefined {
   if (chain.length === 0) return undefined
   if (!current) return chain[0]
-  const parsed = parseModelSelector(current)
+  const normalized = stripDefaultVariant(current.trim())
+  const parsed = parseModelSelector(normalized)
   const key = parsed
     ? formatModelSelector({ model: `${parsed.providerID}/${parsed.modelID}`, ...(parsed.variant ? { variant: parsed.variant } : {}) })
-    : current
+    : normalized
   const idx = chain.findIndex((entry) => formatModelSelector(entry) === key)
   if (idx >= 0) return chain[idx + 1]
   return chain.find((entry) => formatModelSelector(entry) !== key)
@@ -177,6 +305,18 @@ export interface EnsembleConfig {
    */
   fallbackModels?: string[]
   /**
+   * Per-agent override of the fallback chain. Key: agent name (e.g. "diana");
+   * value: ordered selector list in the same format as `fallbackModels`
+   * ("provider/model" with optional "#variant" suffix — never "#default", see
+   * VARIANT_ABSENT_SENTINEL). Lookup order in `resolveFallbackChainForAgent()`:
+   * exact agent key → base-persona key (multi-instance symmetry:
+   * "diana-x"/"diana_2" inherit "diana") → global chain. The map itself is
+   * merged PER KEY across DEFAULT → global → project in `loadConfig()`, so a
+   * partial project config only overrides the agents it declares and never
+   * wipes sibling global entries. Default: {}.
+   */
+  fallbackModelsByAgent?: Record<string, string[]>
+  /**
    * Structured default fallback entry (model + variant) used when
    * `fallbackModels` is empty. Default: google/antigravity-gemini-3.8-flash
    * with variant "low" (see DEFAULT_MODEL_FALLBACK).
@@ -202,6 +342,16 @@ export interface EnsembleConfig {
    * `roomInactivityThresholdMs` so detection granularity stays cheap.
    */
   roomInactivityCheckMs?: number
+  /**
+   * Extra tools denied to spawned teammates on top of the plugin's built-in
+   * integrity deny-list (team_create, team_cleanup, team_merge, team_shutdown,
+   * task, todowrite — see DENIED_TEAMMATE_TOOLS in team-spawn.ts).
+   * Use this for ecosystem-specific tools (e.g. "openchamber",
+   * "needle_verify_delivery") without hardcoding them into the plugin.
+   * Default: [] (empty — only the built-in integrity list applies).
+   * Global and project entries are unioned (deny lists are additive).
+   */
+  deniedTools?: string[]
 }
 
 /** Default configuration values. */
@@ -221,10 +371,12 @@ export const DEFAULT_CONFIG: Required<EnsembleConfig> = {
   modelAssignment: "default",
   promptForModels: false,
   fallbackModels: [],
+  fallbackModelsByAgent: {},
   modelFallback: { model: DEFAULT_MODEL_FALLBACK.model, variant: DEFAULT_MODEL_FALLBACK.variant },
   silentLead: true,
   roomInactivityThresholdMs: 30_000,
   roomInactivityCheckMs: 5_000,
+  deniedTools: [],
 }
 
 /** Read a JSON config file, returning an empty object on missing/invalid. */
@@ -257,6 +409,15 @@ function readConfigFile(filePath: string): Partial<EnsembleConfig> {
     ) {
       result.fallbackModels = raw.fallbackModels as string[]
     }
+    if (typeof raw.fallbackModelsByAgent === "object" && raw.fallbackModelsByAgent !== null && !Array.isArray(raw.fallbackModelsByAgent)) {
+      const entries = Object.entries(raw.fallbackModelsByAgent as Record<string, unknown>)
+      const valid = entries.every(
+        ([, v]) =>
+          Array.isArray(v)
+          && v.every((m: unknown) => typeof m === "string" && m.trim().length > 0),
+      )
+      if (valid) result.fallbackModelsByAgent = raw.fallbackModelsByAgent as Record<string, string[]>
+    }
     if (typeof raw.modelFallback === "object" && raw.modelFallback !== null && !Array.isArray(raw.modelFallback)) {
       const mf = raw.modelFallback as Record<string, unknown>
       if (typeof mf.model === "string" && mf.model.trim().length > 0) {
@@ -268,6 +429,12 @@ function readConfigFile(filePath: string): Partial<EnsembleConfig> {
     if (typeof raw.silentLead === "boolean") result.silentLead = raw.silentLead
     if (typeof raw.roomInactivityThresholdMs === "number") result.roomInactivityThresholdMs = raw.roomInactivityThresholdMs
     if (typeof raw.roomInactivityCheckMs === "number") result.roomInactivityCheckMs = raw.roomInactivityCheckMs
+    if (
+      Array.isArray(raw.deniedTools)
+      && raw.deniedTools.every((t: unknown) => typeof t === "string" && t.trim().length > 0)
+    ) {
+      result.deniedTools = raw.deniedTools as string[]
+    }
     return result
   } catch (err) {
     if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return {}
@@ -279,6 +446,10 @@ function readConfigFile(filePath: string): Partial<EnsembleConfig> {
 /**
  * Load plugin configuration. Merges global → project → env vars.
  * Missing files are silently skipped. Invalid JSON logs a warning.
+ * Two keys escape the plain spread (which replaces whole values):
+ *   - `deniedTools` is unioned (additive deny lists, deduped);
+ *   - `fallbackModelsByAgent` is merged PER AGENT KEY, so a partial project
+ *     map only overrides the agents it declares.
  */
 export function loadConfig(projectDir: string): Required<EnsembleConfig> {
   const homeDir = process.env.HOME ?? process.env.USERPROFILE ?? ""
@@ -288,6 +459,20 @@ export function loadConfig(projectDir: string): Required<EnsembleConfig> {
   const global = readConfigFile(globalPath)
   const project = readConfigFile(projectPath)
   const merged = { ...DEFAULT_CONFIG, ...global, ...project }
+  // deniedTools is additive: union of global + project (deny lists accumulate),
+  // deduped, order-preserving. The spread above would let project clobber global.
+  merged.deniedTools = [...new Set([...(global.deniedTools ?? []), ...(project.deniedTools ?? [])])]
+  // fallbackModelsByAgent merges PER KEY (DEFAULT → global → project). The
+  // top-level spread would replace the WHOLE map, so a partial project file
+  // (e.g. only "build") would silently wipe sibling global entries such as
+  // "diana" — that agent then degrades to the global chain without any log.
+  // Merging keys individually keeps global entries unless the same agent is
+  // explicitly redeclared by the project.
+  merged.fallbackModelsByAgent = {
+    ...DEFAULT_CONFIG.fallbackModelsByAgent,
+    ...(global.fallbackModelsByAgent ?? {}),
+    ...(project.fallbackModelsByAgent ?? {}),
+  }
 
   // Env vars override everything
   const timeout = process.env.OPENCODE_ENSEMBLE_TIMEOUT

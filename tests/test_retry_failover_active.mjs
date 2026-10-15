@@ -282,7 +282,7 @@ function seedMember(db, {
 }
 
 /* ------------------------------------------------------------------ *
- * 5. Teste: Esgotamento da Cadeia (Exhaustion acorda o Lead)          *
+ * 5. Teste: Esgotamento da Cadeia (HARNESS-13 — NÃO acorda o Lead)    *
  * ------------------------------------------------------------------ */
 {
   const db = makeDb();
@@ -312,10 +312,8 @@ function seedMember(db, {
     JSON.stringify(decision),
   );
   check(
-    "Lead acordado na sessão do Lead (exceção autorizada)",
-    calls.promptAsync.length === 1
-      && calls.promptAsync[0].sessionID === LEAD_SESSION
-      && calls.promptAsync[0].synthetic === true,
+    "HARNESS-13 — lead NÃO acordado na exaustão (ZERO promptAsync, exceção de ruído removida)",
+    calls.promptAsync.length === 0,
     JSON.stringify(calls.promptAsync),
   );
   check(
@@ -327,8 +325,10 @@ function seedMember(db, {
     "SELECT content FROM team_message WHERE team_id = ? AND to_name = 'lead'",
   ).all(seed.teamId);
   check(
-    "Mensagem explicativa gravada no SQLite para o Lead",
-    leadMsgs.length === 1 && String(leadMsgs[0].content).includes("fallback chain is exhausted"),
+    "HARNESS-13 — NENHUMA mensagem explicativa gravada para o Lead (zero team_message)",
+    leadMsgs.length === 0
+      && !leadMsgs.some((m) => String(m.content).includes("fallback chain is exhausted")),
+    `leadMsgs=${leadMsgs.length}`,
   );
 
   db.close();

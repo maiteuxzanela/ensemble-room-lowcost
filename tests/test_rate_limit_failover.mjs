@@ -26,8 +26,9 @@
  *   (a) fallback disponível  → troca SILENCIOSA: zero promptAsync no lead,
  *       zero team_message, apenas log + UPDATE do modelo;
  *   (b) retry repetido no mesmo burst → "suppressed" (cooldown), zero ruído;
- *   (c) cadeia esgotada      → EXATAMENTE 1 wake do lead + 1 mensagem
- *       persistida (a única exceção de ruído autorizada);
+ *   (c) cadeia esgotada      → ZERO wake do lead e ZERO team_message
+ *       (HARNESS-13: a exaustão NÃO acorda o lead — só log + decisão;
+ *       a antiga "única exceção de ruído autorizada" foi removida);
  *   (d) sessão não-membro / time arquivado / membro em shutdown → no-op.
  *
  * Uso:  node tests/test_rate_limit_failover.mjs
@@ -300,7 +301,7 @@ const leadMessages = (db, teamId) =>
 }
 
 /* ------------------------------------------------------------------ *
- * 8. Cenário C — cadeia esgotada → EXATAMENTE 1 wake do lead          *
+ * 8. Cenário C — cadeia esgotada → ZERO wake do lead (HARNESS-13)     *
  * ------------------------------------------------------------------ */
 {
   const db = makeDb();
@@ -322,31 +323,36 @@ const leadMessages = (db, teamId) =>
     JSON.stringify(decision),
   );
   check(
-    "C2: EXATAMENTE 1 wake do lead (promptAsync synthetic na sessão do lead)",
-    client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length === 1
-      && client.calls.promptAsync.find((c) => c.sessionID === LEAD_SESSION)?.synthetic === true,
-    `wakes=${client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length}`,
+    "C2: HARNESS-13 — exaustão NÃO acorda o lead (ZERO promptAsync na sessão do lead)",
+    client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length === 0
+      && client.calls.promptAsync.length === 0,
+    `wakes=${client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length} total=${client.calls.promptAsync.length}`,
   );
   check(
-    "C3: EXATAMENTE 1 team_message persistida system→lead (única exceção de ruído)",
-    leadMessages(db, seed.teamId).length === 1,
+    "C3: HARNESS-13 — ZERO team_message persistida (nenhuma exceção de ruído)",
+    leadMessages(db, seed.teamId).length === 0,
   );
   check(
-    "C4: mensagem cita o modelo primário esgotado e a chain",
-    String(leadMessages(db, seed.teamId)[0]?.content).includes("fallback chain is exhausted"),
+    "C4: nenhuma mensagem de exaustão citando 'fallback chain is exhausted' existe",
+    !db.query("SELECT content FROM team_message WHERE team_id = ?").all(seed.teamId)
+      .some((m) => String(m.content).includes("fallback chain is exhausted")),
   );
   check(
     "C5: modelo NÃO foi alterado (sem alternativa disponível)",
     getMember(db, seed.teamId, seed.memberName).model === "google/antigravity-gemini-3.8-flash#low",
   );
 
-  // Retry repetido no mesmo burst NÃO spama o lead (cooldown após a ação).
+  // Retry repetido no mesmo burst permanece suprimido — e segue sem ruído.
   const again = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 2, message: "429", next: Date.now() });
   check(
-    "C6: retry seguinte no burst → 'suppressed', lead NÃO é acordado de novo",
+    "C6: retry seguinte no burst → 'suppressed', lead segue com ZERO wakes e ZERO mensagens",
     again?.action === "suppressed"
-      && client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length === 1
-      && leadMessages(db, seed.teamId).length === 1,
+      && client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length === 0
+      && leadMessages(db, seed.teamId).length === 0,
+  );
+  check(
+    "C7: exaustão registrou cooldown do membro (próximo burst respeita a janela)",
+    failoverCooldown.has(`${seed.teamId}:${seed.memberName}`),
   );
   db.close();
   failoverCooldown.clear();
@@ -379,8 +385,8 @@ const leadMessages = (db, teamId) =>
     `first=${first?.toModel} second=${second?.toModel} third=${third?.action}`,
   );
   check(
-    "D2: apenas o esgotamento acorda o lead (1 wake, 1 mensagem)",
-    client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length === 1 && leadMessages(db, seed.teamId).length === 1,
+    "D2: HARNESS-13 — a exaustão final NÃO acorda o lead (0 wakes, 0 mensagens)",
+    client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length === 0 && leadMessages(db, seed.teamId).length === 0,
     `wakes=${client.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION).length} msgs=${leadMessages(db, seed.teamId).length}`,
   );
   db.close();

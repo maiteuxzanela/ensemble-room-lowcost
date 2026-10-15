@@ -157,7 +157,7 @@ async function runCyclicGraphSuite() {
    * 1. SCHEMA & MIGRATION 13
    * ================================================================== */
   const userVer = db.query("PRAGMA user_version").get().user_version;
-  check("Migration 13 aplicada com sucesso", userVer === 13, `user_version=${userVer}`);
+  check(`Migration ${MIGRATIONS.length} aplicada com sucesso`, userVer === MIGRATIONS.length, `user_version=${userVer}`);
 
   const taskColumns = db.query("PRAGMA table_info(team_task)").all();
   const colNames = taskColumns.map((c) => c.name);

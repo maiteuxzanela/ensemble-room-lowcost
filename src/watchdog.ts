@@ -10,7 +10,8 @@ import { hasReportedCompletion } from "./messaging"
 import { getMemberModel } from "./member-model"
 import { notifyLead } from "./notify"
 import { log } from "./log"
-import { lastRoomActivity } from "./config"
+import { lastRoomActivity, type EnsembleConfig } from "./config"
+import { getTeamQAMember } from "./qa-role"
 import { resolveStandbyWake } from "./tools/shared"
 
 interface WatchdogOpts {
@@ -39,6 +40,13 @@ interface WatchdogOpts {
   roomInactivityThresholdMs?: number
   /** Room inactivity polling interval in ms (default: 5000 = 5s). */
   roomInactivityCheckMs?: number
+  /**
+   * Plugin config — threaded into notifyLead's `{ config }` so every
+   * watchdog wake (stall/chatty/timeout) uses the model-aware ladder
+   * (HARNESS-15 B / F2): agent from team.lead_agent + fallback chain with
+   * step-down, instead of a modelless wake riding the rate-limited primary.
+   */
+  config?: Required<EnsembleConfig>
 }
 
 const requireSessionModule = createRequire(import.meta.url)
@@ -134,6 +142,7 @@ export class Watchdog {
   private readonly peerMessageWindowMs: number
   private readonly roomInactivityThresholdMs: number
   private readonly roomInactivityCheckMs: number
+  private readonly config?: Required<EnsembleConfig>
   private timer: ReturnType<typeof setInterval> | undefined
   private roomInactivityTimer: ReturnType<typeof setInterval> | undefined
 
@@ -152,6 +161,17 @@ export class Watchdog {
     this.peerMessageWindowMs = opts.peerMessageWindowMs ?? 300_000
     this.roomInactivityThresholdMs = opts.roomInactivityThresholdMs ?? 30_000
     this.roomInactivityCheckMs = opts.roomInactivityCheckMs ?? 5_000
+    this.config = opts.config
+  }
+
+  /**
+   * notifyLead wrapper (F2): threads `{ config }` so the wake runs the
+   * model-aware ladder (agent from team.lead_agent + fallback chain with
+   * step-down). Without a config (legacy construction / test harnesses) it
+   * degrades to the exact legacy wake — signature-safe.
+   */
+  private notifyLead(teamId: string, message: string): void {
+    notifyLead(this.client, this.db, teamId, message, this.config ? { config: this.config } : undefined)
   }
 
   private static STALE_THRESHOLD_MS = Number(process.env.STALE_WORKTREE_THRESHOLD_MS) || 300_000
@@ -258,10 +278,8 @@ export class Watchdog {
         log(`watchdog:stall:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`)
       })
 
-      // Notify the lead
-      notifyLead(
-        this.client,
-        this.db,
+      // Notify the lead — model-aware wake when config is threaded (F2).
+      this.notifyLead(
         member.team_id,
         `Teammate "${member.name}" appears stalled (${reason}). Consider checking on them via team_message or shutting them down.`,
       )
@@ -311,10 +329,8 @@ export class Watchdog {
         log(`watchdog:chatty:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`)
       })
 
-      // Notify the lead
-      notifyLead(
-        this.client,
-        this.db,
+      // Notify the lead — model-aware wake when config is threaded (F2).
+      this.notifyLead(
         member.team_id,
         `Agent "${member.name}" is sending many peer messages and may be over-coordinating. Consider checking on them.`,
       )
@@ -323,7 +339,7 @@ export class Watchdog {
     }
   }
 
-  /** Check for room inactivity and wake Clara to inspect and drive progress. */
+  /** Check for room inactivity and wake the Quality Gate reviewer to inspect and drive progress. */
   async checkRoomInactivity(): Promise<void> {
     if (this.roomInactivityThresholdMs === 0) return
 
@@ -341,9 +357,18 @@ export class Watchdog {
       const unfinishedCount = taskCountRow?.count ?? 0
       if (unfinishedCount === 0) continue
 
-      const busyMember = this.db.query(
-        "SELECT name FROM team_member WHERE team_id = ? AND name != 'clara' AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
-      ).get(team.id) as { name: string } | null
+      // Quality Gate reviewer lookup (agnostic: is_qa flag / clara retrocompat).
+      // Resolved BEFORE the busy gate because the busy exclusion below targets
+      // the reviewer's actual name (see qa-role.ts contract).
+      const qa = getTeamQAMember(this.db, team.id)
+
+      const busyMember = qa
+        ? this.db.query(
+            "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
+          ).get(team.id, qa.name) as { name: string } | null
+        : this.db.query(
+            "SELECT name FROM team_member WHERE team_id = ? AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
+          ).get(team.id) as { name: string } | null
       if (busyMember) continue
 
       const lastActivity = lastRoomActivity(this.db, team.id)
@@ -352,53 +377,48 @@ export class Watchdog {
       const inactiveMs = now - lastActivity
       if (inactiveMs < this.roomInactivityThresholdMs) continue
 
-      // Clara lookup
-      const clara = this.db.query(
-        "SELECT session_id, execution_status, agent, last_nudged_at FROM team_member WHERE team_id = ? AND name = 'clara'"
-      ).get(team.id) as { session_id: string; execution_status: string; agent: string; last_nudged_at: number | null } | null
-
-      if (!clara?.session_id) continue
+      if (!qa?.sessionId) continue
 
       // Cooldown / Re-wake suppression:
-      // If Clara was already nudged/woken for inactivity, and no activity occurred since then,
+      // If the QA reviewer was already nudged/woken for inactivity, and no activity occurred since then,
       // don't re-wake within roomInactivityThresholdMs.
-      if (clara.last_nudged_at) {
-        const activeSinceNudge = lastActivity > clara.last_nudged_at
-        if (!activeSinceNudge && (now - clara.last_nudged_at < this.roomInactivityThresholdMs)) {
+      if (qa.lastNudgedAt) {
+        const activeSinceNudge = lastActivity > qa.lastNudgedAt
+        if (!activeSinceNudge && (now - qa.lastNudgedAt < this.roomInactivityThresholdMs)) {
           continue
         }
       }
 
       // Update last_nudged_at and reset reported_to_lead
       this.db.run(
-        "UPDATE team_member SET last_nudged_at = ?, reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
-        [now, now, team.id],
+        "UPDATE team_member SET last_nudged_at = ?, reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
+        [now, now, team.id, qa.name],
       )
 
       const wakeText = `[System: Room has been inactive for ${Math.round(inactiveMs / 1000)}s with ${unfinishedCount} unfinished task(s). Inspect the board, unblock, claim, or nudge teammates to drive progress.]`
       let promptText = wakeText
-      let promptAgent: string | undefined = clara.agent
+      let promptAgent: string | undefined = qa.agent
 
-      if (clara.execution_status === "standby") {
-        const wake = resolveStandbyWake(this.db, team.id, "clara", wakeText)
+      if (qa.executionStatus === "standby") {
+        const wake = resolveStandbyWake(this.db, team.id, qa.name, wakeText)
         if (wake.woke) {
           promptText = wake.text
-          promptAgent = wake.agent ?? clara.agent
+          promptAgent = wake.agent ?? qa.agent
         }
       }
 
-      const claraModel = getMemberModel(this.db, team.id, "clara")
+      const qaModel = getMemberModel(this.db, team.id, qa.name)
       this.client.session.promptAsync({
-        sessionID: clara.session_id,
+        sessionID: qa.sessionId,
         parts: [{ type: "text", text: promptText }],
         agent: promptAgent,
         synthetic: true,
-        ...(claraModel ? { model: claraModel } : {}),
+        ...(qaModel ? { model: qaModel } : {}),
       }).catch((err) => {
-        if (clara.execution_status === "standby") {
+        if (qa.executionStatus === "standby") {
           this.db.run(
-            "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
-            [Date.now(), team.id],
+            "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+            [Date.now(), team.id, qa.name],
           )
         }
         log(`watchdog:room-inactivity:wake-clara:failed team=${team.id} err=${err instanceof Error ? err.message : String(err)}`)
@@ -478,9 +498,7 @@ export class Watchdog {
       // Notify AND wake the lead — a timed-out teammate is otherwise a silent
       // failure. This is the "leave recovery to the lead" path: we surface the
       // timeout, we do not auto-resume the teammate.
-      notifyLead(
-        this.client,
-        this.db,
+      this.notifyLead(
         member.team_id,
         `Teammate "${member.name}" timed out after exceeding the busy time limit and was aborted. Their in-progress work has been released. Review their session, then re-spawn or reassign the task if needed.`,
       )

@@ -278,6 +278,13 @@ export const MIGRATIONS: string[] = [
    CREATE INDEX IF NOT EXISTS team_task_team_idx ON team_task(team_id);
    CREATE INDEX IF NOT EXISTS team_task_assignee_idx ON team_task(assignee);
    CREATE INDEX IF NOT EXISTS team_task_status_idx ON team_task(team_id, status);`,
+  // Migration 14: add is_qa flag to team_member — marks the Quality Gate
+  // reviewer (Clara) explicitly. Additive-only (same non-negotiable as Migrations
+  // 9-11): no CHECK constraint, no table rebuild. The central helpers in
+  // src/qa-role.ts (isQAMember / getTeamQAMember) read this column first and
+  // fall back to the legacy base-persona/agent === 'clara' detection, so
+  // existing databases and consumers keep working unchanged.
+  `ALTER TABLE team_member ADD COLUMN is_qa INTEGER NOT NULL DEFAULT 0;`,
 ]
 
 /**

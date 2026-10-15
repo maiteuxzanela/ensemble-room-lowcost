@@ -2,6 +2,8 @@ import type { ToolDeps } from "../types"
 import { requireTeamMember, resolveStandbyWake } from "./shared"
 import { getMemberModel } from "../member-model"
 import { inReviewNudges } from "../hooks"
+import { isQAMember, getTeamQAMember } from "../qa-role"
+import { promptModelAwareWake } from "../notify"
 import { log } from "../log"
 
 export interface TeamTasksCompleteArgs {
@@ -18,9 +20,9 @@ export interface TeamTasksCompleteArgs {
  *
  * Supports cyclic review transitions:
  * - action='submit_review' (or status='in_review'): in_progress -> in_review
- * - action='reject' (or status='in_progress' when in_review): in_review -> in_progress (Clara/lead only)
+ * - action='reject' (or status='in_progress' when in_review): in_review -> in_progress (QA reviewer/lead only)
  * - action='complete' (default): completed
- *   * If task is 'in_review', ONLY 'clara' or 'lead' can complete it (Guardiã Clara lock).
+ *   * If task is 'in_review', ONLY the Quality Gate reviewer (qa-role.ts) or 'lead' can complete it.
  *
  * Enforces task-board accuracy:
  * - Rejects completing an already-completed or cancelled task.
@@ -43,6 +45,12 @@ export async function executeTeamTasksComplete(
   const now = Date.now()
   const notes = args.review_notes ?? args.notes ?? null
 
+  // Quality Gate reviewer (agnostic: is_qa flag / clara retrocompat) — resolved
+  // once and reused by the submit/reject/complete paths below instead of
+  // hardcoding the literal "clara" (see qa-role.ts contract).
+  const qaMember = getTeamQAMember(deps.db, teamInfo.teamId)
+  const qaLabel = qaMember?.name ?? "the Quality Gate reviewer"
+
   // Flow 1: Submit to review (in_progress -> in_review)
   const isSubmitReview = args.action === "submit_review" || args.action === "in_review" || args.status === "in_review"
   if (isSubmitReview) {
@@ -59,56 +67,52 @@ export async function executeTeamTasksComplete(
       [assignee, notes ?? task.review_notes ?? null, now, args.task_id],
     )
 
-    // Reset in-review nudge cooldown for Clara when a task is submitted or resubmitted for review
-    inReviewNudges.delete(`${teamInfo.teamId}:clara:${args.task_id}`)
+    // Reset in-review nudge cooldown for the QA reviewer when a task is submitted or resubmitted for review
+    if (qaMember) inReviewNudges.delete(`${teamInfo.teamId}:${qaMember.name}:${args.task_id}`)
 
-    // Auto-wake Clara (Guardiã do Quality Gate) for review if present in team and not caller
-    let claraNotified = false
-    if (caller !== "clara") {
-      const claraMember = deps.db.query(
-        "SELECT session_id, execution_status, agent FROM team_member WHERE team_id = ? AND name = 'clara'"
-      ).get(teamInfo.teamId) as { session_id: string; execution_status: string; agent: string } | null
-
-      if (claraMember?.session_id) {
+    // Auto-wake the Quality Gate reviewer for review if present in team and not caller
+    let qaNotified = false
+    if (qaMember && !isQAMember(deps.db, teamInfo.teamId, caller)) {
+      if (qaMember.sessionId) {
         deps.db.run(
-          "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
-          [now, teamInfo.teamId],
+          "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
+          [now, teamInfo.teamId, qaMember.name],
         )
 
         const baseWakeText = `[System: Task "${args.task_id}" was submitted for review by ${caller}${notes ? ` (notes: ${notes})` : ""}]`
         let promptText = baseWakeText
-        let promptAgent: string | undefined = claraMember.agent
+        let promptAgent: string | undefined = qaMember.agent
 
-        if (claraMember.execution_status === "standby") {
-          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, "clara", baseWakeText)
+        if (qaMember.executionStatus === "standby") {
+          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, qaMember.name, baseWakeText)
           if (wake.woke) {
             promptText = wake.text
-            promptAgent = wake.agent ?? claraMember.agent
+            promptAgent = wake.agent ?? qaMember.agent
           }
         }
 
-        const claraModel = getMemberModel(deps.db, teamInfo.teamId, "clara")
+        const qaModel = getMemberModel(deps.db, teamInfo.teamId, qaMember.name)
         deps.client.session.promptAsync({
-          sessionID: claraMember.session_id,
+          sessionID: qaMember.sessionId,
           parts: [{ type: "text", text: promptText }],
           agent: promptAgent,
           synthetic: true,
-          ...(claraModel ? { model: claraModel } : {}),
+          ...(qaModel ? { model: qaModel } : {}),
         }).catch((err) => {
-          if (claraMember.execution_status === "standby") {
+          if (qaMember.executionStatus === "standby") {
             deps.db.run(
-              "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
-              [Date.now(), teamInfo.teamId],
+              "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+              [Date.now(), teamInfo.teamId, qaMember.name],
             )
           }
           log(`tasks-complete:wake-clara:failed err=${String(err)}`)
         })
-        log(`tasks-complete:wake-clara:ok task=${args.task_id} sessionID=${claraMember.session_id}`)
-        claraNotified = true
+        log(`tasks-complete:wake-clara:ok task=${args.task_id} sessionID=${qaMember.sessionId}`)
+        qaNotified = true
       }
     }
 
-    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${claraNotified ? " (notified clara for review)" : ""}`
+    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${qaNotified ? ` (notified ${qaMember?.name} for review)` : ""}`
   }
 
   // Flow 2: Reject review (in_review -> in_progress)
@@ -117,8 +121,8 @@ export async function executeTeamTasksComplete(
     if (task.status !== "in_review") {
       throw new Error(`Task "${args.task_id}" is not in review (current status: ${task.status})`)
     }
-    if (teamInfo.role !== "lead" && caller !== "clara") {
-      throw new Error(`Only clara or the team lead can reject tasks in review`)
+    if (teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {
+      throw new Error(`Only ${qaLabel} or the team lead can reject tasks in review`)
     }
     const newRejectionCount = (task.rejection_count ?? 0) + 1
     deps.db.run(
@@ -133,10 +137,10 @@ export async function executeTeamTasksComplete(
   if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`)
   if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`)
 
-  // Guardiã Clara lock: if task is in_review, only Clara or Lead can approve and complete
+  // Guardiã lock: if task is in_review, only the QA reviewer or Lead can approve and complete
   if (task.status === "in_review") {
-    if (teamInfo.role !== "lead" && caller !== "clara") {
-      throw new Error(`Task "${args.task_id}" is in review; only clara or the team lead can complete it`)
+    if (teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {
+      throw new Error(`Task "${args.task_id}" is in review; only ${qaLabel} or the team lead can complete it`)
     }
   } else if (task.status === "in_progress" && task.assignee && teamInfo.role !== "lead" && caller !== task.assignee) {
     throw new Error(`Task "${args.task_id}" is claimed by ${task.assignee}`)
@@ -195,13 +199,20 @@ export async function executeTeamTasksComplete(
       }
 
       if (wakeTarget) {
-        const memberRow = deps.db.query("SELECT session_id FROM team_member WHERE team_id = ? AND name = ?")
-          .get(teamInfo.teamId, wakeTarget) as { session_id: string } | null
+        // HARNESS-16: one snapshot BEFORE resolveStandbyWake — session delivery
+        // target, explicit agent for non-standby wakes, and the pre-consumption
+        // execution_status for observability (agent is immutable per member).
+        const memberRow = deps.db.query("SELECT session_id, agent, execution_status FROM team_member WHERE team_id = ? AND name = ?")
+          .get(teamInfo.teamId, wakeTarget) as { session_id: string; agent: string; execution_status: string } | null
         const memberSessionId = memberRow?.session_id
 
         if (memberSessionId) {
-          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, wakeTarget, `[System: Task "${t.id}" was unblocked and is ready for you to start]`)
+          const baseText = `[System: Task "${t.id}" was unblocked and is ready for you to start]`
+          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, wakeTarget, baseText)
+
           if (wake.woke) {
+            // Standby consumed: spawn_context prepend + standby → starting
+            // transition (existing path, byte-compatible payload).
             const memberModel = getMemberModel(deps.db, teamInfo.teamId, wakeTarget)
             deps.client.session.promptAsync({
               sessionID: memberSessionId,
@@ -218,7 +229,37 @@ export async function executeTeamTasksComplete(
             })
             log(`tasks-complete:wake-member:ok member=${wakeTarget} task=${t.id}`)
             wokeMembers++
+          } else if (wakeTarget === t.assignee) {
+            // HARNESS-16 UNCONDITIONAL: the board advanced (blocked → in_progress)
+            // but a PRE-ASSIGNED owner that is ready/idle/busy was never woken —
+            // resolveStandbyWake only reports woke for the standby consume, so
+            // the owner slept while its status flipped → silent deadlock (T8).
+            // Wake ALWAYS: explicit agent + member model first rung on the T6
+            // model-aware ladder (step-down on rejection), synthetic system
+            // prompt. No standby revert here: this branch never consumed the
+            // standby window (a lost race means another delivery is already
+            // in flight with the spawn_context prepend).
+            try {
+              const memberModel = getMemberModel(deps.db, teamInfo.teamId, wakeTarget)
+              const primaryModel = memberModel
+                ? `${memberModel.providerID}/${memberModel.modelID}${memberModel.variant ? `#${memberModel.variant}` : ""}`
+                : undefined
+              promptModelAwareWake(deps.client, {
+                sessionID: memberSessionId,
+                text: baseText,
+                logTag: `tasks-complete:wake-member team=${teamInfo.teamId} member=${wakeTarget}`,
+                agent: memberRow.agent || undefined,
+                config: deps.config,
+                ...(primaryModel ? { primaryModel } : {}),
+              })
+              log(`tasks-complete:wake-member:ok member=${wakeTarget} task=${t.id} state=${memberRow.execution_status} unconditional=true`)
+              wokeMembers++
+            } catch (err) {
+              log(`tasks-complete:wake-member:failed member=${wakeTarget} err=${err instanceof Error ? err.message : String(err)}`)
+            }
           }
+          // else: standby-candidate fallback WITHOUT pre-assignment keeps the
+          // legacy gate — silent unless resolveStandbyWake consumed the window.
         }
       }
     }
@@ -259,16 +300,33 @@ export async function executeTeamTasksComplete(
   if (total > 0 && completed === total && activeRemaining === 0) {
     // NOTE: team_member has no `role` column (see schema.ts) — the lead's
     // session id lives on team.lead_session_id, the same canonical source
-    // team_broadcast uses to address the lead.
-    const lead = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?")
-      .get(teamInfo.teamId) as { lead_session_id: string } | null
-    if (lead?.lead_session_id) {
-      deps.client.session.promptAsync({
-        sessionID: lead.lead_session_id,
-        parts: [{ type: "text", text: `[System: All team tasks completed on board by ${who}]` }],
-        synthetic: true,
-      }).catch(err => { log(`tasks-complete:wake-lead:failed err=${String(err)}`) })
-      log(`tasks-complete:wake-lead:sent leadSession=${lead.lead_session_id} by=${who}`)
+    // team_broadcast uses to address the lead (never a team_member session).
+    const leadRow = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?")
+      .get(teamInfo.teamId) as { lead_session_id?: string | null } | null
+    const leadSessionId = leadRow?.lead_session_id
+    if (leadSessionId) {
+      // F1 / HARNESS-15 B: under silentLead:true this is the ONLY wake that
+      // reaches the lead — a modelless promptAsync rides the session's
+      // primary (the rate-limited gemini) and board closure was stranded at
+      // delivered=0. Model-aware via the shared ladder: explicit agent from
+      // team.lead_agent + resolveFallbackChainForAgent(config, leadAgent)
+      // with step-down on rejection (same logic as notifyLead).
+      const agentRow = deps.db.query("SELECT lead_agent FROM team WHERE id = ?")
+        .get(teamInfo.teamId) as { lead_agent?: string | null } | null
+      try {
+        promptModelAwareWake(deps.client, {
+          sessionID: leadSessionId,
+          text: `[System: All team tasks completed on board by ${who}]`,
+          logTag: `tasks-complete:wake-lead team=${teamInfo.teamId}`,
+          agent: agentRow?.lead_agent || undefined,
+          config: deps.config,
+        })
+        log(`tasks-complete:wake-lead:sent leadSession=${leadSessionId} by=${who}`)
+      } catch (err) {
+        // Fail-safe: a synchronous ladder/parse defect must never fail the
+        // board-complete tool call itself — log and continue.
+        log(`tasks-complete:wake-lead:failed team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`)
+      }
     }
   }
 

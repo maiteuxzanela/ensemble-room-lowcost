@@ -39,6 +39,31 @@ export interface TeamTask {
   review_notes: string | null
 }
 
+/**
+ * A single `team_member` row as returned by SQLite queries.
+ * `is_qa` (Migration 14) flags the Quality Gate reviewer explicitly; it is
+ * optional here so callers that select a narrower column subset still type-check.
+ */
+export interface TeamMember {
+  team_id: string
+  name: string
+  session_id: string
+  agent: string
+  status: string
+  execution_status: string
+  model: string | null
+  prompt: string | null
+  time_created: number
+  time_updated: number
+  worktree_dir: string | null
+  worktree_branch: string | null
+  plan_approval: string
+  workspace_id: string | null
+  reported_to_lead: number
+  last_nudged_at: number | null
+  is_qa?: number
+}
+
 /** A single permission rule for session-level enforcement. */
 export interface PermissionRule {
   permission: string

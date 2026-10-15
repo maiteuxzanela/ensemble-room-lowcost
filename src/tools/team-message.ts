@@ -4,6 +4,7 @@ import { requireTeamMember, resolveStandbyWake } from "./shared"
 import { sendMessage, markDelivered, hasReportedCompletion } from "../messaging"
 import { parseModelId, getMemberModel } from "../member-model"
 import { trackPrompt, abortInflight, endTracked } from "../v2-session"
+import { isQAMember, getTeamQAMember } from "../qa-role"
 import { log } from "../log"
 
 /**
@@ -142,55 +143,55 @@ export async function executeTeamMessage(
     if (deps.config?.silentLead) {
       log(`team_message:lead-silenced from=${senderName}`)
 
-      // CC & Wake Clara (room representative / internal lead) when silentLead is active
-      if (senderName !== "clara") {
-        const claraMember = deps.db.query(
-          "SELECT session_id, execution_status, agent FROM team_member WHERE team_id = ? AND name = 'clara'"
-        ).get(teamInfo.teamId) as { session_id: string; execution_status: string; agent: string } | null
+      // CC & Wake the Quality Gate reviewer (room representative / internal lead)
+      // when silentLead is active. Agnostic lookup via qa-role.ts — no literal
+      // "clara" (reviewer may be flagged via is_qa or match the retrocompat rule).
+      if (!isQAMember(deps.db, teamInfo.teamId, senderName)) {
+        const qaMember = getTeamQAMember(deps.db, teamInfo.teamId)
 
-        if (claraMember?.session_id) {
+        if (qaMember?.sessionId) {
           const now = Date.now()
           deps.db.run(
-            "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
-            [now, teamInfo.teamId],
+            "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
+            [now, teamInfo.teamId, qaMember.name],
           )
 
           sendMessage(deps.db, {
             teamId: teamInfo.teamId,
             from: senderName,
-            to: "clara",
+            to: qaMember.name,
             content: `[CC Lead] ${messageText}`,
           })
 
           const baseWakeText = `[System: Message from ${senderName} to lead: ${messageText}]`
           let promptText = baseWakeText
-          let promptAgent: string | undefined = claraMember.agent
+          let promptAgent: string | undefined = qaMember.agent
 
-          if (claraMember.execution_status === "standby") {
-            const wake = resolveStandbyWake(deps.db, teamInfo.teamId, "clara", baseWakeText)
+          if (qaMember.executionStatus === "standby") {
+            const wake = resolveStandbyWake(deps.db, teamInfo.teamId, qaMember.name, baseWakeText)
             if (wake.woke) {
               promptText = wake.text
-              promptAgent = wake.agent ?? claraMember.agent
+              promptAgent = wake.agent ?? qaMember.agent
             }
           }
 
-          const claraModel = getMemberModel(deps.db, teamInfo.teamId, "clara")
+          const qaModel = getMemberModel(deps.db, teamInfo.teamId, qaMember.name)
           deps.client.session.promptAsync({
-            sessionID: claraMember.session_id,
+            sessionID: qaMember.sessionId,
             parts: [{ type: "text", text: promptText }],
             agent: promptAgent,
             synthetic: true,
-            ...(claraModel ? { model: claraModel } : {}),
+            ...(qaModel ? { model: qaModel } : {}),
           }).catch((err) => {
-            if (claraMember.execution_status === "standby") {
+            if (qaMember.executionStatus === "standby") {
               deps.db.run(
-                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
-                [Date.now(), teamInfo.teamId],
+                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+                [Date.now(), teamInfo.teamId, qaMember.name],
               )
             }
             log(`team_message:wake-clara-cc:failed from=${senderName} err=${err instanceof Error ? err.message : String(err)}`)
           })
-          log(`team_message:lead-silenced:cc-clara from=${senderName} sessionID=${claraMember.session_id}`)
+          log(`team_message:lead-silenced:cc-clara from=${senderName} sessionID=${qaMember.sessionId}`)
         }
       }
 

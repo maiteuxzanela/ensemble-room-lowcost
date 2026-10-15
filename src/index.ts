@@ -21,6 +21,10 @@ export { trackPrompt, abortInflight, endTracked } from "./v2-session"
 export { executeTeamTasksReview, executeTeamTasksReject } from "./tools/team-tasks-complete"
 export { executeTeamStandby, setMemberStandby } from "./tools/team-standby"
 export { executeTeamClaim, claimTask } from "./tools/team-claim"
+// Central QA-reviewer helpers (Migration 14) — exported so wake/CC/watchdog
+// consumers and deterministic test harnesses can resolve the reviewer without
+// hardcoding the string "clara". See src/qa-role.ts for the lookup contract.
+export { isQAMember, getTeamQAMember, type QAMemberInfo } from "./qa-role"
 export { buildTeammateSystemPrompt, buildLeadSystemPrompt } from "./system-prompt"
 export { lastRoomActivity } from "./config"
 export { Watchdog } from "./watchdog"
@@ -174,6 +178,9 @@ const plugin: Plugin = async (input) => {
     peerMessageWindowMs: config.peerMessageWindowMs,
     roomInactivityThresholdMs: config.roomInactivityThresholdMs,
     roomInactivityCheckMs: config.roomInactivityCheckMs,
+    // F2: thread config so watchdog notifyLead wakes use the model-aware
+    // ladder (agent + fallback chain step-down) instead of a modelless wake.
+    config,
   })
   watchdog.start()
 
@@ -215,6 +222,10 @@ const plugin: Plugin = async (input) => {
                 db,
                 transition.teamId,
                 `Warning: Teammate "${transition.memberName}" went idle immediately after spawning with no output${modelInfo}. This usually means the model failed to start (authentication error, invalid model, or provider issue). Check your API key and model configuration, then retry the spawn.`,
+                // HARNESS-15 B: model-aware wake — the agent resolves from
+                // options/team.lead_agent and the model ladder from the
+                // config's fallback chain (primary → next).
+                { config },
               )
               client.tui.showToast({
                 title: "Team",
@@ -267,8 +278,8 @@ const plugin: Plugin = async (input) => {
             progressTracker.recordBusyStart(sessionID)
           } else if (transition.to === "retry") {
             // Teammate is being rate-limited — evaluate SILENT model failover
-            // FIRST (zero-noise: "switched"/"suppressed" never wake the lead;
-            // only chain exhaustion does, inside handleRetryModelFailover).
+            // FIRST (zero-noise per HARNESS-13: "switched"/"suppressed"/
+            // "exhausted" never wake the lead; exhaustion only toasts).
             const failover = await handleRetryModelFailover(
               db,
               registry,
@@ -283,7 +294,7 @@ const plugin: Plugin = async (input) => {
             const failoverInfo = failover?.action === "switched"
               ? ` — switched to ${failover.toModel}`
               : failover?.action === "exhausted"
-                ? " — no fallback model left, lead notified"
+                ? " — no fallback model left"
                 : ""
             try {
               await client.tui.showToast({
@@ -318,6 +329,45 @@ const plugin: Plugin = async (input) => {
 
           // Show working progress after every transition so the user sees who's still active
           await notifyWorkingProgress(client, db, transition.teamId)
+        }
+
+        // SEAM wiring (V1): non-member sessions — e.g. the Diana isolated
+        // blind-review session — and LEAD sessions (HARNESS-15 A: rate-
+        // limited lead with an explicit fallbackModelsByAgent chain) produce
+        // NO transition (handleSessionStatusEvent bails on the registry
+        // lookup). Evaluate the isolated failover path for their retries: it
+        // applies the per-agent chain from fallbackModelsByAgent when one
+        // exists for the session's agent, and no-ops otherwise (the global
+        // chain NEVER hijacks — for the lead it never sequesters). Zero-noise
+        // preserved (HARNESS-13): toasts fire only when the failover ACTED
+        // ("switched"/"exhausted"); "suppressed" stays silent; the lead is
+        // never woken from a failover path. The member path above
+        // (transition.to === "retry") is untouched.
+        if (!transition && statusType === "retry") {
+          const isolatedFailover = await handleRetryModelFailover(
+            db,
+            registry,
+            client,
+            config,
+            sessionID,
+            retryPayload,
+          ).catch((err) => {
+            log(`failover:event:failed session=${sessionID} err=${err instanceof Error ? err.message : String(err)}`)
+            return undefined
+          })
+          if (isolatedFailover && isolatedFailover.action !== "suppressed") {
+            const isolatedInfo = isolatedFailover.action === "switched"
+              ? ` switched to ${isolatedFailover.toModel}`
+              : " chain exhausted"
+            try {
+              await client.tui.showToast({
+                title: "Team",
+                message: `Session "${isolatedFailover.memberName}" is rate-limited —${isolatedInfo}`,
+                variant: "warning",
+                duration: 3000,
+              })
+            } catch { /* TUI may not be available */ }
+          }
         }
 
         // Wake the lead when it goes idle and has pending messages.
@@ -387,7 +437,9 @@ const plugin: Plugin = async (input) => {
       // teammate just appears stuck.
       if (event.type === "session.error") {
         const props = event.properties as { sessionID?: string; error?: { name?: string; data?: { message?: string } } }
-        handleSessionErrorEvent(db, registry, client, props.sessionID, props.error)
+        // HARNESS-15 B: thread the config so the notifyLead wake inside is
+        // model-aware (agent + fallback-chain ladder).
+        handleSessionErrorEvent(db, registry, client, props.sessionID, props.error, config)
       }
 
       // Track per-step output tokens for stall detection
@@ -500,6 +552,8 @@ const plugin: Plugin = async (input) => {
           worktree: tool.schema.boolean().default(true).describe("Create a git worktree for file isolation (default: true, set false for read-only agents)"),
           plan_approval: tool.schema.boolean().default(false).describe("Require teammate to send a plan for approval before writing files (default: false)"),
           standby: tool.schema.boolean().default(false).describe("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)"),
+          role: tool.schema.enum(["qa", "member"]).optional().describe("Teammate role: 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)"),
+          is_qa: tool.schema.boolean().optional().describe("Explicitly flag this teammate as the Quality Gate reviewer (stored in team_member.is_qa). Omitted = auto-detect (agent 'clara' or base persona 'clara' → QA)"),
         },
         async execute(args, ctx) {
           const result = await executeTeamSpawn(deps, args, ctx.sessionID)

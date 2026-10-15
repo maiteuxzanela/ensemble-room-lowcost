@@ -460,7 +460,14 @@ var MIGRATIONS = [
    DROP TABLE team_task_old_m13;
    CREATE INDEX IF NOT EXISTS team_task_team_idx ON team_task(team_id);
    CREATE INDEX IF NOT EXISTS team_task_assignee_idx ON team_task(assignee);
-   CREATE INDEX IF NOT EXISTS team_task_status_idx ON team_task(team_id, status);`
+   CREATE INDEX IF NOT EXISTS team_task_status_idx ON team_task(team_id, status);`,
+  // Migration 14: add is_qa flag to team_member — marks the Quality Gate
+  // reviewer (Clara) explicitly. Additive-only (same non-negotiable as Migrations
+  // 9-11): no CHECK constraint, no table rebuild. The central helpers in
+  // src/qa-role.ts (isQAMember / getTeamQAMember) read this column first and
+  // fall back to the legacy base-persona/agent === 'clara' detection, so
+  // existing databases and consumers keep working unchanged.
+  `ALTER TABLE team_member ADD COLUMN is_qa INTEGER NOT NULL DEFAULT 0;`
 ];
 function applyMigrations(db) {
   const { user_version: current } = db.query("PRAGMA user_version").get();
@@ -718,6 +725,7 @@ var DEFAULT_MODEL_FALLBACK = Object.freeze({
   model: "google/antigravity-gemini-3.8-flash",
   variant: "low"
 });
+var VARIANT_ABSENT_SENTINEL = "default";
 function parseModelSelector(selector) {
   let base = selector;
   let variant;
@@ -725,7 +733,7 @@ function parseModelSelector(selector) {
   if (hash >= 0) {
     base = selector.slice(0, hash);
     const v = selector.slice(hash + 1).trim();
-    if (v) variant = v;
+    if (v && v !== VARIANT_ABSENT_SENTINEL) variant = v;
   }
   const slash = base.indexOf("/");
   if (slash <= 0 || slash === base.length - 1) return void 0;
@@ -735,12 +743,17 @@ function parseModelSelector(selector) {
   return variant ? { providerID, modelID, variant } : { providerID, modelID };
 }
 function formatModelSelector(entry) {
-  return entry.variant ? `${entry.model}#${entry.variant}` : entry.model;
+  return entry.variant && entry.variant !== VARIANT_ABSENT_SENTINEL ? `${entry.model}#${entry.variant}` : entry.model;
 }
-function resolveFallbackChain(config) {
+function stripDefaultVariant(selector) {
+  const hash = selector.indexOf("#");
+  if (hash < 0) return selector;
+  return selector.slice(hash + 1).trim() === VARIANT_ABSENT_SENTINEL ? selector.slice(0, hash) : selector;
+}
+function chainFromSelectors(selectors) {
   const chain = [];
   const seen = /* @__PURE__ */ new Set();
-  for (const selector of config.fallbackModels ?? []) {
+  for (const selector of selectors) {
     const parsed = parseModelSelector(selector);
     if (!parsed) continue;
     const entry = {
@@ -752,28 +765,56 @@ function resolveFallbackChain(config) {
     seen.add(key);
     chain.push(entry);
   }
+  return chain;
+}
+function resolveFallbackChain(config) {
+  const chain = chainFromSelectors(config.fallbackModels ?? []);
   if (chain.length > 0) return chain;
   const mf = config.modelFallback;
   if (mf?.model) {
     const parsed = parseModelSelector(mf.model);
     const model = parsed ? `${parsed.providerID}/${parsed.modelID}` : mf.model;
-    const variant = mf.variant || parsed?.variant;
+    const rawVariant = mf.variant?.trim() || parsed?.variant;
+    const variant = rawVariant && rawVariant !== VARIANT_ABSENT_SENTINEL ? rawVariant : void 0;
     return [variant ? { model, variant } : { model }];
   }
   return [{ model: DEFAULT_MODEL_FALLBACK.model, variant: DEFAULT_MODEL_FALLBACK.variant }];
 }
+function resolveBasePersona(memberName) {
+  return (memberName.split(/[-_]/)[0] ?? memberName).toLowerCase();
+}
+function resolveFallbackChainForAgent(config, agent) {
+  if (agent) {
+    const selectors = config.fallbackModelsByAgent?.[agent];
+    if (Array.isArray(selectors) && selectors.length > 0) {
+      const chain = chainFromSelectors(selectors);
+      if (chain.length > 0) return chain;
+    }
+    const basePersona = resolveBasePersona(agent);
+    if (basePersona !== agent) {
+      const baseSelectors = config.fallbackModelsByAgent?.[basePersona];
+      if (Array.isArray(baseSelectors) && baseSelectors.length > 0) {
+        const chain = chainFromSelectors(baseSelectors);
+        if (chain.length > 0) return chain;
+      }
+    }
+  }
+  return resolveFallbackChain(config);
+}
 function selectFallbackModel(chain, primary) {
   if (chain.length === 0) return void 0;
   if (!primary) return chain[0];
-  const parsed = parseModelSelector(primary);
-  const primaryKey = parsed ? formatModelSelector({ model: `${parsed.providerID}/${parsed.modelID}`, ...parsed.variant ? { variant: parsed.variant } : {} }) : primary;
+  const normalized = stripDefaultVariant(primary.trim());
+  const parsed = parseModelSelector(normalized);
+  const primaryKey = parsed ? formatModelSelector({ model: `${parsed.providerID}/${parsed.modelID}`, ...parsed.variant ? { variant: parsed.variant } : {} }) : normalized;
   return chain.find((entry) => formatModelSelector(entry) !== primaryKey);
 }
 function selectNextFallback(chain, current) {
   if (chain.length === 0) return void 0;
   if (!current) return chain[0];
-  const parsed = parseModelSelector(current);
-  const key = parsed ? formatModelSelector({ model: `${parsed.providerID}/${parsed.modelID}`, ...parsed.variant ? { variant: parsed.variant } : {} }) : current;
+  const normalized = stripDefaultVariant(current.trim());
+  const parsed = parseModelSelector(normalized);
+  const key = parsed ? formatModelSelector({ model: `${parsed.providerID}/${parsed.modelID}`, ...parsed.variant ? { variant: parsed.variant } : {} }) : normalized;
   const idx = chain.findIndex((entry) => formatModelSelector(entry) === key);
   if (idx >= 0) return chain[idx + 1];
   return chain.find((entry) => formatModelSelector(entry) !== key);
@@ -794,10 +835,12 @@ var DEFAULT_CONFIG = {
   modelAssignment: "default",
   promptForModels: false,
   fallbackModels: [],
+  fallbackModelsByAgent: {},
   modelFallback: { model: DEFAULT_MODEL_FALLBACK.model, variant: DEFAULT_MODEL_FALLBACK.variant },
   silentLead: true,
   roomInactivityThresholdMs: 3e4,
-  roomInactivityCheckMs: 5e3
+  roomInactivityCheckMs: 5e3,
+  deniedTools: []
 };
 function readConfigFile(filePath) {
   try {
@@ -824,6 +867,13 @@ function readConfigFile(filePath) {
     if (Array.isArray(raw.fallbackModels) && raw.fallbackModels.every((m) => typeof m === "string" && m.trim().length > 0)) {
       result.fallbackModels = raw.fallbackModels;
     }
+    if (typeof raw.fallbackModelsByAgent === "object" && raw.fallbackModelsByAgent !== null && !Array.isArray(raw.fallbackModelsByAgent)) {
+      const entries = Object.entries(raw.fallbackModelsByAgent);
+      const valid = entries.every(
+        ([, v]) => Array.isArray(v) && v.every((m) => typeof m === "string" && m.trim().length > 0)
+      );
+      if (valid) result.fallbackModelsByAgent = raw.fallbackModelsByAgent;
+    }
     if (typeof raw.modelFallback === "object" && raw.modelFallback !== null && !Array.isArray(raw.modelFallback)) {
       const mf = raw.modelFallback;
       if (typeof mf.model === "string" && mf.model.trim().length > 0) {
@@ -833,6 +883,9 @@ function readConfigFile(filePath) {
     if (typeof raw.silentLead === "boolean") result.silentLead = raw.silentLead;
     if (typeof raw.roomInactivityThresholdMs === "number") result.roomInactivityThresholdMs = raw.roomInactivityThresholdMs;
     if (typeof raw.roomInactivityCheckMs === "number") result.roomInactivityCheckMs = raw.roomInactivityCheckMs;
+    if (Array.isArray(raw.deniedTools) && raw.deniedTools.every((t) => typeof t === "string" && t.trim().length > 0)) {
+      result.deniedTools = raw.deniedTools;
+    }
     return result;
   } catch (err) {
     if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return {};
@@ -847,6 +900,12 @@ function loadConfig(projectDir) {
   const global = readConfigFile(globalPath);
   const project = readConfigFile(projectPath);
   const merged = { ...DEFAULT_CONFIG, ...global, ...project };
+  merged.deniedTools = [.../* @__PURE__ */ new Set([...global.deniedTools ?? [], ...project.deniedTools ?? []])];
+  merged.fallbackModelsByAgent = {
+    ...DEFAULT_CONFIG.fallbackModelsByAgent,
+    ...global.fallbackModelsByAgent ?? {},
+    ...project.fallbackModelsByAgent ?? {}
+  };
   const timeout = process.env.OPENCODE_ENSEMBLE_TIMEOUT;
   if (timeout !== void 0) merged.timeoutMs = timeout === "0" ? 0 : parseInt(timeout, 10) || merged.timeoutMs;
   const rateLimit = process.env.OPENCODE_ENSEMBLE_RATE_LIMIT;
@@ -1040,16 +1099,63 @@ async function notifyWorkingProgress(client, db, teamId) {
   } catch {
   }
 }
-function notifyLead(client, db, teamId, content) {
+function resolveLeadWakeContext(db, teamId) {
+  const team = db.query("SELECT lead_session_id, lead_agent FROM team WHERE id = ?").get(teamId);
+  if (!team?.lead_session_id) return void 0;
+  return { leadSessionId: team.lead_session_id, leadAgent: team.lead_agent || void 0 };
+}
+function promptModelAwareWake(client, params) {
+  const { sessionID, text, logTag, agent, config, primaryModel, synthetic = true } = params;
+  const ladder = [];
+  const seen = /* @__PURE__ */ new Set();
+  const pushSelector = (selector) => {
+    if (selector && !seen.has(selector)) {
+      seen.add(selector);
+      ladder.push(selector);
+    }
+  };
+  if (primaryModel) pushSelector(primaryModel);
+  if (config) {
+    for (const entry of resolveFallbackChainForAgent(config, agent)) {
+      pushSelector(formatModelSelector(entry));
+    }
+  }
+  const attempt = (index) => {
+    const selector = ladder[index];
+    const parsed = selector ? parseModelSelector(selector) : void 0;
+    client.session.promptAsync({
+      sessionID,
+      parts: [{ type: "text", text }],
+      ...agent ? { agent } : {},
+      ...parsed ? { model: parsed } : {},
+      ...synthetic ? { synthetic: true } : {}
+    }).then(() => {
+      if (selector) log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${selector}`);
+    }).catch((err) => {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const next = ladder[index + 1];
+      if (next) {
+        log(`${logTag}:retry session=${sessionID} from=${selector ?? "session-default"} to=${next} err=${errMsg}`);
+        attempt(index + 1);
+      } else {
+        log(`${logTag}:failed session=${sessionID} model=${selector ?? "session-default"} err=${errMsg}`);
+      }
+    });
+  };
+  attempt(0);
+}
+function notifyLead(client, db, teamId, content, options) {
   const id = sendMessage(db, { teamId, from: "system", to: "lead", content });
-  const team = db.query("SELECT lead_session_id FROM team WHERE id = ?").get(teamId);
-  if (!team?.lead_session_id) return id;
-  client.session.promptAsync({
-    sessionID: team.lead_session_id,
-    parts: [{ type: "text", text: "[System: New team message from system]" }],
-    synthetic: true
-  }).catch((err) => {
-    log(`notifyLead:wake:failed team=${teamId} err=${err instanceof Error ? err.message : String(err)}`);
+  const ctx = resolveLeadWakeContext(db, teamId);
+  if (!ctx) return id;
+  const leadAgent = options?.agent ?? ctx.leadAgent;
+  promptModelAwareWake(client, {
+    sessionID: ctx.leadSessionId,
+    text: "[System: New team message from system]",
+    logTag: `notifyLead:wake team=${teamId}`,
+    agent: leadAgent,
+    config: options?.config,
+    primaryModel: options?.primaryModel
   });
   return id;
 }
@@ -1102,6 +1208,55 @@ function resolveRecipientSession(db, registry, teamId, recipientName) {
   if (!memberRow) return void 0;
   registry.register(teamId, recipientName, memberRow.session_id);
   return memberRow.session_id;
+}
+
+// src/qa-role.ts
+function resolveBasePersona2(memberName) {
+  return (memberName.split(/[-_]/)[0] ?? memberName).toLowerCase();
+}
+function isQAMember(db, teamId, memberName) {
+  const row = db.query(
+    "SELECT is_qa, agent FROM team_member WHERE team_id = ? AND name = ?"
+  ).get(teamId, memberName);
+  if (!row) return false;
+  if (row.is_qa === 1) return true;
+  if (resolveBasePersona2(memberName) === "clara") return true;
+  if (row.agent === "clara") return true;
+  return false;
+}
+function getTeamQAMember(db, teamId) {
+  const cols = "name, session_id, execution_status, agent, last_nudged_at";
+  const flagged = db.query(
+    `SELECT ${cols} FROM team_member
+     WHERE team_id = ? AND is_qa = 1 AND status NOT IN ('shutdown', 'error')
+     LIMIT 1`
+  ).get(teamId);
+  if (flagged) {
+    return {
+      name: flagged.name,
+      sessionId: flagged.session_id,
+      executionStatus: flagged.execution_status,
+      agent: flagged.agent,
+      lastNudgedAt: flagged.last_nudged_at
+    };
+  }
+  const candidates = db.query(
+    `SELECT ${cols} FROM team_member
+     WHERE team_id = ? AND status NOT IN ('shutdown', 'error')`
+  ).all(teamId);
+  const match = candidates.find(
+    (c) => resolveBasePersona2(c.name) === "clara" || c.agent === "clara"
+  );
+  if (match) {
+    return {
+      name: match.name,
+      sessionId: match.session_id,
+      executionStatus: match.execution_status,
+      agent: match.agent,
+      lastNudgedAt: match.last_nudged_at
+    };
+  }
+  return null;
 }
 
 // src/hooks.ts
@@ -1270,7 +1425,7 @@ var IN_REVIEW_NUDGE_MESSAGE = "[System]: Tasks remain in review on the board. Yo
 var MAX_IN_REVIEW_NUDGES = 2;
 var inReviewNudges = /* @__PURE__ */ new Map();
 function shouldNudgeInReviewTasks(db, teamId, memberName) {
-  if (memberName !== "clara") return false;
+  if (!isQAMember(db, teamId, memberName)) return false;
   const member = db.query("SELECT status, execution_status FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
   if (!member || member.status !== "ready") return false;
   if (member.execution_status === "standby") return false;
@@ -1287,7 +1442,7 @@ function shouldNudgeInReviewTasks(db, teamId, memberName) {
   }
   return false;
 }
-function handleSessionErrorEvent(db, registry, client, sessionId, error) {
+function handleSessionErrorEvent(db, registry, client, sessionId, error, config) {
   if (!sessionId) return;
   const teamInfo = findTeamBySession(db, registry, sessionId);
   if (!teamInfo || teamInfo.role !== "member" || !teamInfo.memberName) return;
@@ -1296,17 +1451,23 @@ function handleSessionErrorEvent(db, registry, client, sessionId, error) {
     client,
     db,
     teamInfo.teamId,
-    `Teammate "${teamInfo.memberName}" had a session error: ${errMsg}. Check their session for details. They may be stuck and need investigation or shutdown.`
+    `Teammate "${teamInfo.memberName}" had a session error: ${errMsg}. Check their session for details. They may be stuck and need investigation or shutdown.`,
+    // HARNESS-15 B: when the caller threads the config through, the wake is
+    // model-aware (agent + fallback-chain ladder inside notifyLead). Omitting
+    // it keeps the legacy wake — retrocompatible for callers without config.
+    config ? { config } : void 0
   );
 }
 var FAILOVER_COOLDOWN_MS = 10 * 60 * 1e3;
 var failoverCooldown = /* @__PURE__ */ new Map();
 async function handleRetryModelFailover(db, registry, client, config, sessionId, retryPayload) {
   const entry = registry.getBySession(sessionId);
-  if (!entry) return void 0;
+  if (!entry) {
+    return handleIsolatedSessionFailover(db, client, config, sessionId, retryPayload);
+  }
   const team = db.query("SELECT status FROM team WHERE id = ?").get(entry.teamId);
   if (!team || team.status !== "active") return void 0;
-  const member = db.query("SELECT model, status FROM team_member WHERE team_id = ? AND name = ?").get(entry.teamId, entry.memberName);
+  const member = db.query("SELECT model, status, agent FROM team_member WHERE team_id = ? AND name = ?").get(entry.teamId, entry.memberName);
   if (!member) return void 0;
   if (member.status === "shutdown" || member.status === "shutdown_requested" || member.status === "error") {
     return void 0;
@@ -1318,19 +1479,13 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
     log(`failover:suppressed member=${entry.memberName} remaining_ms=${FAILOVER_COOLDOWN_MS - (now - lastAction)}`);
     return { action: "suppressed", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model };
   }
-  const chain = resolveFallbackChain(config);
+  const chain = resolveFallbackChainForAgent(config, member.agent);
   const next = selectNextFallback(chain, member.model);
   if (!next) {
     failoverCooldown.set(cooldownKey, now);
     const detail = retryPayload?.action?.message ?? retryPayload?.message ?? "rate limited";
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty";
-    notifyLead(
-      client,
-      db,
-      entry.teamId,
-      `Teammate "${entry.memberName}" is rate-limited on model "${member.model ?? "default"}" and the fallback chain is exhausted (${chainDesc}). Last error: ${detail}. Update fallbackModels/modelFallback in ensemble.json or respawn the teammate on another model.`
-    );
-    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}]`);
+    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}] detail=${detail}`);
     return { action: "exhausted", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model };
   }
   const toSelector = formatModelSelector(next);
@@ -1360,6 +1515,13 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
             text: `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`
           }
         ],
+        // Agent EXPLICIT (Diana achado 2 — BLOCKING): omitting `agent` makes
+        // the OpenCode server assume its default agent ("dante") and
+        // OVERWRITE session.agent — a persona sequester that corrupted
+        // tales-tests/tales/tulio/clara sessions live. team_member.agent is
+        // NOT NULL (issue #28); the truthiness guard is defence in depth for
+        // legacy rows only.
+        ...member.agent ? { agent: member.agent } : {},
         ...parsedModel ? { model: parsedModel } : {},
         synthetic: true
       });
@@ -1374,6 +1536,86 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
     fromModel: member.model,
     toModel: toSelector
   };
+}
+async function handleIsolatedSessionFailover(db, client, config, sessionId, retryPayload) {
+  const leadTeam = db.query("SELECT id, lead_agent FROM team WHERE lead_session_id = ? AND status = 'active'").get(sessionId);
+  const scope = leadTeam ? "lead" : "isolated";
+  let agent = typeof retryPayload?.agent === "string" && retryPayload.agent ? retryPayload.agent : void 0;
+  let currentModel = null;
+  if (typeof client.session?.get === "function") {
+    try {
+      const res = await client.session.get({ sessionID: sessionId });
+      const info = res?.data;
+      if (!agent && typeof info?.agent === "string" && info.agent) agent = info.agent;
+      if (currentModel === null && info?.model && typeof info.model.providerID === "string" && typeof info.model.id === "string") {
+        const rawVariant = typeof info.model.variant === "string" ? info.model.variant.trim() : "";
+        const variant = rawVariant && rawVariant !== "default" ? rawVariant : void 0;
+        currentModel = variant ? `${info.model.providerID}/${info.model.id}#${variant}` : `${info.model.providerID}/${info.model.id}`;
+      }
+    } catch (err) {
+      log(`failover:${scope}:session-get:failed session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (!agent && leadTeam?.lead_agent) agent = leadTeam.lead_agent;
+  if (!agent) return void 0;
+  const selectors = config.fallbackModelsByAgent?.[agent];
+  if (!Array.isArray(selectors) || selectors.length === 0) {
+    log(`failover:${scope}:skipped session=${sessionId} agent=${agent} (no fallbackModelsByAgent chain)`);
+    return void 0;
+  }
+  const chain = resolveFallbackChainForAgent(config, agent);
+  if (chain.length === 0) return void 0;
+  const cooldownKey = `isolated:${sessionId}`;
+  const now = Date.now();
+  const lastAction = failoverCooldown.get(cooldownKey);
+  if (lastAction !== void 0 && now - lastAction < FAILOVER_COOLDOWN_MS) {
+    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${FAILOVER_COOLDOWN_MS - (now - lastAction)}`);
+    return { action: "suppressed", memberName: agent, teamId: "", fromModel: currentModel };
+  }
+  const next = selectNextFallback(chain, currentModel);
+  if (!next) {
+    failoverCooldown.set(cooldownKey, now);
+    const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty";
+    log(`failover:exhausted ${scope} session=${sessionId} agent=${agent} model=${currentModel ?? "default"} chain=[${chainDesc}]`);
+    return { action: "exhausted", memberName: agent, teamId: "", fromModel: currentModel };
+  }
+  const toSelector = formatModelSelector(next);
+  failoverCooldown.set(cooldownKey, now);
+  log(`failover:switched ${scope} session=${sessionId} agent=${agent} from=${currentModel ?? "default"} to=${toSelector} (silent \u2014 lead not woken)`);
+  const cancelled = abortInflight(sessionId);
+  log(`failover:abort-inflight ${scope} session=${sessionId} cancelled=${cancelled}`);
+  if (typeof client.session?.abort === "function") {
+    try {
+      await client.session.abort({ sessionID: sessionId });
+    } catch (err) {
+      log(`failover:abort:failed ${scope} session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  const parsedModel = parseModelSelector(toSelector);
+  if (typeof client.session?.promptAsync === "function") {
+    try {
+      await client.session.promptAsync({
+        sessionID: sessionId,
+        parts: [
+          {
+            type: "text",
+            text: `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`
+          }
+        ],
+        // Agent EXPLICIT (Diana achado 2 — BLOCKING, HARNESS-15 A rule 1b):
+        // omitting `agent` makes the server assume its default agent
+        // ("dante") and OVERWRITE session.agent — persona sequester. `agent`
+        // is guaranteed non-empty here (discovery guard above returned
+        // otherwise).
+        agent,
+        ...parsedModel ? { model: parsedModel } : {},
+        synthetic: true
+      });
+    } catch (err) {
+      log(`failover:promptAsync:failed ${scope} session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return { action: "switched", memberName: agent, teamId: "", fromModel: currentModel, toModel: toSelector };
 }
 
 // src/v2-events.ts
@@ -1982,7 +2224,7 @@ import { existsSync, readFileSync as readFileSync2 } from "node:fs";
 import os from "node:os";
 import path3 from "node:path";
 var spawnFailures = /* @__PURE__ */ new Map();
-function resolveBasePersona(memberName) {
+function resolveBasePersona3(memberName) {
   return (memberName.split(/[-_]/)[0] ?? memberName).toLowerCase();
 }
 var MAX_PERSONA_CONTEXT_CHARS = 2400;
@@ -2003,7 +2245,7 @@ function resolveModel(explicitModel, agentType, teamMemberCount, config, memberN
   const lookupKeys = [];
   if (memberName) {
     lookupKeys.push(memberName);
-    const basePersonaName = resolveBasePersona(memberName);
+    const basePersonaName = resolveBasePersona3(memberName);
     if (basePersonaName !== memberName) lookupKeys.push(basePersonaName);
   }
   lookupKeys.push(agentType);
@@ -2046,19 +2288,17 @@ async function executeTeamSpawn(deps, args, sessionId) {
   }
   const existing = deps.db.query("SELECT name FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, args.name);
   if (existing) throw new Error(`Teammate "${args.name}" already exists in team "${teamInfo.teamName}"`);
-  const basePersonaName = resolveBasePersona(args.name);
-  const isQualityGate = agent === "clara" || basePersonaName === "clara";
-  if (isQualityGate) {
-    const activeMembers = deps.db.query(
-      "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
-    ).all(teamInfo.teamId, args.name);
-    const concurrent = activeMembers.find((m) => resolveBasePersona(m.name) === "clara");
-    if (concurrent) {
+  const basePersonaName = resolveBasePersona3(args.name);
+  const spawnIsQA = args.role === "qa" || args.is_qa === true || agent === "clara" || basePersonaName === "clara";
+  if (spawnIsQA) {
+    const existingQA = getTeamQAMember(deps.db, teamInfo.teamId);
+    if (existingQA) {
       throw new Error(
-        `Guardi\xE3 do Quality Gate 'clara' j\xE1 est\xE1 ativa na equipe '${teamInfo.teamName}' (inst\xE2ncia ativa: '${concurrent.name}'). Pap\xE9is de auditoria do Quality Gate s\xE3o exclusivos e n\xE3o admitem inst\xE2ncias concorrentes.`
+        `Guardi\xE3 do Quality Gate '${existingQA.name}' j\xE1 est\xE1 ativa na equipe '${teamInfo.teamName}' (inst\xE2ncia ativa: '${existingQA.name}'). Pap\xE9is de auditoria do Quality Gate s\xE3o exclusivos e n\xE3o admitem inst\xE2ncias concorrentes.`
       );
     }
   }
+  const roomQa = getTeamQAMember(deps.db, teamInfo.teamId);
   const isReadOnly = agent === "plan" || agent === "explore";
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory);
   const usePlanApproval = args.plan_approval === true;
@@ -2074,7 +2314,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
       log(`spawn:auto-standby member=${args.name} task=${args.claim_task} reason=task_blocked`);
     }
   }
-  if (!autoStandby && isQualityGate && args.standby !== false) {
+  if (!autoStandby && spawnIsQA && args.standby !== false) {
     const otherMembersCount = deps.db.query(
       "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
     ).get(teamInfo.teamId, args.name).c;
@@ -2171,14 +2411,12 @@ async function executeTeamSpawn(deps, args, sessionId) {
     "team_cleanup",
     "team_merge",
     "team_shutdown",
-    "openchamber",
-    "openchamber_web",
     "task",
-    "todowrite",
-    "needle_verify_delivery"
+    "todowrite"
   ];
+  const deniedTools = [.../* @__PURE__ */ new Set([...DENIED_TEAMMATE_TOOLS, ...deps.config.deniedTools ?? []])];
   permission.push(
-    ...DENIED_TEAMMATE_TOOLS.map((t) => ({ permission: t, pattern: "*", action: "deny" }))
+    ...deniedTools.map((t) => ({ permission: t, pattern: "*", action: "deny" }))
   );
   permission.push({ permission: "execute", pattern: "*", action: "allow" });
   let childSessionId;
@@ -2235,11 +2473,13 @@ async function executeTeamSpawn(deps, args, sessionId) {
   const memberCount = deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId).c;
   const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config, args.name);
   if (resolvedModel) log(`spawn:model name=${args.name} model=${resolvedModel}`);
-  const fallbackModel = selectFallbackModel(resolveFallbackChain(deps.config), resolvedModel);
-  if (fallbackModel) log(`spawn:fallback name=${args.name} fallback=${formatModelSelector(fallbackModel)}`);
+  const agentBasePersona = resolveBasePersona3(agent);
+  const agentFallbackChain = agentBasePersona !== agent && deps.config.fallbackModelsByAgent?.[agentBasePersona]?.length ? resolveFallbackChainForAgent(deps.config, agentBasePersona) : resolveFallbackChainForAgent(deps.config, agent);
+  const fallbackModel = selectFallbackModel(agentFallbackChain, resolvedModel);
+  if (fallbackModel) log(`spawn:fallback name=${args.name} agent=${agent} fallback=${formatModelSelector(fallbackModel)}`);
   deps.db.run(
-    `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, time_created, time_updated)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, is_qa, time_created, time_updated)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       teamInfo.teamId,
       args.name,
@@ -2257,6 +2497,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
       worktreeBranch,
       workspaceId,
       planApproval,
+      spawnIsQA ? 1 : 0,
       now,
       now
     ]
@@ -2375,11 +2616,12 @@ async function executeTeamSpawn(deps, args, sessionId) {
       "- Keep peer messages focused and actionable \u2014 coordinate, don't chat."
     );
   }
+  const qaPeerName = roomQa?.name;
   context.push("", "When you finish your task:");
   if (!isReadOnly && worktreeBranch) {
     context.push(`1. Commit your changes: git add -A && git commit -m "your summary"`);
     context.push(
-      "2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with Clara via team_message(to: 'clara') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a task, mark it complete using team_tasks_complete."
+      qaPeerName ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a task, mark it complete using team_tasks_complete.` : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`
     );
     context.push(
       "3. Send ONE message to the lead using team_message with this format:"
@@ -2389,14 +2631,14 @@ async function executeTeamSpawn(deps, args, sessionId) {
       "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for Quality Gate inspection and anti-early-commit governance)."
     );
     context.push(
-      "2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so Clara can validate and approve. Coordinate peer-to-peer with Clara via team_message(to: 'clara') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete."
+      qaPeerName ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so ${qaPeerName} can validate and approve. Coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.` : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`
     );
     context.push(
       "3. Send ONE message to the lead using team_message with this format:"
     );
   } else {
     context.push(
-      "1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with Clara via team_message(to: 'clara'). If you claimed a task, mark it complete using team_tasks_complete."
+      qaPeerName ? `1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). If you claimed a task, mark it complete using team_tasks_complete.` : `1. If your task requires Quality Gate review or peer feedback, coordinate with the team lead via team_message. If you claimed a task, mark it complete using team_tasks_complete.`
     );
     context.push(
       "2. Send ONE message to the lead using team_message with this format:"
@@ -2420,7 +2662,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     "- Send ONE message to the lead via team_message describing the specific blocker.",
     "- Do NOT attempt workarounds or make assumptions. Wait for the lead's response.",
     "",
-    "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted read/edit or qmd_search. Keep command outputs concise.",
+    "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit. Keep command outputs concise \u2014 never dump files >300 lines.",
     "",
     "MANDATORY CLOSING RULE: Approval without tools does not exist. It is strictly forbidden to finish your response with only plain text or Markdown. When concluding any task or audit/review, you MUST execute:",
     "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' if submitting for review)",
@@ -2491,7 +2733,10 @@ async function executeTeamSpawn(deps, args, sessionId) {
           deps.client,
           deps.db,
           teamInfo.teamId,
-          `Teammate "${args.name}" failed to start and was removed${modelInfo}. Error: ${errMsg}. You may retry the spawn.`
+          `Teammate "${args.name}" failed to start and was removed${modelInfo}. Error: ${errMsg}. You may retry the spawn.`,
+          // F2: model-aware wake — agent from team.lead_agent + fallback-chain
+          // ladder with step-down (HARNESS-15 B), same as notifyLead elsewhere.
+          { config: deps.config }
         );
       } catch {
       }
@@ -2593,49 +2838,47 @@ async function executeTeamMessage(deps, args, sessionId) {
   if (isToLead) {
     if (deps.config?.silentLead) {
       log(`team_message:lead-silenced from=${senderName}`);
-      if (senderName !== "clara") {
-        const claraMember = deps.db.query(
-          "SELECT session_id, execution_status, agent FROM team_member WHERE team_id = ? AND name = 'clara'"
-        ).get(teamInfo.teamId);
-        if (claraMember?.session_id) {
+      if (!isQAMember(deps.db, teamInfo.teamId, senderName)) {
+        const qaMember = getTeamQAMember(deps.db, teamInfo.teamId);
+        if (qaMember?.sessionId) {
           const now = Date.now();
           deps.db.run(
-            "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
-            [now, teamInfo.teamId]
+            "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
+            [now, teamInfo.teamId, qaMember.name]
           );
           sendMessage(deps.db, {
             teamId: teamInfo.teamId,
             from: senderName,
-            to: "clara",
+            to: qaMember.name,
             content: `[CC Lead] ${messageText}`
           });
           const baseWakeText = `[System: Message from ${senderName} to lead: ${messageText}]`;
           let promptText = baseWakeText;
-          let promptAgent = claraMember.agent;
-          if (claraMember.execution_status === "standby") {
-            const wake2 = resolveStandbyWake(deps.db, teamInfo.teamId, "clara", baseWakeText);
+          let promptAgent = qaMember.agent;
+          if (qaMember.executionStatus === "standby") {
+            const wake2 = resolveStandbyWake(deps.db, teamInfo.teamId, qaMember.name, baseWakeText);
             if (wake2.woke) {
               promptText = wake2.text;
-              promptAgent = wake2.agent ?? claraMember.agent;
+              promptAgent = wake2.agent ?? qaMember.agent;
             }
           }
-          const claraModel = getMemberModel(deps.db, teamInfo.teamId, "clara");
+          const qaModel = getMemberModel(deps.db, teamInfo.teamId, qaMember.name);
           deps.client.session.promptAsync({
-            sessionID: claraMember.session_id,
+            sessionID: qaMember.sessionId,
             parts: [{ type: "text", text: promptText }],
             agent: promptAgent,
             synthetic: true,
-            ...claraModel ? { model: claraModel } : {}
+            ...qaModel ? { model: qaModel } : {}
           }).catch((err) => {
-            if (claraMember.execution_status === "standby") {
+            if (qaMember.executionStatus === "standby") {
               deps.db.run(
-                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
-                [Date.now(), teamInfo.teamId]
+                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+                [Date.now(), teamInfo.teamId, qaMember.name]
               );
             }
             log(`team_message:wake-clara-cc:failed from=${senderName} err=${err instanceof Error ? err.message : String(err)}`);
           });
-          log(`team_message:lead-silenced:cc-clara from=${senderName} sessionID=${claraMember.session_id}`);
+          log(`team_message:lead-silenced:cc-clara from=${senderName} sessionID=${qaMember.sessionId}`);
         }
       }
       return `Message sent to ${args.to}.`;
@@ -2815,6 +3058,8 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
   if (!task) throw new Error(`Task "${args.task_id}" not found`);
   const now = Date.now();
   const notes = args.review_notes ?? args.notes ?? null;
+  const qaMember = getTeamQAMember(deps.db, teamInfo.teamId);
+  const qaLabel = qaMember?.name ?? "the Quality Gate reviewer";
   const isSubmitReview = args.action === "submit_review" || args.action === "in_review" || args.status === "in_review";
   if (isSubmitReview) {
     if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`);
@@ -2829,56 +3074,53 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
       "UPDATE team_task SET status = 'in_review', assignee = ?, review_notes = ?, time_updated = ? WHERE id = ?",
       [assignee, notes ?? task.review_notes ?? null, now, args.task_id]
     );
-    inReviewNudges.delete(`${teamInfo.teamId}:clara:${args.task_id}`);
-    let claraNotified = false;
-    if (caller !== "clara") {
-      const claraMember = deps.db.query(
-        "SELECT session_id, execution_status, agent FROM team_member WHERE team_id = ? AND name = 'clara'"
-      ).get(teamInfo.teamId);
-      if (claraMember?.session_id) {
+    if (qaMember) inReviewNudges.delete(`${teamInfo.teamId}:${qaMember.name}:${args.task_id}`);
+    let qaNotified = false;
+    if (qaMember && !isQAMember(deps.db, teamInfo.teamId, caller)) {
+      if (qaMember.sessionId) {
         deps.db.run(
-          "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
-          [now, teamInfo.teamId]
+          "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
+          [now, teamInfo.teamId, qaMember.name]
         );
         const baseWakeText = `[System: Task "${args.task_id}" was submitted for review by ${caller}${notes ? ` (notes: ${notes})` : ""}]`;
         let promptText = baseWakeText;
-        let promptAgent = claraMember.agent;
-        if (claraMember.execution_status === "standby") {
-          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, "clara", baseWakeText);
+        let promptAgent = qaMember.agent;
+        if (qaMember.executionStatus === "standby") {
+          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, qaMember.name, baseWakeText);
           if (wake.woke) {
             promptText = wake.text;
-            promptAgent = wake.agent ?? claraMember.agent;
+            promptAgent = wake.agent ?? qaMember.agent;
           }
         }
-        const claraModel = getMemberModel(deps.db, teamInfo.teamId, "clara");
+        const qaModel = getMemberModel(deps.db, teamInfo.teamId, qaMember.name);
         deps.client.session.promptAsync({
-          sessionID: claraMember.session_id,
+          sessionID: qaMember.sessionId,
           parts: [{ type: "text", text: promptText }],
           agent: promptAgent,
           synthetic: true,
-          ...claraModel ? { model: claraModel } : {}
+          ...qaModel ? { model: qaModel } : {}
         }).catch((err) => {
-          if (claraMember.execution_status === "standby") {
+          if (qaMember.executionStatus === "standby") {
             deps.db.run(
-              "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
-              [Date.now(), teamInfo.teamId]
+              "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+              [Date.now(), teamInfo.teamId, qaMember.name]
             );
           }
           log(`tasks-complete:wake-clara:failed err=${String(err)}`);
         });
-        log(`tasks-complete:wake-clara:ok task=${args.task_id} sessionID=${claraMember.session_id}`);
-        claraNotified = true;
+        log(`tasks-complete:wake-clara:ok task=${args.task_id} sessionID=${qaMember.sessionId}`);
+        qaNotified = true;
       }
     }
-    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${claraNotified ? " (notified clara for review)" : ""}`;
+    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${qaNotified ? ` (notified ${qaMember?.name} for review)` : ""}`;
   }
   const isReject = args.action === "reject" || args.action === "reject_review" || task.status === "in_review" && (args.action === "in_progress" || args.status === "in_progress");
   if (isReject) {
     if (task.status !== "in_review") {
       throw new Error(`Task "${args.task_id}" is not in review (current status: ${task.status})`);
     }
-    if (teamInfo.role !== "lead" && caller !== "clara") {
-      throw new Error(`Only clara or the team lead can reject tasks in review`);
+    if (teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {
+      throw new Error(`Only ${qaLabel} or the team lead can reject tasks in review`);
     }
     const newRejectionCount = (task.rejection_count ?? 0) + 1;
     deps.db.run(
@@ -2891,8 +3133,8 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
   if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`);
   if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`);
   if (task.status === "in_review") {
-    if (teamInfo.role !== "lead" && caller !== "clara") {
-      throw new Error(`Task "${args.task_id}" is in review; only clara or the team lead can complete it`);
+    if (teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {
+      throw new Error(`Task "${args.task_id}" is in review; only ${qaLabel} or the team lead can complete it`);
     }
   } else if (task.status === "in_progress" && task.assignee && teamInfo.role !== "lead" && caller !== task.assignee) {
     throw new Error(`Task "${args.task_id}" is claimed by ${task.assignee}`);
@@ -2940,10 +3182,11 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
         }
       }
       if (wakeTarget) {
-        const memberRow = deps.db.query("SELECT session_id FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, wakeTarget);
+        const memberRow = deps.db.query("SELECT session_id, agent, execution_status FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, wakeTarget);
         const memberSessionId = memberRow?.session_id;
         if (memberSessionId) {
-          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, wakeTarget, `[System: Task "${t.id}" was unblocked and is ready for you to start]`);
+          const baseText = `[System: Task "${t.id}" was unblocked and is ready for you to start]`;
+          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, wakeTarget, baseText);
           if (wake.woke) {
             const memberModel = getMemberModel(deps.db, teamInfo.teamId, wakeTarget);
             deps.client.session.promptAsync({
@@ -2961,6 +3204,23 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
             });
             log(`tasks-complete:wake-member:ok member=${wakeTarget} task=${t.id}`);
             wokeMembers++;
+          } else if (wakeTarget === t.assignee) {
+            try {
+              const memberModel = getMemberModel(deps.db, teamInfo.teamId, wakeTarget);
+              const primaryModel = memberModel ? `${memberModel.providerID}/${memberModel.modelID}${memberModel.variant ? `#${memberModel.variant}` : ""}` : void 0;
+              promptModelAwareWake(deps.client, {
+                sessionID: memberSessionId,
+                text: baseText,
+                logTag: `tasks-complete:wake-member team=${teamInfo.teamId} member=${wakeTarget}`,
+                agent: memberRow.agent || void 0,
+                config: deps.config,
+                ...primaryModel ? { primaryModel } : {}
+              });
+              log(`tasks-complete:wake-member:ok member=${wakeTarget} task=${t.id} state=${memberRow.execution_status} unconditional=true`);
+              wokeMembers++;
+            } catch (err) {
+              log(`tasks-complete:wake-member:failed member=${wakeTarget} err=${err instanceof Error ? err.message : String(err)}`);
+            }
           }
         }
       }
@@ -2988,16 +3248,22 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
     log(`tasks-complete:toast:failed`);
   }
   if (total > 0 && completed === total && activeRemaining === 0) {
-    const lead = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?").get(teamInfo.teamId);
-    if (lead?.lead_session_id) {
-      deps.client.session.promptAsync({
-        sessionID: lead.lead_session_id,
-        parts: [{ type: "text", text: `[System: All team tasks completed on board by ${who}]` }],
-        synthetic: true
-      }).catch((err) => {
-        log(`tasks-complete:wake-lead:failed err=${String(err)}`);
-      });
-      log(`tasks-complete:wake-lead:sent leadSession=${lead.lead_session_id} by=${who}`);
+    const leadRow = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?").get(teamInfo.teamId);
+    const leadSessionId = leadRow?.lead_session_id;
+    if (leadSessionId) {
+      const agentRow = deps.db.query("SELECT lead_agent FROM team WHERE id = ?").get(teamInfo.teamId);
+      try {
+        promptModelAwareWake(deps.client, {
+          sessionID: leadSessionId,
+          text: `[System: All team tasks completed on board by ${who}]`,
+          logTag: `tasks-complete:wake-lead team=${teamInfo.teamId}`,
+          agent: agentRow?.lead_agent || void 0,
+          config: deps.config
+        });
+        log(`tasks-complete:wake-lead:sent leadSession=${leadSessionId} by=${who}`);
+      } catch (err) {
+        log(`tasks-complete:wake-lead:failed team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
   let unblockedMsg = "";
@@ -4497,8 +4763,8 @@ function buildTeammateSystemPrompt(db, teamId, memberName, config) {
     "The runtime automatically wakes you with a synthetic system prompt when dependent tasks are unblocked or peer messages arrive.",
     "",
     "ANTI-DUMPING & CODE EXPLORATION CONTRACT:",
-    "Do NOT use bash grep, find, or broad shell searches across codebases.",
-    "Use strictly qmd_search or read/edit targeting specific files. Never dump files >300 lines or raw command outputs into context."
+    "Do NOT use bash grep, find, or broad shell scans across codebases.",
+    "Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit on specific files. Never dump files >300 lines or raw command outputs into context."
   ];
   const pendingMessages = db.query(
     "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND to_name = ? AND delivered = 0 ORDER BY time_created ASC"
@@ -6321,6 +6587,7 @@ var Watchdog = class _Watchdog {
   peerMessageWindowMs;
   roomInactivityThresholdMs;
   roomInactivityCheckMs;
+  config;
   timer;
   roomInactivityTimer;
   constructor(opts) {
@@ -6338,6 +6605,16 @@ var Watchdog = class _Watchdog {
     this.peerMessageWindowMs = opts.peerMessageWindowMs ?? 3e5;
     this.roomInactivityThresholdMs = opts.roomInactivityThresholdMs ?? 3e4;
     this.roomInactivityCheckMs = opts.roomInactivityCheckMs ?? 5e3;
+    this.config = opts.config;
+  }
+  /**
+   * notifyLead wrapper (F2): threads `{ config }` so the wake runs the
+   * model-aware ladder (agent from team.lead_agent + fallback chain with
+   * step-down). Without a config (legacy construction / test harnesses) it
+   * degrades to the exact legacy wake — signature-safe.
+   */
+  notifyLead(teamId, message) {
+    notifyLead(this.client, this.db, teamId, message, this.config ? { config: this.config } : void 0);
   }
   static STALE_THRESHOLD_MS = Number(process.env.STALE_WORKTREE_THRESHOLD_MS) || 3e5;
   /** Clean up worktrees and workspaces for shutdown/error members past the stale threshold. */
@@ -6410,9 +6687,7 @@ var Watchdog = class _Watchdog {
       }).catch((err) => {
         log(`watchdog:stall:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`);
       });
-      notifyLead(
-        this.client,
-        this.db,
+      this.notifyLead(
         member.team_id,
         `Teammate "${member.name}" appears stalled (${reason}). Consider checking on them via team_message or shutting them down.`
       );
@@ -6452,16 +6727,14 @@ var Watchdog = class _Watchdog {
       }).catch((err) => {
         log(`watchdog:chatty:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`);
       });
-      notifyLead(
-        this.client,
-        this.db,
+      this.notifyLead(
         member.team_id,
         `Agent "${member.name}" is sending many peer messages and may be over-coordinating. Consider checking on them.`
       );
       log(`watchdog:chatty member=${member.name} limit=${this.peerMessageLimit}`);
     }
   }
-  /** Check for room inactivity and wake Clara to inspect and drive progress. */
+  /** Check for room inactivity and wake the Quality Gate reviewer to inspect and drive progress. */
   async checkRoomInactivity() {
     if (this.roomInactivityThresholdMs === 0) return;
     const activeTeams = this.db.query(
@@ -6474,50 +6747,50 @@ var Watchdog = class _Watchdog {
       ).get(team.id);
       const unfinishedCount = taskCountRow?.count ?? 0;
       if (unfinishedCount === 0) continue;
-      const busyMember = this.db.query(
-        "SELECT name FROM team_member WHERE team_id = ? AND name != 'clara' AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
+      const qa = getTeamQAMember(this.db, team.id);
+      const busyMember = qa ? this.db.query(
+        "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
+      ).get(team.id, qa.name) : this.db.query(
+        "SELECT name FROM team_member WHERE team_id = ? AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
       ).get(team.id);
       if (busyMember) continue;
       const lastActivity = lastRoomActivity(this.db, team.id);
       if (lastActivity <= 0) continue;
       const inactiveMs = now - lastActivity;
       if (inactiveMs < this.roomInactivityThresholdMs) continue;
-      const clara = this.db.query(
-        "SELECT session_id, execution_status, agent, last_nudged_at FROM team_member WHERE team_id = ? AND name = 'clara'"
-      ).get(team.id);
-      if (!clara?.session_id) continue;
-      if (clara.last_nudged_at) {
-        const activeSinceNudge = lastActivity > clara.last_nudged_at;
-        if (!activeSinceNudge && now - clara.last_nudged_at < this.roomInactivityThresholdMs) {
+      if (!qa?.sessionId) continue;
+      if (qa.lastNudgedAt) {
+        const activeSinceNudge = lastActivity > qa.lastNudgedAt;
+        if (!activeSinceNudge && now - qa.lastNudgedAt < this.roomInactivityThresholdMs) {
           continue;
         }
       }
       this.db.run(
-        "UPDATE team_member SET last_nudged_at = ?, reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = 'clara'",
-        [now, now, team.id]
+        "UPDATE team_member SET last_nudged_at = ?, reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
+        [now, now, team.id, qa.name]
       );
       const wakeText = `[System: Room has been inactive for ${Math.round(inactiveMs / 1e3)}s with ${unfinishedCount} unfinished task(s). Inspect the board, unblock, claim, or nudge teammates to drive progress.]`;
       let promptText = wakeText;
-      let promptAgent = clara.agent;
-      if (clara.execution_status === "standby") {
-        const wake = resolveStandbyWake(this.db, team.id, "clara", wakeText);
+      let promptAgent = qa.agent;
+      if (qa.executionStatus === "standby") {
+        const wake = resolveStandbyWake(this.db, team.id, qa.name, wakeText);
         if (wake.woke) {
           promptText = wake.text;
-          promptAgent = wake.agent ?? clara.agent;
+          promptAgent = wake.agent ?? qa.agent;
         }
       }
-      const claraModel = getMemberModel(this.db, team.id, "clara");
+      const qaModel = getMemberModel(this.db, team.id, qa.name);
       this.client.session.promptAsync({
-        sessionID: clara.session_id,
+        sessionID: qa.sessionId,
         parts: [{ type: "text", text: promptText }],
         agent: promptAgent,
         synthetic: true,
-        ...claraModel ? { model: claraModel } : {}
+        ...qaModel ? { model: qaModel } : {}
       }).catch((err) => {
-        if (clara.execution_status === "standby") {
+        if (qa.executionStatus === "standby") {
           this.db.run(
-            "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = 'clara' AND execution_status = 'starting'",
-            [Date.now(), team.id]
+            "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+            [Date.now(), team.id, qa.name]
           );
         }
         log(`watchdog:room-inactivity:wake-clara:failed team=${team.id} err=${err instanceof Error ? err.message : String(err)}`);
@@ -6573,9 +6846,7 @@ var Watchdog = class _Watchdog {
       );
       const released = releaseMemberTasks(this.db, member.team_id, member.name);
       if (released > 0) log(`watchdog:tasks:released name=${member.name} count=${released}`);
-      notifyLead(
-        this.client,
-        this.db,
+      this.notifyLead(
         member.team_id,
         `Teammate "${member.name}" timed out after exceeding the busy time limit and was aborted. Their in-progress work has been released. Review their session, then re-spawn or reassign the task if needed.`
       );
@@ -6697,7 +6968,10 @@ var plugin = async (input) => {
     peerMessageLimit: config.peerMessageLimit,
     peerMessageWindowMs: config.peerMessageWindowMs,
     roomInactivityThresholdMs: config.roomInactivityThresholdMs,
-    roomInactivityCheckMs: config.roomInactivityCheckMs
+    roomInactivityCheckMs: config.roomInactivityCheckMs,
+    // F2: thread config so watchdog notifyLead wakes use the model-aware
+    // ladder (agent + fallback chain step-down) instead of a modelless wake.
+    config
   });
   watchdog.start();
   return {
@@ -6726,7 +7000,11 @@ var plugin = async (input) => {
                 client,
                 db,
                 transition.teamId,
-                `Warning: Teammate "${transition.memberName}" went idle immediately after spawning with no output${modelInfo}. This usually means the model failed to start (authentication error, invalid model, or provider issue). Check your API key and model configuration, then retry the spawn.`
+                `Warning: Teammate "${transition.memberName}" went idle immediately after spawning with no output${modelInfo}. This usually means the model failed to start (authentication error, invalid model, or provider issue). Check your API key and model configuration, then retry the spawn.`,
+                // HARNESS-15 B: model-aware wake — the agent resolves from
+                // options/team.lead_agent and the model ladder from the
+                // config's fallback chain (primary → next).
+                { config }
               );
               client.tui.showToast({
                 title: "Team",
@@ -6781,7 +7059,7 @@ var plugin = async (input) => {
               log(`failover:event:failed session=${sessionID} err=${err instanceof Error ? err.message : String(err)}`);
               return void 0;
             });
-            const failoverInfo = failover?.action === "switched" ? ` \u2014 switched to ${failover.toModel}` : failover?.action === "exhausted" ? " \u2014 no fallback model left, lead notified" : "";
+            const failoverInfo = failover?.action === "switched" ? ` \u2014 switched to ${failover.toModel}` : failover?.action === "exhausted" ? " \u2014 no fallback model left" : "";
             try {
               await client.tui.showToast({
                 title: "Team",
@@ -6814,6 +7092,31 @@ var plugin = async (input) => {
             }
           }
           await notifyWorkingProgress(client, db, transition.teamId);
+        }
+        if (!transition && statusType === "retry") {
+          const isolatedFailover = await handleRetryModelFailover(
+            db,
+            registry,
+            client,
+            config,
+            sessionID,
+            retryPayload
+          ).catch((err) => {
+            log(`failover:event:failed session=${sessionID} err=${err instanceof Error ? err.message : String(err)}`);
+            return void 0;
+          });
+          if (isolatedFailover && isolatedFailover.action !== "suppressed") {
+            const isolatedInfo = isolatedFailover.action === "switched" ? ` switched to ${isolatedFailover.toModel}` : " chain exhausted";
+            try {
+              await client.tui.showToast({
+                title: "Team",
+                message: `Session "${isolatedFailover.memberName}" is rate-limited \u2014${isolatedInfo}`,
+                variant: "warning",
+                duration: 3e3
+              });
+            } catch {
+            }
+          }
         }
         if (statusType === "idle") {
           const team = db.query("SELECT id FROM team WHERE lead_session_id = ? AND status = 'active'").get(sessionID);
@@ -6866,7 +7169,7 @@ var plugin = async (input) => {
       }
       if (event.type === "session.error") {
         const props = event.properties;
-        handleSessionErrorEvent(db, registry, client, props.sessionID, props.error);
+        handleSessionErrorEvent(db, registry, client, props.sessionID, props.error, config);
       }
       if (event.type === "message.part.updated") {
         const part = event.properties.part;
@@ -6957,7 +7260,9 @@ var plugin = async (input) => {
           claim_task: tool.schema.string().optional().describe("Task ID to auto-claim for this teammate (optional)"),
           worktree: tool.schema.boolean().default(true).describe("Create a git worktree for file isolation (default: true, set false for read-only agents)"),
           plan_approval: tool.schema.boolean().default(false).describe("Require teammate to send a plan for approval before writing files (default: false)"),
-          standby: tool.schema.boolean().default(false).describe("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)")
+          standby: tool.schema.boolean().default(false).describe("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)"),
+          role: tool.schema.enum(["qa", "member"]).optional().describe("Teammate role: 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)"),
+          is_qa: tool.schema.boolean().optional().describe("Explicitly flag this teammate as the Quality Gate reviewer (stored in team_member.is_qa). Omitted = auto-detect (agent 'clara' or base persona 'clara' \u2192 QA)")
         },
         async execute(args, ctx) {
           const result = await executeTeamSpawn(deps, args, ctx.sessionID);
@@ -7186,6 +7491,7 @@ export {
   executeTeamTasksReject,
   executeTeamTasksReview,
   failoverCooldown,
+  getTeamQAMember,
   handleRetryModelFailover,
   hasActivePeerDialogue,
   hasBlockedAssignedTasks,
@@ -7193,6 +7499,7 @@ export {
   hasOtherActiveMembers,
   hasPendingBoardTasks,
   inReviewNudges,
+  isQAMember,
   lastRoomActivity,
   setMemberStandby,
   shouldAlarmFastIdle,

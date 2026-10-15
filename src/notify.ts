@@ -1,5 +1,7 @@
 import type { Database } from "./db"
 import type { PluginClient } from "./types"
+import type { EnsembleConfig } from "./config"
+import { formatModelSelector, parseModelSelector, resolveFallbackChainForAgent } from "./config"
 import { sendMessage } from "./messaging"
 import { log } from "./log"
 
@@ -86,6 +88,136 @@ export async function notifyWorkingProgress(
 }
 
 /**
+ * Optional, RETROCOMPATIBLE wake options for notifyLead (HARNESS-15 B).
+ * Callers that omit them keep the legacy wake (no agent, no model) — every
+ * pre-existing call site stays valid.
+ */
+export interface NotifyLeadWakeOptions {
+  /**
+   * The lead's agent (e.g. "dante"). Passed EXPLICITLY to promptAsync so the
+   * OpenCode server never rebinds the session to its default agent (persona
+   * sequester — Diana achado 2). When omitted, notifyLead falls back to the
+   * plugin's known lead agent (`team.lead_agent`, Migration 5).
+   */
+  agent?: string
+  /**
+   * Plugin config. Together with the resolved lead agent it turns the wake
+   * model-aware: the model ladder is built from
+   * `resolveFallbackChainForAgent(config, leadAgent)` so a rate-limited
+   * primary never strands the message at delivered=0 (the 2026-10 incident:
+   * a modelless wake landed on the rate-limited gemini primary and the
+   * system message was never delivered).
+   */
+  config?: Required<EnsembleConfig>
+  /**
+   * Optional PRIMARY model selector for the FIRST wake attempt (e.g. the
+   * lead's currently bound model). Defaults to the head of the resolved
+   * fallback chain. Never carries the "#default" sentinel — parseModelSelector
+   * normalizes it away.
+   */
+  primaryModel?: string
+}
+
+/** Lead wake context resolved from a team row: session id + known agent. */
+export interface LeadWakeContext {
+  leadSessionId: string
+  /** `team.lead_agent` (Migration 5) — the plugin's known lead agent, if recorded. */
+  leadAgent?: string
+}
+
+/**
+ * Resolve WHERE to wake a team's lead: the canonical `lead_session_id` plus
+ * the plugin's recorded lead agent (`team.lead_agent`, Migration 5 — "agente
+ * de lead conhecido do plugin"). Returns undefined for a missing team or a
+ * lead-less team. Read-only: never writes the team row.
+ */
+export function resolveLeadWakeContext(db: Database, teamId: string): LeadWakeContext | undefined {
+  const team = db.query("SELECT lead_session_id, lead_agent FROM team WHERE id = ?")
+    .get(teamId) as { lead_session_id: string; lead_agent: string | null } | null
+  if (!team?.lead_session_id) return undefined
+  return { leadSessionId: team.lead_session_id, leadAgent: team.lead_agent || undefined }
+}
+
+/**
+ * Fire a MODEL-AWARE wake (HARNESS-15 B / F1) — the shared step-down ladder
+ * behind every lead wake that carries a config:
+ *
+ *   - `agent` (when known) goes EXPLICITLY on every attempt — omitting it
+ *     lets the server rebind the session to its default agent (persona
+ *     sequester);
+ *   - the model LADDER is `primaryModel?` first, then each distinct entry of
+ *     `resolveFallbackChainForAgent(config, agent)` (agent optional: without
+ *     one the resolver returns the global chain, which still beats a
+ *     modelless wake under rate-limit);
+ *   - each rejected attempt steps to the next rung; the ladder exhausted →
+ *     log only. The caller must persist any message BEFORE calling: the wake
+ *     is fire-and-forget (never awaited, per the promptAsync invariant).
+ *
+ * Shared by notifyLead (system messages) and the board-complete wake in
+ * team-tasks-complete — the ONLY lead wake under silentLead:true.
+ */
+export function promptModelAwareWake(
+  client: PluginClient,
+  params: {
+    sessionID: string
+    text: string
+    /** Log tag prefix, e.g. `notifyLead:wake team=t1`. */
+    logTag: string
+    /** Lead's agent — explicit when known (persona-sequester defence). */
+    agent?: string
+    /** Enables the model ladder via resolveFallbackChainForAgent(config, agent). */
+    config?: Required<EnsembleConfig>
+    /** First-attempt model selector; defaults to the chain head. */
+    primaryModel?: string
+    /** Synthetic system entry (default: true). */
+    synthetic?: boolean
+  },
+): void {
+  const { sessionID, text, logTag, agent, config, primaryModel, synthetic = true } = params
+
+  // Ladder: optional primary first, then each DISTINCT chain entry, deduped
+  // by formatted selector. "#default" never survives parse/format (config.ts).
+  const ladder: string[] = []
+  const seen = new Set<string>()
+  const pushSelector = (selector: string): void => {
+    if (selector && !seen.has(selector)) {
+      seen.add(selector)
+      ladder.push(selector)
+    }
+  }
+  if (primaryModel) pushSelector(primaryModel)
+  if (config) {
+    for (const entry of resolveFallbackChainForAgent(config, agent)) {
+      pushSelector(formatModelSelector(entry))
+    }
+  }
+
+  const attempt = (index: number): void => {
+    const selector = ladder[index]
+    const parsed = selector ? parseModelSelector(selector) : undefined
+    client.session.promptAsync({
+      sessionID,
+      parts: [{ type: "text", text }],
+      ...(agent ? { agent } : {}),
+      ...(parsed ? { model: parsed } : {}),
+      ...(synthetic ? { synthetic: true } : {}),
+    }).then(() => {
+      if (selector) log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${selector}`)
+    }).catch((err) => {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      const next = ladder[index + 1]
+      if (next) {
+        log(`${logTag}:retry session=${sessionID} from=${selector ?? "session-default"} to=${next} err=${errMsg}`)
+        attempt(index + 1)
+      } else {
+        log(`${logTag}:failed session=${sessionID} model=${selector ?? "session-default"} err=${errMsg}`)
+      }
+    })
+  }
+  attempt(0)
+}
+
+/**
  * Persist a system-generated message to the lead AND actively wake the lead
  * so the message is delivered on the lead's next turn.
  *
@@ -96,34 +228,41 @@ export async function notifyWorkingProgress(
  * "all teammates done" gate would otherwise suppress the wake and strand the
  * message in the DB with delivered=0.
  *
- * The message is persisted first; the promptAsync wake is fire-and-forget
- * (never awaited, per the plugin's promptAsync invariant). If the wake fails,
- * the message is still in the DB and the passive backstop / recovery paths
- * remain available.
+ * HARNESS-15 B — MODEL-AWARE WAKE: when wake options carry the config (and
+ * an agent resolves — options.agent, else team.lead_agent), the wake becomes
+ * a RETRY LADDER delegated to promptModelAwareWake: the primary model first,
+ * then each distinct entry of the agent's fallback chain, in order. Each
+ * failed attempt (rejected promptAsync) steps to the next rung; the message
+ * row is persisted up front so a fully failed ladder still leaves the passive
+ * backstop / recovery paths available.
  *
- * Returns the persisted message id.
+ * The message is persisted first; the promptAsync wake is fire-and-forget
+ * (never awaited, per the plugin's promptAsync invariant). Returns the
+ * persisted message id.
  */
 export function notifyLead(
   client: PluginClient,
   db: Database,
   teamId: string,
   content: string,
+  options?: NotifyLeadWakeOptions,
 ): string {
   const id = sendMessage(db, { teamId, from: "system", to: "lead", content })
 
-  const team = db.query("SELECT lead_session_id FROM team WHERE id = ?")
-    .get(teamId) as { lead_session_id: string } | null
-  if (!team?.lead_session_id) return id
+  const ctx = resolveLeadWakeContext(db, teamId)
+  if (!ctx) return id
 
-  // Fire-and-forget wake — the system prompt transform delivers the actual
-  // content on the lead's next turn. Synthetic: renders as a persistent
-  // system entry, not a fake user turn.
-  client.session.promptAsync({
-    sessionID: team.lead_session_id,
-    parts: [{ type: "text", text: "[System: New team message from system]" }],
-    synthetic: true,
-  }).catch((err) => {
-    log(`notifyLead:wake:failed team=${teamId} err=${err instanceof Error ? err.message : String(err)}`)
+  // Lead agent: explicit option first, then the plugin's stored lead agent
+  // (team.lead_agent). Absent → wake without the agent param (legacy shape).
+  const leadAgent = options?.agent ?? ctx.leadAgent
+
+  promptModelAwareWake(client, {
+    sessionID: ctx.leadSessionId,
+    text: "[System: New team message from system]",
+    logTag: `notifyLead:wake team=${teamId}`,
+    agent: leadAgent,
+    config: options?.config,
+    primaryModel: options?.primaryModel,
   })
 
   return id

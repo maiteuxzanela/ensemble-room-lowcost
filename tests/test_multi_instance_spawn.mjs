@@ -86,7 +86,10 @@ const {
 
 // Marcadores estruturais de regressão no dist (trava + normalização).
 // O bundle esbuild escapa não-ASCII (\xE3), então inspecionamos trechos ASCII.
-check("dist contém a trava de unicidade da Guardiã", distRaw.includes("Quality Gate 'clara' j") && distRaw.includes("admitem inst"));
+// Mensagem agora interpola o nome real do QA (contrato Task 4: existingQA.name)
+// em vez do literal 'clara' — asserts de runtime abaixo continuam travando a
+// forma final da mensagem para a retrocompat 'clara'.
+check("dist contém a trava de unicidade da Guardiã", distRaw.includes("Quality Gate '${existingQA.name}' j") && distRaw.includes("admitem inst"));
 check("dist normaliza base persona via split(/[-_]/)", /split\(\/\[-_\]\/\)/.test(distRaw));
 
 // ---------------------------------------------------------------------------

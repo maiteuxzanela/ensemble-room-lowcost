@@ -7,10 +7,11 @@ import { releaseMemberTasks } from "../tasks"
 import {
   formatModelSelector,
   parseModelSelector,
-  resolveFallbackChain,
+  resolveFallbackChainForAgent,
   selectFallbackModel,
 } from "../config"
 import { log } from "../log"
+import { getTeamQAMember } from "../qa-role"
 import type { EnsembleConfig } from "../config"
 import { getTeamResourceParts, teamWorktreeName } from "./merge-helper"
 import { existsSync, readFileSync } from "node:fs"
@@ -120,7 +121,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  */
 export async function executeTeamSpawn(
   deps: ToolDeps,
-  args: { name: string; agent?: string | null; prompt: string; model?: string; claim_task?: string; worktree?: boolean; plan_approval?: boolean; standby?: boolean },
+  args: { name: string; agent?: string | null; prompt: string; model?: string; claim_task?: string; worktree?: boolean; plan_approval?: boolean; standby?: boolean; role?: "qa" | "member"; is_qa?: boolean },
   sessionId: string,
 ): Promise<string> {
   // Normalize agent: the tool schema defaults to "build", but Zod's .default()
@@ -147,23 +148,38 @@ export async function executeTeamSpawn(
   // Multi-instance normalization: "cris-1"/"cris_1" → base persona "cris".
   const basePersonaName = resolveBasePersona(args.name)
 
-  // Quality Gate uniqueness lock (Guardiã Clara): audit roles are exclusive.
-  // Any member that IS or RESOLVES TO the "clara" base persona (name `clara`,
-  // instance `clara-2`/`clara_2`, or agent "clara") is rejected while another
-  // active clara-family member exists in the same team. Deterministic,
-  // fail-fast (before any worktree/session side effect).
-  const isQualityGate = agent === "clara" || basePersonaName === "clara"
-  if (isQualityGate) {
-    const activeMembers = deps.db.query(
-      "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
-    ).all(teamInfo.teamId, args.name) as Array<{ name: string }>
-    const concurrent = activeMembers.find((m) => resolveBasePersona(m.name) === "clara")
-    if (concurrent) {
+  // Quality Gate role detection (agnostic): explicit `role: "qa"` / `is_qa: true`
+  // args OR the retrocompat signals (agent "clara", base persona "clara"). The
+  // retrocompat signals are never demoted — mirrors isQAMember's rule set in
+  // qa-role.ts (additive flags, no demotion path).
+  const spawnIsQA = args.role === "qa" || args.is_qa === true || agent === "clara" || basePersonaName === "clara"
+
+  // Quality Gate uniqueness lock: audit roles are exclusive. While another
+  // ACTIVE Quality Gate reviewer (is_qa flag or clara retrocompat family) exists
+  // in the team, no second reviewer may spawn. Deterministic, fail-fast
+  // (before any worktree/session side effect).
+  //
+  // Message shape (runtime-asserted by test_multi_instance_spawn and
+  // test_auto_standby_seq for the retrocompat QA 'clara'; the dist structural
+  // marker asserts the interpolated template "Quality Gate '${existingQA.name}' j"):
+  //   Guardiã do Quality Gate '<qa.name>' já está ativa na equipe '<team>'
+  //   (instância ativa: '<qa.name>'). Papéis de auditoria do Quality Gate são
+  //   exclusivos e não admitem instâncias concorrentes.
+  // Both name slots resolve the actual reviewer via getTeamQAMember — no
+  // hardcoded literal (see qa-role.ts contract).
+  if (spawnIsQA) {
+    const existingQA = getTeamQAMember(deps.db, teamInfo.teamId)
+    if (existingQA) {
       throw new Error(
-        `Guardiã do Quality Gate 'clara' já está ativa na equipe '${teamInfo.teamName}' (instância ativa: '${concurrent.name}'). Papéis de auditoria do Quality Gate são exclusivos e não admitem instâncias concorrentes.`,
+        `Guardiã do Quality Gate '${existingQA.name}' já está ativa na equipe '${teamInfo.teamName}' (instância ativa: '${existingQA.name}'). Papéis de auditoria do Quality Gate são exclusivos e não admitem instâncias concorrentes.`,
       )
     }
   }
+
+  // Room's existing Quality Gate reviewer resolved BEFORE this member's INSERT,
+  // so a first-time QA spawn doesn't address itself in its own peer-to-peer
+  // template below (subsequent spawns will see it once inserted).
+  const roomQa = getTeamQAMember(deps.db, teamInfo.teamId)
 
   const isReadOnly = agent === "plan" || agent === "explore"
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory)
@@ -184,12 +200,12 @@ export async function executeTeamSpawn(
     }
   }
 
-  // Semantic Auto-Standby for Quality Gate Guardian (clara):
-  // If agent is clara (or agent === "clara" or the base persona of the name is
-  // "clara") and the team has other active members or pending tasks on the
-  // board, Clara must be born in standby unless args.standby === false is
+  // Semantic Auto-Standby for Quality Gate Guardian:
+  // If this spawn carries the QA role (explicit role/is_qa or clara retrocompat)
+  // and the team has other active members or pending tasks on the board, the
+  // guardian must be born in standby unless args.standby === false is
   // explicitly passed.
-  if (!autoStandby && isQualityGate && args.standby !== false) {
+  if (!autoStandby && spawnIsQA && args.standby !== false) {
     const otherMembersCount = (deps.db.query(
       "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
     ).get(teamInfo.teamId, args.name) as { c: number }).c
@@ -304,20 +320,22 @@ export async function executeTeamSpawn(
     ...TEAM_TOOLS.map(t => ({ permission: t, pattern: "*", action: "allow" as const })),
   )
 
-  // Deny lead-only and out-of-scope tools for teammates to eliminate tool schema bloat
+  // Deny lead-only and out-of-scope tools for teammates to eliminate tool schema bloat.
+  // Base list: plugin-integrity essentials only (team lifecycle + task-board
+  // side-channel tools). Ecosystem-specific tools (e.g. openchamber,
+  // needle_verify_delivery) are NOT hardcoded here — operators add them via
+  // the `deniedTools` config key (ensemble.json), merged below.
   const DENIED_TEAMMATE_TOOLS = [
     "team_create",
     "team_cleanup",
     "team_merge",
     "team_shutdown",
-    "openchamber",
-    "openchamber_web",
     "task",
     "todowrite",
-    "needle_verify_delivery",
   ] as const
+  const deniedTools = [...new Set([...DENIED_TEAMMATE_TOOLS, ...(deps.config.deniedTools ?? [])])]
   permission.push(
-    ...DENIED_TEAMMATE_TOOLS.map(t => ({ permission: t, pattern: "*", action: "deny" as const })),
+    ...deniedTools.map(t => ({ permission: t, pattern: "*", action: "deny" as const })),
   )
 
   // Code Mode is the invocation path for plugin tools on V2 — without this,
@@ -376,16 +394,24 @@ export async function executeTeamSpawn(
   const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config, args.name)
   if (resolvedModel) log(`spawn:model name=${args.name} model=${resolvedModel}`)
 
-  // Resolve the rate-limit fallback chain (fallbackModels → modelFallback →
-  // google/antigravity-gemini-3.8-flash#low). Persisted nowhere: the chain is
+  // Resolve the rate-limit fallback chain for THIS agent (per-agent override
+  // `fallbackModelsByAgent[agent]` → global fallbackModels/modelFallback →
+  // DEFAULT_MODEL_FALLBACK). The agent key is already the canonical persona
+  // ("diana"), so a multi-instance member name ("diana-2") inherits its base
+  // persona's chain for free; a suffixed AGENT type ("diana-x") is tolerated
+  // by also trying resolveBasePersona(agent). Persisted nowhere: the chain is
   // config-derived, so every delivery path recomputes the same result. The
   // first entry differing from the primary is the one silent failover uses.
-  const fallbackModel = selectFallbackModel(resolveFallbackChain(deps.config), resolvedModel)
-  if (fallbackModel) log(`spawn:fallback name=${args.name} fallback=${formatModelSelector(fallbackModel)}`)
+  const agentBasePersona = resolveBasePersona(agent)
+  const agentFallbackChain = agentBasePersona !== agent && deps.config.fallbackModelsByAgent?.[agentBasePersona]?.length
+    ? resolveFallbackChainForAgent(deps.config, agentBasePersona)
+    : resolveFallbackChainForAgent(deps.config, agent)
+  const fallbackModel = selectFallbackModel(agentFallbackChain, resolvedModel)
+  if (fallbackModel) log(`spawn:fallback name=${args.name} agent=${agent} fallback=${formatModelSelector(fallbackModel)}`)
 
   deps.db.run(
-    `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, time_created, time_updated)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, is_qa, time_created, time_updated)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       teamInfo.teamId, args.name, childSessionId, agent,
       // Standby members are born 'ready'/'standby', not 'busy'/'starting':
@@ -394,7 +420,8 @@ export async function executeTeamSpawn(
       // member that stalled.
       useStandby ? "ready" : "busy",
       useStandby ? "standby" : "starting",
-      resolvedModel ?? null, args.prompt, worktreeDir, worktreeBranch, workspaceId, planApproval, now, now,
+      resolvedModel ?? null, args.prompt, worktreeDir, worktreeBranch, workspaceId, planApproval,
+      spawnIsQA ? 1 : 0, now, now,
     ]
   )
 
@@ -542,11 +569,17 @@ export async function executeTeamSpawn(
     )
   }
 
+  // Quality Gate peer-to-peer clause: addresses the room's existing reviewer by
+  // its actual name (roomQa resolved pre-INSERT). Teams without a reviewer get
+  // the generic fallback instead of a dangling reference to a non-member.
+  const qaPeerName = roomQa?.name
   context.push("", "When you finish your task:")
   if (!isReadOnly && worktreeBranch) {
     context.push(`1. Commit your changes: git add -A && git commit -m "your summary"`)
     context.push(
-      "2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with Clara via team_message(to: 'clara') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a task, mark it complete using team_tasks_complete.",
+      qaPeerName
+        ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`
+        : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`,
     )
     context.push(
       "3. Send ONE message to the lead using team_message with this format:",
@@ -556,14 +589,18 @@ export async function executeTeamSpawn(
       "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for Quality Gate inspection and anti-early-commit governance).",
     )
     context.push(
-      "2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so Clara can validate and approve. Coordinate peer-to-peer with Clara via team_message(to: 'clara') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.",
+      qaPeerName
+        ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so ${qaPeerName} can validate and approve. Coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`
+        : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`,
     )
     context.push(
       "3. Send ONE message to the lead using team_message with this format:",
     )
   } else {
     context.push(
-      "1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with Clara via team_message(to: 'clara'). If you claimed a task, mark it complete using team_tasks_complete.",
+      qaPeerName
+        ? `1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). If you claimed a task, mark it complete using team_tasks_complete.`
+        : `1. If your task requires Quality Gate review or peer feedback, coordinate with the team lead via team_message. If you claimed a task, mark it complete using team_tasks_complete.`,
     )
     context.push(
       "2. Send ONE message to the lead using team_message with this format:",
@@ -587,7 +624,7 @@ export async function executeTeamSpawn(
     "- Send ONE message to the lead via team_message describing the specific blocker.",
     "- Do NOT attempt workarounds or make assumptions. Wait for the lead's response.",
     "",
-    "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted read/edit or qmd_search. Keep command outputs concise.",
+    "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit. Keep command outputs concise — never dump files >300 lines.",
     "",
     "MANDATORY CLOSING RULE: Approval without tools does not exist. It is strictly forbidden to finish your response with only plain text or Markdown. When concluding any task or audit/review, you MUST execute:",
     "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' if submitting for review)",
@@ -675,6 +712,9 @@ export async function executeTeamSpawn(
           deps.db,
           teamInfo.teamId,
           `Teammate "${args.name}" failed to start and was removed${modelInfo}. Error: ${errMsg}. You may retry the spawn.`,
+          // F2: model-aware wake — agent from team.lead_agent + fallback-chain
+          // ladder with step-down (HARNESS-15 B), same as notifyLead elsewhere.
+          { config: deps.config },
         )
       } catch { /* rollback failed — watchdog will clean up stale member */ }
     })

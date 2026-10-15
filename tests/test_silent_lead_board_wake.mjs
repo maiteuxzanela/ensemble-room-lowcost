@@ -525,7 +525,12 @@ async function runBehavior(label, mods) {
     await executeTeamTasksComplete(deps(DEFAULT_CONFIG), { task_id: "tA" }, S6);
     const unblocked = db.query("SELECT status FROM team_task WHERE id = 'tB'").get()?.status;
     check(`[${label}] D6a concluir tA desbloqueia tB`, unblocked === "in_progress" || unblocked === "pending", String(unblocked));
-    check(`[${label}] D6b board ainda incompleto (1/2): sem wake`, calls.promptAsync.length === base, `delta=${calls.promptAsync.length - base}`);
+    // D6b (realinhado p/ HARNESS-16): concluir tA desbloqueia tB e ACORDA o
+    // assignee pré-atribuído (M6) incondicionalmente → delta=1, mas o LEAD
+    // (L6) NÃO pode ser acordado enquanto o board está incompleto (1/2).
+    // Filtramos pela sessão do lead, espelhando o D6c.
+    const leadWakesD6b = calls.promptAsync.slice(base).filter(c => c.sessionID === L6).length;
+    check(`[${label}] D6b board ainda incompleto (1/2): sem wake do LEAD`, leadWakesD6b === 0, `leadWakes=${leadWakesD6b} total=${calls.promptAsync.length - base}`);
 
     base = calls.promptAsync.length;
     await executeTeamTasksComplete(deps(DEFAULT_CONFIG), { task_id: "tB" }, S6);
