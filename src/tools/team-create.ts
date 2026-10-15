@@ -53,5 +53,5 @@ export async function executeTeamCreate(
     [id, args.name, projectId, sessionId, now, now]
   )
 
-  return `Team "${args.name}" created. You are the lead. Use team_spawn to add teammates.`
+  return `Team "${args.name}" created. You are the lead. Para demandas de engenharia, convoque o squad canônico via team_spawn: Implementador, Hugo (testes determinísticos) e Clara (Quality Gate). Use team_tasks_add para planejar as frentes.`
 }

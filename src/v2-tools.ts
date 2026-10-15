@@ -14,6 +14,7 @@ import { executeTeamCleanup } from "./tools/team-cleanup"
 import { executeTeamMerge } from "./tools/team-merge"
 import { executeTeamStatus } from "./tools/team-status"
 import { executeTeamView } from "./tools/team-view"
+import { executeDecisionLead } from "./tools/decision-lead"
 
 /** V2 tool definition (JSON Schema input, structured content output). */
 export interface V2ToolDef {
@@ -81,7 +82,8 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
   await domain.transform((editor) => {
     editor.add({
       name: "team_create",
-      description: "Create a new agent team. You become the team lead. Use this before spawning teammates.",
+      description: "Create a new agent team. You become the team lead. Use this before spawning teammates. " +
+        "For engineering demands, convoke the canonical squad via team_spawn: Implementador, Hugo (deterministic tests) and Clara (Quality Gate).",
       input: {
         type: "object",
         properties: {
@@ -99,7 +101,8 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
       description:
         "Spawn a new teammate that works in parallel. The teammate starts immediately with the given prompt. " +
         "Each teammate gets their own git worktree for file isolation. " +
-        "Teammates work asynchronously and will message you when done. Do not poll for their status.",
+        "Teammates work asynchronously and will message you when done. Do not poll for their status. " +
+        "Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
       input: {
         type: "object",
         properties: {
@@ -372,6 +375,30 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
         additionalProperties: false,
       },
       execute: run(executeTeamView),
+    })
+
+    editor.add({
+      name: "decision_lead",
+      description:
+        "Escalate an emergency decision to the team lead and pause until they deliberate. " +
+        "Use this instead of a best-effort team_message to the lead when a ruling is genuinely " +
+        "blocking you: it wakes the lead directly (punching through silentLead), suspends you to " +
+        "standby, pauses the reviewer autoawake, and raises a high-priority toast.",
+      input: {
+        type: "object",
+        properties: {
+          question: str("The decision you need the lead to make (required)"),
+          context: str("Full context the lead needs to make the decision (required)"),
+          options: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional candidate options for the lead to choose from",
+          },
+        },
+        required: ["question", "context"],
+        additionalProperties: false,
+      },
+      execute: run(executeDecisionLead),
     })
   })
 }

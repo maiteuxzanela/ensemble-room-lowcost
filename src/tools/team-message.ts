@@ -4,7 +4,7 @@ import { requireTeamMember, resolveStandbyWake } from "./shared"
 import { sendMessage, markDelivered, hasReportedCompletion } from "../messaging"
 import { parseModelId, getMemberModel } from "../member-model"
 import { trackPrompt, abortInflight, endTracked } from "../v2-session"
-import { isQAMember, getTeamQAMember } from "../qa-role"
+import { clearAwaitingLeadDecision } from "./decision-lead"
 import { log } from "../log"
 
 /**
@@ -28,6 +28,13 @@ export async function executeTeamMessage(
   }
 
   const senderName = teamInfo.role === "lead" ? "lead" : (teamInfo.memberName ?? "unknown")
+
+  // HARNESS-22: a lead-authored message IS the deliberation. Lifting the
+  // pending-decision flag here resumes the room-inactivity watchdog's normal
+  // Clara autoawake (paused while team.awaiting_lead_decision = 1).
+  if (teamInfo.role === "lead") {
+    clearAwaitingLeadDecision(deps.db, teamInfo.teamId)
+  }
 
   // In-place model update (lead only). Handled before recipient session
   // resolution so it works even when the member is idle/not in the registry,
@@ -141,60 +148,15 @@ export async function executeTeamMessage(
   // systematically by the board-complete event instead.
   if (isToLead) {
     if (deps.config?.silentLead) {
+      // HARNESS-22 — no redundant CC. The old path cloned every lead-bound
+      // message to the Quality Gate reviewer with a CC-Lead prefix AND woke it
+      // with a promptAsync, on top of the board-complete wake
+      // (team_tasks_complete → [System: Task ... submitted for review]) and the
+      // teammate's own final report — the "triple redundancy" this ticket
+      // removes. The SQLite row written by sendMessage above IS the delivery
+      // channel; the reviewer is woken exclusively by the systematic
+      // board-complete event.
       log(`team_message:lead-silenced from=${senderName}`)
-
-      // CC & Wake the Quality Gate reviewer (room representative / internal lead)
-      // when silentLead is active. Agnostic lookup via qa-role.ts — no literal
-      // "clara" (reviewer may be flagged via is_qa or match the retrocompat rule).
-      if (!isQAMember(deps.db, teamInfo.teamId, senderName)) {
-        const qaMember = getTeamQAMember(deps.db, teamInfo.teamId)
-
-        if (qaMember?.sessionId) {
-          const now = Date.now()
-          deps.db.run(
-            "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
-            [now, teamInfo.teamId, qaMember.name],
-          )
-
-          sendMessage(deps.db, {
-            teamId: teamInfo.teamId,
-            from: senderName,
-            to: qaMember.name,
-            content: `[CC Lead] ${messageText}`,
-          })
-
-          const baseWakeText = `[System: Message from ${senderName} to lead: ${messageText}]`
-          let promptText = baseWakeText
-          let promptAgent: string | undefined = qaMember.agent
-
-          if (qaMember.executionStatus === "standby") {
-            const wake = resolveStandbyWake(deps.db, teamInfo.teamId, qaMember.name, baseWakeText)
-            if (wake.woke) {
-              promptText = wake.text
-              promptAgent = wake.agent ?? qaMember.agent
-            }
-          }
-
-          const qaModel = getMemberModel(deps.db, teamInfo.teamId, qaMember.name)
-          deps.client.session.promptAsync({
-            sessionID: qaMember.sessionId,
-            parts: [{ type: "text", text: promptText }],
-            agent: promptAgent,
-            synthetic: true,
-            ...(qaModel ? { model: qaModel } : {}),
-          }).catch((err) => {
-            if (qaMember.executionStatus === "standby") {
-              deps.db.run(
-                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
-                [Date.now(), teamInfo.teamId, qaMember.name],
-              )
-            }
-            log(`team_message:wake-clara-cc:failed from=${senderName} err=${err instanceof Error ? err.message : String(err)}`)
-          })
-          log(`team_message:lead-silenced:cc-clara from=${senderName} sessionID=${qaMember.sessionId}`)
-        }
-      }
-
       return `Message sent to ${args.to}.`
     }
     log(`team_message:wake-lead from=${senderName} recipientSession=${recipientSessionId}`)

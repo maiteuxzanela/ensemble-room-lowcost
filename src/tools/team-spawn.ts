@@ -148,6 +148,11 @@ export async function executeTeamSpawn(
   // Multi-instance normalization: "cris-1"/"cris_1" → base persona "cris".
   const basePersonaName = resolveBasePersona(args.name)
 
+  // SDET / Test Engineering role detection (agnostic): the canonical test-
+  // engineering persona is "hugo" — matched either as the explicit agent type
+  // or via the base persona of a multi-instance name ("hugo-sdet" → "hugo").
+  const isHugo = basePersonaName === "hugo" || agent === "hugo"
+
   // Quality Gate role detection (agnostic): explicit `role: "qa"` / `is_qa: true`
   // args OR the retrocompat signals (agent "clara", base persona "clara"). The
   // retrocompat signals are never demoted — mirrors isQAMember's rule set in
@@ -172,6 +177,23 @@ export async function executeTeamSpawn(
     if (existingQA) {
       throw new Error(
         `Guardiã do Quality Gate '${existingQA.name}' já está ativa na equipe '${teamInfo.teamName}' (instância ativa: '${existingQA.name}'). Papéis de auditoria do Quality Gate são exclusivos e não admitem instâncias concorrentes.`,
+      )
+    }
+  }
+
+  // SDET / Test Engineering uniqueness lock: engineering-audit roles are
+  // exclusive. While another ACTIVE SDET (canonical persona "hugo", matched by
+  // agent type or by the base persona of a multi-instance name such as
+  // "hugo-sdet") exists in the team, no second SDET may spawn. Deterministic,
+  // fail-fast (before any worktree/session side effect).
+  if (isHugo) {
+    const activeMembers = deps.db.query(
+      "SELECT name, agent FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error')",
+    ).all(teamInfo.teamId) as Array<{ name: string; agent: string }>
+    const existingSDET = activeMembers.find(m => resolveBasePersona(m.name) === "hugo" || m.agent === "hugo")
+    if (existingSDET) {
+      throw new Error(
+        `Engenheiro de Testes 'hugo' já está ativo na equipe '${teamInfo.teamName}'. Papéis de engenharia de testes são exclusivos e não admitem instâncias concorrentes.`,
       )
     }
   }
@@ -219,6 +241,18 @@ export async function executeTeamSpawn(
       autoStandbyReason = "quality gate guardian with active team or board"
       log(`spawn:auto-standby member=${args.name} agent=${agent} reason=quality_gate_active_team`)
     }
+  }
+
+  // Semantic Auto-Standby for the SDET / Test Engineering persona ("hugo"):
+  // unlike the Quality Gate guardian, Hugo is born in standby BY DEFAULT —
+  // regardless of the room's membership or board state — because its role is
+  // reactive (design and validate deliveries) and it must not burn tokens
+  // speculating before work lands. Only an explicit `standby: false` overrides
+  // this default.
+  if (!autoStandby && isHugo && args.standby !== false) {
+    autoStandby = true
+    autoStandbyReason = "hugo sdet default standby"
+    log(`spawn:auto-standby member=${args.name} agent=${agent} reason=hugo_sdet_default`)
   }
 
   // Standby mode: the member is registered and its session is created, but no
@@ -282,10 +316,11 @@ export async function executeTeamSpawn(
   // Permission rules on session.create are the hard gate (server-enforced).
   // For read-only agents, deny write tools and explicitly allow team tools.
   // For all agents with worktrees, allowlist the worktree path for edit/bash.
-  // The 9 member-accessible tools per the documented tool table: the 6 worker
-  // tools plus the 3 inspection tools (team_results/team_status/team_view —
-  // any member). Caught live 2026-09-15: teammates could not read each
-  // other's messages because team_results was missing from this list.
+  // The member-accessible tools: the worker tools plus the inspection tools
+  // (team_results/team_status/team_view — any member) and decision_lead
+  // (HARNESS-22 — any member may escalate a blocking ruling to the lead).
+  // Caught live 2026-09-15: teammates could not read each other's messages
+  // because team_results was missing from this list.
   const TEAM_TOOLS = [
     "team_message",
     "team_broadcast",
@@ -297,6 +332,7 @@ export async function executeTeamSpawn(
     "team_results",
     "team_status",
     "team_view",
+    "decision_lead",
   ] as const
   const permission: PermissionRule[] = []
 
@@ -578,11 +614,11 @@ export async function executeTeamSpawn(
     context.push(`1. Commit your changes: git add -A && git commit -m "your summary"`)
     context.push(
       qaPeerName
-        ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`
-        : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`,
+        ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). For partial or in-progress deliveries, submit_review is the SINGLE channel — do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`
+        : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). For partial or in-progress deliveries, submit_review is the SINGLE channel — do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`,
     )
     context.push(
-      "3. Send ONE message to the lead using team_message with this format:",
+      "3. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:",
     )
   } else if (!isReadOnly) {
     context.push(
@@ -590,11 +626,11 @@ export async function executeTeamSpawn(
     )
     context.push(
       qaPeerName
-        ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so ${qaPeerName} can validate and approve. Coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`
-        : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`,
+        ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so ${qaPeerName} can validate and approve. Coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). For partial or in-progress deliveries, submit_review is the SINGLE channel — do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`
+        : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). For partial or in-progress deliveries, submit_review is the SINGLE channel — do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`,
     )
     context.push(
-      "3. Send ONE message to the lead using team_message with this format:",
+      "3. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:",
     )
   } else {
     context.push(
@@ -603,7 +639,7 @@ export async function executeTeamSpawn(
         : `1. If your task requires Quality Gate review or peer feedback, coordinate with the team lead via team_message. If you claimed a task, mark it complete using team_tasks_complete.`,
     )
     context.push(
-      "2. Send ONE message to the lead using team_message with this format:",
+      "2. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:",
     )
   }
   context.push(
@@ -627,8 +663,8 @@ export async function executeTeamSpawn(
     "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit. Keep command outputs concise — never dump files >300 lines.",
     "",
     "MANDATORY CLOSING RULE: Approval without tools does not exist. It is strictly forbidden to finish your response with only plain text or Markdown. When concluding any task or audit/review, you MUST execute:",
-    "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' if submitting for review)",
-    "2. team_message(to: 'lead', text: '<task-result>...')",
+    "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' if submitting for review — the SINGLE channel for partial/in-progress deliveries)",
+    "2. team_message(to: 'lead', text: '<task-result>...') — ONLY on final completion. Do NOT duplicate a partial/in-progress report via team_message(to: 'lead').",
     "",
     "Your plain text output is NOT visible to the team. You MUST use team_message to communicate.",
   )

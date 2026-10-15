@@ -131,12 +131,16 @@ check(
   srcComplete.includes("tasks-complete:wake-clara") && distRaw.includes("tasks-complete:wake-clara"),
 );
 check(
-  "0.5 marcador cc-clara presente em team_message sob silentLead (src e dist)",
-  srcMsg.includes("team_message:lead-silenced:cc-clara") && distRaw.includes("team_message:lead-silenced:cc-clara"),
+  "0.5 HARNESS-22: marcador cc-clara REMOVIDO de team_message (src e dist)",
+  !srcMsg.includes("team_message:lead-silenced:cc-clara") && !distRaw.includes("team_message:lead-silenced:cc-clara"),
 );
 check(
-  "0.6 prefixo [CC Lead] gravado em team_message (src e dist)",
-  srcMsg.includes("[CC Lead]") && distRaw.includes("[CC Lead]"),
+  "0.6 HARNESS-22: prefixo [CC Lead] REMOVIDO de team_message (src e dist)",
+  !srcMsg.includes("[CC Lead]") && !distRaw.includes("[CC Lead]"),
+);
+check(
+  "0.6b HARNESS-22: ramo silenciado de team_message preserva o log team_message:lead-silenced (src e dist)",
+  srcMsg.includes("team_message:lead-silenced") && distRaw.includes("team_message:lead-silenced"),
 );
 
 /* Anti-mock scan */
@@ -359,10 +363,11 @@ async function runClaraRoutingBehavior(label, mods) {
   }
 
   /* ================================================================ *
-   * 4. CC DA CLARA AO ENVIAR MENSAGEM AO LEAD (silentLead: true)      *
+   * 4. HARNESS-22 — SEM CC DA CLARA AO ENVIAR MENSAGEM AO LEAD       *
+   *    (silentLead: true; o clone [CC Lead] foi extirpado)           *
    * ================================================================ */
   {
-    // Resetar Clara para standby com contexto
+    // Resetar Clara para standby com contexto — ela NÃO deve ser acordada.
     db.run(
       "UPDATE team_member SET execution_status = 'standby', spawn_context = 'Contexto Clara CC' WHERE team_id = ? AND name = 'clara'",
       [TEAM],
@@ -382,29 +387,23 @@ async function runClaraRoutingBehavior(label, mods) {
     const leadMsgs = db.query("SELECT * FROM team_message WHERE team_id = ? AND to_name = 'lead' AND from_name = 'maya'").all(TEAM);
     check(`[${label}] 4.2 Mensagem original gravada no SQLite com to='lead'`, leadMsgs.length === 1 && leadMsgs[0].content === msgText);
 
-    // (b) Mensagem CC persistida para a Clara
+    // (b) NENHUMA mensagem CC persistida para a Clara (clone removido)
     const claraMsgs = db.query("SELECT * FROM team_message WHERE team_id = ? AND to_name = 'clara' AND from_name = 'maya'").all(TEAM);
-    check(`[${label}] 4.3 Mensagem CC gravada no SQLite com to='clara' e prefixo [CC Lead]`,
-      claraMsgs.length === 1 && claraMsgs[0].content === `[CC Lead] ${msgText}`,
+    check(`[${label}] 4.3 NENHUMA mensagem [CC Lead] gravada para a Clara (clone extirpado)`,
+      claraMsgs.length === 0,
       claraMsgs[0]?.content,
     );
 
     // (c) Lead não recebe nenhum promptAsync
     check(`[${label}] 4.4 Lead NÃO recebe promptAsync (silentLead preservado)`, !calls.promptAsync.some((c) => c.sessionID === LEAD_SESSION));
 
-    // (d) Clara recebe promptAsync e acorda do standby
+    // (d) Clara NÃO recebe promptAsync — a única via de wake é o board-complete
     const claraPrompts = calls.promptAsync.filter((c) => c.sessionID === CLARA_SESSION);
-    check(`[${label}] 4.5 Clara recebeu promptAsync de CC`, claraPrompts.length === 1);
-    check(`[${label}] 4.6 Prompt da Clara contém o texto sintético de CC do Lead`,
-      claraPrompts[0]?.parts?.[0]?.text?.includes(`[System: Message from maya to lead: ${msgText}]`),
-      claraPrompts[0]?.parts?.[0]?.text,
-    );
-    check(`[${label}] 4.7 Prompt da Clara prependeu o spawn_context (acordou de standby)`,
-      claraPrompts[0]?.parts?.[0]?.text?.includes("Contexto Clara CC"),
-    );
+    check(`[${label}] 4.5 Clara NÃO recebeu promptAsync de CC automático`, claraPrompts.length === 0, `calls=${claraPrompts.length}`);
 
-    const claraRow = db.query("SELECT execution_status FROM team_member WHERE team_id = ? AND name = 'clara'").get(TEAM);
-    check(`[${label}] 4.8 Clara transicionou para starting`, claraRow.execution_status === "starting");
+    const claraRow = db.query("SELECT execution_status, spawn_context FROM team_member WHERE team_id = ? AND name = 'clara'").get(TEAM);
+    check(`[${label}] 4.6 Clara permanece em standby (sem wake automático)`, claraRow.execution_status === "standby", claraRow.execution_status);
+    check(`[${label}] 4.7 spawn_context da Clara preservado (janela de standby intacta)`, claraRow.spawn_context === "Contexto Clara CC");
   }
 
   /* ================================================================ *

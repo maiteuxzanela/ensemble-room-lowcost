@@ -467,7 +467,17 @@ var MIGRATIONS = [
   // src/qa-role.ts (isQAMember / getTeamQAMember) read this column first and
   // fall back to the legacy base-persona/agent === 'clara' detection, so
   // existing databases and consumers keep working unchanged.
-  `ALTER TABLE team_member ADD COLUMN is_qa INTEGER NOT NULL DEFAULT 0;`
+  `ALTER TABLE team_member ADD COLUMN is_qa INTEGER NOT NULL DEFAULT 0;`,
+  // Migration 15 (HARNESS-22): pending-lead-decision state on the team. A member
+  // raises an emergency decision via the `decision_lead` tool; the flag is set so
+  // the room-inactivity watchdog PAUSES Clara's autoawake until the lead
+  // deliberates (team_message from the lead clears it). Additive-only — the same
+  // non-negotiable as Migrations 9-11/14: no CHECK constraint, no table rebuild.
+  // `awaiting_decision_member` records WHO is waiting on the decision and
+  // `awaiting_decision_at` the raise timestamp, purely for observability.
+  `ALTER TABLE team ADD COLUMN awaiting_lead_decision INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE team ADD COLUMN awaiting_decision_member TEXT;
+   ALTER TABLE team ADD COLUMN awaiting_decision_at INTEGER;`
 ];
 function applyMigrations(db) {
   const { user_version: current } = db.query("PRAGMA user_version").get();
@@ -2071,7 +2081,7 @@ async function executeTeamCreate(deps, args, sessionId) {
     "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)",
     [id, args.name, projectId, sessionId, now, now]
   );
-  return `Team "${args.name}" created. You are the lead. Use team_spawn to add teammates.`;
+  return `Team "${args.name}" created. You are the lead. Para demandas de engenharia, convoque o squad can\xF4nico via team_spawn: Implementador, Hugo (testes determin\xEDsticos) e Clara (Quality Gate). Use team_tasks_add para planejar as frentes.`;
 }
 
 // src/tools/shared.ts
@@ -2289,12 +2299,24 @@ async function executeTeamSpawn(deps, args, sessionId) {
   const existing = deps.db.query("SELECT name FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, args.name);
   if (existing) throw new Error(`Teammate "${args.name}" already exists in team "${teamInfo.teamName}"`);
   const basePersonaName = resolveBasePersona3(args.name);
+  const isHugo = basePersonaName === "hugo" || agent === "hugo";
   const spawnIsQA = args.role === "qa" || args.is_qa === true || agent === "clara" || basePersonaName === "clara";
   if (spawnIsQA) {
     const existingQA = getTeamQAMember(deps.db, teamInfo.teamId);
     if (existingQA) {
       throw new Error(
         `Guardi\xE3 do Quality Gate '${existingQA.name}' j\xE1 est\xE1 ativa na equipe '${teamInfo.teamName}' (inst\xE2ncia ativa: '${existingQA.name}'). Pap\xE9is de auditoria do Quality Gate s\xE3o exclusivos e n\xE3o admitem inst\xE2ncias concorrentes.`
+      );
+    }
+  }
+  if (isHugo) {
+    const activeMembers = deps.db.query(
+      "SELECT name, agent FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error')"
+    ).all(teamInfo.teamId);
+    const existingSDET = activeMembers.find((m) => resolveBasePersona3(m.name) === "hugo" || m.agent === "hugo");
+    if (existingSDET) {
+      throw new Error(
+        `Engenheiro de Testes 'hugo' j\xE1 est\xE1 ativo na equipe '${teamInfo.teamName}'. Pap\xE9is de engenharia de testes s\xE3o exclusivos e n\xE3o admitem inst\xE2ncias concorrentes.`
       );
     }
   }
@@ -2326,6 +2348,11 @@ async function executeTeamSpawn(deps, args, sessionId) {
       autoStandbyReason = "quality gate guardian with active team or board";
       log(`spawn:auto-standby member=${args.name} agent=${agent} reason=quality_gate_active_team`);
     }
+  }
+  if (!autoStandby && isHugo && args.standby !== false) {
+    autoStandby = true;
+    autoStandbyReason = "hugo sdet default standby";
+    log(`spawn:auto-standby member=${args.name} agent=${agent} reason=hugo_sdet_default`);
   }
   const useStandby = (args.standby === true || autoStandby) && args.standby !== false;
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`);
@@ -2386,7 +2413,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
     "team_standby",
     "team_results",
     "team_status",
-    "team_view"
+    "team_view",
+    "decision_lead"
   ];
   const permission = [];
   if (worktreeDir) {
@@ -2621,27 +2649,27 @@ async function executeTeamSpawn(deps, args, sessionId) {
   if (!isReadOnly && worktreeBranch) {
     context.push(`1. Commit your changes: git add -A && git commit -m "your summary"`);
     context.push(
-      qaPeerName ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a task, mark it complete using team_tasks_complete.` : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`
+      qaPeerName ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). For partial or in-progress deliveries, submit_review is the SINGLE channel \u2014 do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.` : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). For partial or in-progress deliveries, submit_review is the SINGLE channel \u2014 do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`
     );
     context.push(
-      "3. Send ONE message to the lead using team_message with this format:"
+      "3. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:"
     );
   } else if (!isReadOnly) {
     context.push(
       "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for Quality Gate inspection and anti-early-commit governance)."
     );
     context.push(
-      qaPeerName ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so ${qaPeerName} can validate and approve. Coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}') instead of sending multiple direct reports to the lead. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.` : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`
+      qaPeerName ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so ${qaPeerName} can validate and approve. Coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). For partial or in-progress deliveries, submit_review is the SINGLE channel \u2014 do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.` : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). For partial or in-progress deliveries, submit_review is the SINGLE channel \u2014 do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`
     );
     context.push(
-      "3. Send ONE message to the lead using team_message with this format:"
+      "3. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:"
     );
   } else {
     context.push(
       qaPeerName ? `1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). If you claimed a task, mark it complete using team_tasks_complete.` : `1. If your task requires Quality Gate review or peer feedback, coordinate with the team lead via team_message. If you claimed a task, mark it complete using team_tasks_complete.`
     );
     context.push(
-      "2. Send ONE message to the lead using team_message with this format:"
+      "2. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:"
     );
   }
   context.push(
@@ -2665,8 +2693,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
     "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit. Keep command outputs concise \u2014 never dump files >300 lines.",
     "",
     "MANDATORY CLOSING RULE: Approval without tools does not exist. It is strictly forbidden to finish your response with only plain text or Markdown. When concluding any task or audit/review, you MUST execute:",
-    "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' if submitting for review)",
-    "2. team_message(to: 'lead', text: '<task-result>...')",
+    "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' if submitting for review \u2014 the SINGLE channel for partial/in-progress deliveries)",
+    "2. team_message(to: 'lead', text: '<task-result>...') \u2014 ONLY on final completion. Do NOT duplicate a partial/in-progress report via team_message(to: 'lead').",
     "",
     "Your plain text output is NOT visible to the team. You MUST use team_message to communicate."
   );
@@ -2751,6 +2779,105 @@ async function executeTeamSpawn(deps, args, sessionId) {
   return `Teammate "${args.name}" spawned (agent: ${agent})${branchInfo}${standbyInfo}${planInfo}${claimInfo}. They are working on: ${args.prompt.slice(0, 120)}${args.prompt.length > 120 ? "..." : ""}`;
 }
 
+// src/tools/team-standby.ts
+init_log();
+function setMemberStandby(db, teamId, memberName, reason) {
+  const result = db.run(
+    "UPDATE team_member SET execution_status = 'standby', status = 'ready', spawn_context = NULL, time_updated = ? WHERE team_id = ? AND name = ?",
+    [Date.now(), teamId, memberName]
+  );
+  if (result.changes === 0) {
+    throw new Error(`Member "${memberName}" not found in team`);
+  }
+  log(`member:standby name=${memberName} team=${teamId}${reason ? ` reason=${reason}` : ""}`);
+}
+async function executeTeamStandby(deps, args, sessionId) {
+  const teamInfo = requireTeamMember(deps, sessionId);
+  if (teamInfo.role === "lead") {
+    throw new Error("Only teammates can enter standby mode");
+  }
+  const memberName = teamInfo.memberName;
+  if (!memberName) {
+    throw new Error("Unknown member name for session");
+  }
+  setMemberStandby(deps.db, teamInfo.teamId, memberName, args.reason);
+  const reasonStr = args.reason ? ` (reason: ${args.reason})` : "";
+  return `Entered standby mode${reasonStr}. Execution suspended until dependencies are unblocked or a new message arrives.`;
+}
+
+// src/tools/decision-lead.ts
+init_log();
+function markAwaitingLeadDecision(db, teamId, memberName) {
+  const now = Date.now();
+  db.run(
+    "UPDATE team SET awaiting_lead_decision = 1, awaiting_decision_member = ?, awaiting_decision_at = ?, time_updated = ? WHERE id = ?",
+    [memberName, now, now, teamId]
+  );
+  log(`decision-lead:raised team=${teamId} member=${memberName}`);
+}
+function clearAwaitingLeadDecision(db, teamId) {
+  const result = db.run(
+    "UPDATE team SET awaiting_lead_decision = 0, awaiting_decision_member = NULL, awaiting_decision_at = NULL, time_updated = ? WHERE id = ? AND awaiting_lead_decision = 1",
+    [Date.now(), teamId]
+  );
+  if (result.changes > 0) log(`decision-lead:cleared team=${teamId}`);
+}
+function hasAwaitingLeadDecision(db, teamId) {
+  const row = db.query("SELECT awaiting_lead_decision FROM team WHERE id = ?").get(teamId);
+  return row?.awaiting_lead_decision === 1;
+}
+async function executeDecisionLead(deps, args, sessionId) {
+  const teamInfo = requireTeamMember(deps, sessionId);
+  if (teamInfo.role === "lead") {
+    throw new Error("Only teammates can request an emergency decision from the lead.");
+  }
+  const memberName = teamInfo.memberName;
+  if (!memberName) {
+    throw new Error("Unknown member name for session");
+  }
+  const question = args.question?.trim();
+  if (!question) {
+    throw new Error("decision_lead requires a non-empty 'question'.");
+  }
+  const context = args.context?.trim();
+  if (!context) {
+    throw new Error("decision_lead requires a non-empty 'context'.");
+  }
+  const options = (args.options ?? []).map((o) => typeof o === "string" ? o.trim() : "").filter((o) => o.length > 0);
+  const optionsBlock = options.length > 0 ? `
+Options:
+${options.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}` : "";
+  const payload = `[System: EMERGENCY DECISION REQUIRED from ${memberName}]: ${question}
+${context}${optionsBlock}`;
+  markAwaitingLeadDecision(deps.db, teamInfo.teamId, memberName);
+  setMemberStandby(deps.db, teamInfo.teamId, memberName, "awaiting lead decision");
+  const ctx = resolveLeadWakeContext(deps.db, teamInfo.teamId);
+  if (ctx) {
+    const chain = resolveFallbackChainForAgent(deps.config, ctx.leadAgent);
+    const primaryModel = chain.length > 0 ? formatModelSelector(chain[0]) : void 0;
+    promptModelAwareWake(deps.client, {
+      sessionID: ctx.leadSessionId,
+      text: payload,
+      logTag: `decision-lead:wake team=${teamInfo.teamId} member=${memberName}`,
+      agent: ctx.leadAgent,
+      config: deps.config,
+      primaryModel
+    });
+  } else {
+    log(`decision-lead:no-lead team=${teamInfo.teamId} member=${memberName} \u2014 decision recorded but lead could not be resolved`);
+  }
+  try {
+    await deps.client.tui.showToast({
+      title: "Decision required",
+      message: `Lead decision required from ${memberName}`,
+      variant: "warning",
+      duration: 8e3
+    });
+  } catch {
+  }
+  return `Emergency decision requested from the lead. You are now in standby until the lead responds.`;
+}
+
 // src/tools/team-message.ts
 init_log();
 async function executeTeamMessage(deps, args, sessionId) {
@@ -2759,6 +2886,9 @@ async function executeTeamMessage(deps, args, sessionId) {
     throw new Error("Only the lead can force-deliver a message to a completed teammate.");
   }
   const senderName = teamInfo.role === "lead" ? "lead" : teamInfo.memberName ?? "unknown";
+  if (teamInfo.role === "lead") {
+    clearAwaitingLeadDecision(deps.db, teamInfo.teamId);
+  }
   if (args.model !== void 0) {
     if (teamInfo.role !== "lead") throw new Error("Only the lead can update a teammate's model.");
     const parsed = parseModelId(args.model);
@@ -2838,49 +2968,6 @@ async function executeTeamMessage(deps, args, sessionId) {
   if (isToLead) {
     if (deps.config?.silentLead) {
       log(`team_message:lead-silenced from=${senderName}`);
-      if (!isQAMember(deps.db, teamInfo.teamId, senderName)) {
-        const qaMember = getTeamQAMember(deps.db, teamInfo.teamId);
-        if (qaMember?.sessionId) {
-          const now = Date.now();
-          deps.db.run(
-            "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
-            [now, teamInfo.teamId, qaMember.name]
-          );
-          sendMessage(deps.db, {
-            teamId: teamInfo.teamId,
-            from: senderName,
-            to: qaMember.name,
-            content: `[CC Lead] ${messageText}`
-          });
-          const baseWakeText = `[System: Message from ${senderName} to lead: ${messageText}]`;
-          let promptText = baseWakeText;
-          let promptAgent = qaMember.agent;
-          if (qaMember.executionStatus === "standby") {
-            const wake2 = resolveStandbyWake(deps.db, teamInfo.teamId, qaMember.name, baseWakeText);
-            if (wake2.woke) {
-              promptText = wake2.text;
-              promptAgent = wake2.agent ?? qaMember.agent;
-            }
-          }
-          const qaModel = getMemberModel(deps.db, teamInfo.teamId, qaMember.name);
-          deps.client.session.promptAsync({
-            sessionID: qaMember.sessionId,
-            parts: [{ type: "text", text: promptText }],
-            agent: promptAgent,
-            synthetic: true,
-            ...qaModel ? { model: qaModel } : {}
-          }).catch((err) => {
-            if (qaMember.executionStatus === "standby") {
-              deps.db.run(
-                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
-                [Date.now(), teamInfo.teamId, qaMember.name]
-              );
-            }
-            log(`team_message:wake-clara-cc:failed from=${senderName} err=${err instanceof Error ? err.message : String(err)}`);
-          });
-          log(`team_message:lead-silenced:cc-clara from=${senderName} sessionID=${qaMember.sessionId}`);
-        }
-      }
       return `Message sent to ${args.to}.`;
     }
     log(`team_message:wake-lead from=${senderName} recipientSession=${recipientSessionId}`);
@@ -3280,32 +3367,6 @@ async function executeTeamTasksReview(deps, args, sessionId) {
 }
 async function executeTeamTasksReject(deps, args, sessionId) {
   return executeTeamTasksComplete(deps, { ...args, action: "reject" }, sessionId);
-}
-
-// src/tools/team-standby.ts
-init_log();
-function setMemberStandby(db, teamId, memberName, reason) {
-  const result = db.run(
-    "UPDATE team_member SET execution_status = 'standby', status = 'ready', spawn_context = NULL, time_updated = ? WHERE team_id = ? AND name = ?",
-    [Date.now(), teamId, memberName]
-  );
-  if (result.changes === 0) {
-    throw new Error(`Member "${memberName}" not found in team`);
-  }
-  log(`member:standby name=${memberName} team=${teamId}${reason ? ` reason=${reason}` : ""}`);
-}
-async function executeTeamStandby(deps, args, sessionId) {
-  const teamInfo = requireTeamMember(deps, sessionId);
-  if (teamInfo.role === "lead") {
-    throw new Error("Only teammates can enter standby mode");
-  }
-  const memberName = teamInfo.memberName;
-  if (!memberName) {
-    throw new Error("Unknown member name for session");
-  }
-  setMemberStandby(deps.db, teamInfo.teamId, memberName, args.reason);
-  const reasonStr = args.reason ? ` (reason: ${args.reason})` : "";
-  return `Entered standby mode${reasonStr}. Execution suspended until dependencies are unblocked or a new message arrives.`;
 }
 
 // src/result-parser.ts
@@ -4095,7 +4156,7 @@ async function registerV2Tools(domain, deps) {
   await domain.transform((editor) => {
     editor.add({
       name: "team_create",
-      description: "Create a new agent team. You become the team lead. Use this before spawning teammates.",
+      description: "Create a new agent team. You become the team lead. Use this before spawning teammates. For engineering demands, convoke the canonical squad via team_spawn: Implementador, Hugo (deterministic tests) and Clara (Quality Gate).",
       input: {
         type: "object",
         properties: {
@@ -4109,7 +4170,7 @@ async function registerV2Tools(domain, deps) {
     });
     editor.add({
       name: "team_spawn",
-      description: "Spawn a new teammate that works in parallel. The teammate starts immediately with the given prompt. Each teammate gets their own git worktree for file isolation. Teammates work asynchronously and will message you when done. Do not poll for their status.",
+      description: "Spawn a new teammate that works in parallel. The teammate starts immediately with the given prompt. Each teammate gets their own git worktree for file isolation. Teammates work asynchronously and will message you when done. Do not poll for their status. Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
       input: {
         type: "object",
         properties: {
@@ -4353,6 +4414,25 @@ async function registerV2Tools(domain, deps) {
         additionalProperties: false
       },
       execute: run(executeTeamView)
+    });
+    editor.add({
+      name: "decision_lead",
+      description: "Escalate an emergency decision to the team lead and pause until they deliberate. Use this instead of a best-effort team_message to the lead when a ruling is genuinely blocking you: it wakes the lead directly (punching through silentLead), suspends you to standby, pauses the reviewer autoawake, and raises a high-priority toast.",
+      input: {
+        type: "object",
+        properties: {
+          question: str("The decision you need the lead to make (required)"),
+          context: str("Full context the lead needs to make the decision (required)"),
+          options: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional candidate options for the lead to choose from"
+          }
+        },
+        required: ["question", "context"],
+        additionalProperties: false
+      },
+      execute: run(executeDecisionLead)
     });
   });
 }
@@ -4769,7 +4849,12 @@ function buildTeammateSystemPrompt(db, teamId, memberName, config) {
     "",
     "ANTI-DUMPING & CODE EXPLORATION CONTRACT:",
     "Do NOT use bash grep, find, or broad shell scans across codebases.",
-    "Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit on specific files. Never dump files >300 lines or raw command outputs into context."
+    "Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit on specific files. Never dump files >300 lines or raw command outputs into context.",
+    "",
+    "DELIVERY CONTRACT:",
+    "For partial or in-progress work, use team_tasks_complete(task_id, action: 'submit_review', notes: '...') as the SINGLE delivery channel.",
+    "Do NOT also send a redundant team_message(to: 'lead') for partial work \u2014 report to the lead only when the task is fully complete.",
+    "If a genuinely blocking decision requires the lead, escalate with decision_lead instead of a best-effort message."
   ];
   const pendingMessages = db.query(
     "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND to_name = ? AND delivered = 0 ORDER BY time_created ASC"
@@ -6754,6 +6839,13 @@ var Watchdog = class _Watchdog {
     ).all();
     const now = Date.now();
     for (const team of activeTeams) {
+      const decisionRow = this.db.query(
+        "SELECT awaiting_lead_decision FROM team WHERE id = ?"
+      ).get(team.id);
+      if (decisionRow?.awaiting_lead_decision === 1) {
+        log(`watchdog:room-inactivity:paused team=${team.id} reason=awaiting-lead-decision`);
+        continue;
+      }
       const taskCountRow = this.db.query(
         "SELECT COUNT(*) as count FROM team_task WHERE team_id = ? AND status IN ('pending', 'in_progress', 'in_review', 'blocked')"
       ).get(team.id);
@@ -7261,7 +7353,7 @@ var plugin = async (input) => {
     // Register all team tools
     tool: {
       team_create: tool({
-        description: "Create a new agent team. You become the team lead. Use this before spawning teammates.",
+        description: "Create a new agent team. You become the team lead. Use this before spawning teammates. For engineering demands, convoke the canonical squad via team_spawn: Implementador, Hugo (deterministic tests) and Clara (Quality Gate).",
         args: {
           name: tool.schema.string().describe("Team name (lowercase alphanumeric with hyphens, 1-64 chars)"),
           project_name: tool.schema.string().optional().describe("Project display name for first use of this working directory. If omitted, a short random name is generated.")
@@ -7273,7 +7365,7 @@ var plugin = async (input) => {
         }
       }),
       team_spawn: tool({
-        description: "Spawn a new teammate that works in parallel. The teammate starts immediately with the given prompt. Each teammate gets their own git worktree for file isolation. Teammates work asynchronously and will message you when done. Do not poll for their status.",
+        description: "Spawn a new teammate that works in parallel. The teammate starts immediately with the given prompt. Each teammate gets their own git worktree for file isolation. Teammates work asynchronously and will message you when done. Do not poll for their status. Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
         args: {
           name: tool.schema.string().describe("Teammate name (lowercase alphanumeric with hyphens)"),
           agent: tool.schema.string().default("build").describe("Agent type (e.g. 'build', 'plan', 'explore')"),
@@ -7482,6 +7574,19 @@ var plugin = async (input) => {
           ctx.metadata({ title: `Viewing ${args.member}` });
           return result;
         }
+      }),
+      decision_lead: tool({
+        description: "Escalate an emergency decision to the team lead and pause until they deliberate. Use this instead of a best-effort team_message to the lead when a ruling is genuinely blocking you: it wakes the lead directly (punching through silentLead), suspends you to standby, pauses the reviewer autoawake, and raises a high-priority toast.",
+        args: {
+          question: tool.schema.string().describe("The decision you need the lead to make (required)"),
+          context: tool.schema.string().describe("Full context the lead needs to make the decision (required)"),
+          options: tool.schema.array(tool.schema.string()).optional().describe("Optional candidate options for the lead to choose from")
+        },
+        async execute(args, ctx) {
+          const result = await executeDecisionLead(deps, args, ctx.sessionID);
+          ctx.metadata({ title: `Decision requested from lead` });
+          return result;
+        }
       })
     }
   };
@@ -7506,8 +7611,10 @@ export {
   buildLeadSystemPrompt,
   buildTeammateSystemPrompt,
   claimTask,
+  clearAwaitingLeadDecision,
   index_default as default,
   endTracked,
+  executeDecisionLead,
   executeTeamClaim,
   executeTeamStandby,
   executeTeamTasksReject,
@@ -7516,6 +7623,7 @@ export {
   getTeamQAMember,
   handleRetryModelFailover,
   hasActivePeerDialogue,
+  hasAwaitingLeadDecision,
   hasBlockedAssignedTasks,
   hasInReviewAssignedTasks,
   hasOtherActiveMembers,
@@ -7523,6 +7631,7 @@ export {
   inReviewNudges,
   isQAMember,
   lastRoomActivity,
+  markAwaitingLeadDecision,
   setMemberStandby,
   shouldAlarmFastIdle,
   shouldNudgeIdleMember,

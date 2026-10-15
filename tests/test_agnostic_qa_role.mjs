@@ -563,9 +563,10 @@ async function runAgnosticQASuite(label, mods) {
   check(`[${label}] D.8 Tarefa transicionou para completed no SQLite`, taskAfterApprove.status === "completed");
 
   /* ------------------------------------------------------------------ *
-   * Item E: Desvio de mensagem ao lead silenciado com CC para o QA     *
+   * Item E: HARNESS-22 — mensagem ao lead silenciado SEM CC para o QA  *
+   *         (o clone automático [CC Lead] foi extirpado)               *
    * ------------------------------------------------------------------ */
-  // Bob volta para idle para receber CC
+  // Bob volta para idle; NÃO deve ser acordado por CC.
   db.run("UPDATE team_member SET execution_status = 'idle' WHERE team_id = ? AND name = 'bob'", [TEAM]);
   calls.promptAsync.length = 0;
 
@@ -580,17 +581,13 @@ async function runAgnosticQASuite(label, mods) {
 
   check(`[${label}] E.1 Envio de mensagem ao Lead sob silentLead concluído`, typeof msgRes === "string");
 
-  // Verificar CC no SQLite (tabela team_message tem coluna to_name)
+  // Sem clone [CC Lead]: nenhuma cópia gravada para o QA.
   const ccMsg = db.query("SELECT * FROM team_message WHERE team_id = ? AND to_name = 'bob' ORDER BY time_created DESC LIMIT 1").get(TEAM);
-  check(`[${label}] E.2 Mensagem com prefixo [CC Lead] gravada para 'bob'`, ccMsg?.content?.includes("[CC Lead] Lead, finalizei minha parte"));
+  check(`[${label}] E.2 NENHUMA cópia [CC Lead] gravada para 'bob' (clone extirpado)`, ccMsg === undefined || ccMsg === null);
 
   const bobCCPrompts = calls.promptAsync.filter((c) => c.sessionID === bobRow.session_id);
-  check(`[${label}] E.3 'bob' recebeu auto-wake via CC do Lead`, bobCCPrompts.length === 1);
-  check(
-    `[${label}] E.4 Prompt de CC contém o texto da mensagem`,
-    bobCCPrompts[0]?.parts?.[0]?.text?.includes("[System: Message from alice to lead: Lead, finalizei minha parte da feature]"),
-    bobCCPrompts[0]?.parts?.[0]?.text,
-  );
+  check(`[${label}] E.3 'bob' NÃO recebeu auto-wake de CC`, bobCCPrompts.length === 0, `count=${bobCCPrompts.length}`);
+  check(`[${label}] E.4 Lead permanece em silêncio absoluto (nenhum promptAsync)`, !calls.promptAsync.some((c) => c.sessionID === LEAD_SESSION));
 
   // Anti-loop: Bob enviando mensagem ao lead NÃO gera CC para si mesmo
   calls.promptAsync.length = 0;

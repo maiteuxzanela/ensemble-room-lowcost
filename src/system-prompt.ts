@@ -199,6 +199,11 @@ export function buildTeammateSystemPrompt(db: Database, teamId: string, memberNa
     "ANTI-DUMPING & CODE EXPLORATION CONTRACT:",
     "Do NOT use bash grep, find, or broad shell scans across codebases.",
     "Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit on specific files. Never dump files >300 lines or raw command outputs into context.",
+    "",
+    "DELIVERY CONTRACT:",
+    "For partial or in-progress work, use team_tasks_complete(task_id, action: 'submit_review', notes: '...') as the SINGLE delivery channel.",
+    "Do NOT also send a redundant team_message(to: 'lead') for partial work — report to the lead only when the task is fully complete.",
+    "If a genuinely blocking decision requires the lead, escalate with decision_lead instead of a best-effort message.",
   ]
 
   // Deliver pending peer messages addressed to this teammate

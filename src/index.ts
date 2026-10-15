@@ -21,6 +21,9 @@ export { trackPrompt, abortInflight, endTracked } from "./v2-session"
 export { executeTeamTasksReview, executeTeamTasksReject } from "./tools/team-tasks-complete"
 export { executeTeamStandby, setMemberStandby } from "./tools/team-standby"
 export { executeTeamClaim, claimTask } from "./tools/team-claim"
+// HARNESS-22 — emergency lead-decision escalation + the pending-decision helpers
+// (mark/clear/has) the watchdog and message paths share.
+export { executeDecisionLead, markAwaitingLeadDecision, clearAwaitingLeadDecision, hasAwaitingLeadDecision } from "./tools/decision-lead"
 // Central QA-reviewer helpers (Migration 14) — exported so wake/CC/watchdog
 // consumers and deterministic test harnesses can resolve the reviewer without
 // hardcoding the string "clara". See src/qa-role.ts for the lookup contract.
@@ -53,6 +56,7 @@ import { executeTeamStandby } from "./tools/team-standby"
 import { executeTeamResults } from "./tools/team-results"
 import { executeTeamStatus } from "./tools/team-status"
 import { executeTeamView } from "./tools/team-view"
+import { executeDecisionLead } from "./tools/decision-lead"
 import type { ToolDeps, } from "./types"
 import { TokenBucket } from "./rate-limit"
 import { Watchdog } from "./watchdog"
@@ -549,7 +553,8 @@ const plugin: Plugin = async (input) => {
     // Register all team tools
     tool: {
       team_create: tool({
-        description: "Create a new agent team. You become the team lead. Use this before spawning teammates.",
+        description: "Create a new agent team. You become the team lead. Use this before spawning teammates. " +
+          "For engineering demands, convoke the canonical squad via team_spawn: Implementador, Hugo (deterministic tests) and Clara (Quality Gate).",
         args: {
           name: tool.schema.string().describe("Team name (lowercase alphanumeric with hyphens, 1-64 chars)"),
           project_name: tool.schema.string().optional().describe("Project display name for first use of this working directory. If omitted, a short random name is generated."),
@@ -564,7 +569,8 @@ const plugin: Plugin = async (input) => {
       team_spawn: tool({
         description: "Spawn a new teammate that works in parallel. The teammate starts immediately with the given prompt. " +
           "Each teammate gets their own git worktree for file isolation. " +
-          "Teammates work asynchronously and will message you when done. Do not poll for their status.",
+          "Teammates work asynchronously and will message you when done. Do not poll for their status. " +
+          "Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
         args: {
           name: tool.schema.string().describe("Teammate name (lowercase alphanumeric with hyphens)"),
           agent: tool.schema.string().default("build").describe("Agent type (e.g. 'build', 'plan', 'explore')"),
@@ -812,6 +818,23 @@ const plugin: Plugin = async (input) => {
         async execute(args, ctx) {
           const result = await executeTeamView(deps, args, ctx.sessionID)
           ctx.metadata({ title: `Viewing ${args.member}` })
+          return result
+        },
+      }),
+
+      decision_lead: tool({
+        description: "Escalate an emergency decision to the team lead and pause until they deliberate. " +
+          "Use this instead of a best-effort team_message to the lead when a ruling is genuinely blocking you: " +
+          "it wakes the lead directly (punching through silentLead), suspends you to standby, pauses the " +
+          "reviewer autoawake, and raises a high-priority toast.",
+        args: {
+          question: tool.schema.string().describe("The decision you need the lead to make (required)"),
+          context: tool.schema.string().describe("Full context the lead needs to make the decision (required)"),
+          options: tool.schema.array(tool.schema.string()).optional().describe("Optional candidate options for the lead to choose from"),
+        },
+        async execute(args, ctx) {
+          const result = await executeDecisionLead(deps, args, ctx.sessionID)
+          ctx.metadata({ title: `Decision requested from lead` })
           return result
         },
       }),

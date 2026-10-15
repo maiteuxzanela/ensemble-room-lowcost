@@ -398,6 +398,20 @@ export class Watchdog {
     const now = Date.now()
 
     for (const team of activeTeams) {
+      // HARNESS-22 — pending-lead-decision pause. When a member raised an
+      // emergency decision via the `decision_lead` tool (team.awaiting_lead_decision,
+      // Migration 15) the LEAD was already woken directly. Waking Clara on top of
+      // that would race the lead's deliberation and burn tokens, so the reviewer
+      // autoawake is PAUSED until the lead deliberates (a lead-authored
+      // team_message clears the flag — see clearAwaitingLeadDecision).
+      const decisionRow = this.db.query(
+        "SELECT awaiting_lead_decision FROM team WHERE id = ?"
+      ).get(team.id) as { awaiting_lead_decision: number } | null
+      if (decisionRow?.awaiting_lead_decision === 1) {
+        log(`watchdog:room-inactivity:paused team=${team.id} reason=awaiting-lead-decision`)
+        continue
+      }
+
       // Check unfinished tasks on the board
       const taskCountRow = this.db.query(
         "SELECT COUNT(*) as count FROM team_task WHERE team_id = ? AND status IN ('pending', 'in_progress', 'in_review', 'blocked')"

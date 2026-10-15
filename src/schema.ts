@@ -285,6 +285,16 @@ export const MIGRATIONS: string[] = [
   // fall back to the legacy base-persona/agent === 'clara' detection, so
   // existing databases and consumers keep working unchanged.
   `ALTER TABLE team_member ADD COLUMN is_qa INTEGER NOT NULL DEFAULT 0;`,
+  // Migration 15 (HARNESS-22): pending-lead-decision state on the team. A member
+  // raises an emergency decision via the `decision_lead` tool; the flag is set so
+  // the room-inactivity watchdog PAUSES Clara's autoawake until the lead
+  // deliberates (team_message from the lead clears it). Additive-only — the same
+  // non-negotiable as Migrations 9-11/14: no CHECK constraint, no table rebuild.
+  // `awaiting_decision_member` records WHO is waiting on the decision and
+  // `awaiting_decision_at` the raise timestamp, purely for observability.
+  `ALTER TABLE team ADD COLUMN awaiting_lead_decision INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE team ADD COLUMN awaiting_decision_member TEXT;
+   ALTER TABLE team ADD COLUMN awaiting_decision_at INTEGER;`,
 ]
 
 /**
