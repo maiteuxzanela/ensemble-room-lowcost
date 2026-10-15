@@ -2851,6 +2851,12 @@ ${options.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}` : "";
 ${context}${optionsBlock}`;
   markAwaitingLeadDecision(deps.db, teamInfo.teamId, memberName);
   setMemberStandby(deps.db, teamInfo.teamId, memberName, "awaiting lead decision");
+  sendMessage(deps.db, {
+    teamId: teamInfo.teamId,
+    from: memberName,
+    to: "lead",
+    content: payload
+  });
   const ctx = resolveLeadWakeContext(deps.db, teamInfo.teamId);
   if (ctx) {
     const chain = resolveFallbackChainForAgent(deps.config, ctx.leadAgent);
@@ -2886,9 +2892,6 @@ async function executeTeamMessage(deps, args, sessionId) {
     throw new Error("Only the lead can force-deliver a message to a completed teammate.");
   }
   const senderName = teamInfo.role === "lead" ? "lead" : teamInfo.memberName ?? "unknown";
-  if (teamInfo.role === "lead") {
-    clearAwaitingLeadDecision(deps.db, teamInfo.teamId);
-  }
   if (args.model !== void 0) {
     if (teamInfo.role !== "lead") throw new Error("Only the lead can update a teammate's model.");
     const parsed = parseModelId(args.model);
@@ -2923,6 +2926,9 @@ async function executeTeamMessage(deps, args, sessionId) {
       content: text
     });
     log(`team_message:queued from=${senderName} to=${args.to} (recipient not yet spawned)`);
+    if (teamInfo.role === "lead") {
+      clearAwaitingLeadDecision(deps.db, teamInfo.teamId);
+    }
     return `Message queued for ${args.to} \u2014 they haven't been spawned yet. It will be delivered when they join the team.`;
   }
   if (!recipientSessionId) throw new Error(`Recipient "${args.to}" not found in team "${teamInfo.teamName}"`);
@@ -2964,6 +2970,9 @@ async function executeTeamMessage(deps, args, sessionId) {
     to: args.to,
     content: messageText
   });
+  if (teamInfo.role === "lead") {
+    clearAwaitingLeadDecision(deps.db, teamInfo.teamId);
+  }
   const isToLead = args.to === "lead";
   if (isToLead) {
     if (deps.config?.silentLead) {

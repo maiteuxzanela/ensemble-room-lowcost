@@ -412,6 +412,11 @@ async function runBehavior(label, mods) {
     // A flag = 1 foi deixada pelo decision_lead acima. Ninguém busy; atividade antiga.
     db.run("UPDATE team_member SET time_updated = ? WHERE team_id = ?", [now - 120_000, TEAM]);
     db.run("UPDATE team_task SET time_updated = ? WHERE team_id = ?", [now - 120_000, TEAM]);
+    // HARNESS-22: decision_lead agora também persiste a pergunta em team_message
+    // (delivered=0). lastRoomActivity() inclui MAX(team_message.time_created), então
+    // essa linha nova precisa envelhecer junto das demais fontes — sem isso o
+    // watchdog enxergaria a sala como "ativa" e não retomaria o autoawake da Clara.
+    db.run("UPDATE team_message SET time_created = ? WHERE team_id = ?", [now - 120_000, TEAM]);
     db.run("UPDATE team_member SET execution_status = 'idle', status = 'ready' WHERE team_id = ? AND name = 'clara'", [TEAM]);
     db.run("UPDATE team_member SET last_nudged_at = NULL WHERE team_id = ? AND name = 'clara'", [TEAM]);
 
@@ -586,6 +591,122 @@ async function runBehavior(label, mods) {
       v2?.input.properties.options?.type === "array" && v2?.input.properties.options?.items?.type === "string",
     );
     check(`[${label}] 5.6 descrição V2 menciona silentLead`, v2?.description?.includes("silentLead") === true);
+  }
+
+  /* ================================================================ *
+   * 6. HARNESS-22 — clearAwaitingLeadDecision SÓ APÓS PERSISTÊNCIA    *
+   *    E PERSISTÊNCIA DURÁVEL DA PERGUNTA (team_message, delivered=0) *
+   * ================================================================ */
+  {
+    const tryErr = async (fn) => {
+      try {
+        await fn();
+        return null;
+      } catch (e) {
+        return e instanceof Error ? e.message : String(e);
+      }
+    };
+    const flagNow = () =>
+      db.query("SELECT awaiting_lead_decision FROM team WHERE id = ?").get(TEAM).awaiting_lead_decision;
+
+    /* --- B. decision_lead persiste a pergunta em team_message -------- */
+    const question = "Autorizas a publicação do bundle final?";
+    const contextText = "O Quality Gate ainda não emitiu veredito sobre o dist.";
+    calls.promptAsync.length = 0;
+    const leadMsgsBefore = db
+      .query("SELECT COUNT(*) AS c FROM team_message WHERE team_id = ? AND from_name = 'tulio' AND to_name = 'lead'")
+      .get(TEAM).c;
+    const retDL = await executeDecisionLead(deps, { question, context: contextText }, TULIO_SESSION);
+    check(
+      `[${label}] 6.1 decision_lead retorna confirmação de standby`,
+      typeof retDL === "string" && retDL.includes("Emergency decision requested from the lead"),
+      retDL,
+    );
+    const persisted = db
+      .query(
+        "SELECT from_name, to_name, content, delivered FROM team_message WHERE team_id = ? AND from_name = 'tulio' AND to_name = 'lead' ORDER BY time_created DESC, rowid DESC",
+      )
+      .all(TEAM);
+    check(
+      `[${label}] 6.2 decision_lead persistiu exatamente 1 linha nova em team_message`,
+      persisted.length === leadMsgsBefore + 1,
+      `antes=${leadMsgsBefore} depois=${persisted.length}`,
+    );
+    const row = persisted[0];
+    check(
+      `[${label}] 6.3 linha persistida com from='tulio' e to='lead'`,
+      !!row && row.from_name === "tulio" && row.to_name === "lead",
+      JSON.stringify({ from: row?.from_name, to: row?.to_name }),
+    );
+    check(
+      `[${label}] 6.4 corpo (content) contém a pergunta e o contexto`,
+      !!row && row.content.includes(question) && row.content.includes(contextText),
+      row?.content?.slice(0, 140),
+    );
+    check(`[${label}] 6.5 delivered=0 (entrega passiva ao lead)`, !!row && row.delivered === 0, `delivered=${row?.delivered}`);
+    check(`[${label}] 6.6 pré-condição para as negativas: awaiting_lead_decision=1`, flagNow() === 1, `flag=${flagNow()}`);
+
+    /* --- A. falha de validação no team_message do lead NÃO zera a flag */
+    const badModelErr = await tryErr(() =>
+      executeTeamMessage(deps, { to: "clara", text: "deliberação", model: "invalidmodel" }, LEAD_SESSION),
+    );
+    check(
+      `[${label}] 6.7 \`team_message\` do lead com model inválido lança exceção`,
+      typeof badModelErr === "string" && /Invalid model/.test(badModelErr),
+      String(badModelErr),
+    );
+    check(
+      `[${label}] 6.8 após model inválido, awaiting_lead_decision PERMANECE 1`,
+      flagNow() === 1,
+      `flag=${flagNow()}`,
+    );
+
+    const badRecipientErr = await tryErr(() =>
+      executeTeamMessage(deps, { to: "ghost", text: "para fantasma", model: "opencode/mimo-v2.6-flash-free" }, LEAD_SESSION),
+    );
+    check(
+      `[${label}] 6.9 \`team_message\` do lead para destinatário inexistente lança exceção`,
+      typeof badRecipientErr === "string" && /not found in team/.test(badRecipientErr),
+      String(badRecipientErr),
+    );
+    check(
+      `[${label}] 6.10 após destinatário inexistente, awaiting_lead_decision PERMANECE 1`,
+      flagNow() === 1,
+      `flag=${flagNow()}`,
+    );
+
+    const noPayloadErr = await tryErr(() => executeTeamMessage(deps, { to: "clara" }, LEAD_SESSION));
+    check(
+      `[${label}] 6.11 \`team_message\` do lead sem 'text' nem 'model' lança exceção`,
+      typeof noPayloadErr === "string" && /requires either 'text' or 'model'/.test(noPayloadErr),
+      String(noPayloadErr),
+    );
+    check(
+      `[${label}] 6.12 após payload vazio, awaiting_lead_decision PERMANECE 1`,
+      flagNow() === 1,
+      `flag=${flagNow()}`,
+    );
+
+    /* --- A. mensagem VÁLIDA e persistida do lead LIMPA a flag --------- */
+    calls.promptAsync.length = 0;
+    const validText = "Veredito: autorizado — siga com a publicação.";
+    const retValid = await executeTeamMessage(deps, { to: "clara", text: validText }, LEAD_SESSION);
+    check(`[${label}] 6.13 \`team_message\` válido do lead retorna sucesso`, retValid === "Message sent to clara.", String(retValid));
+    const validRow = db
+      .query(
+        "SELECT from_name, to_name, content, delivered FROM team_message WHERE team_id = ? AND from_name = 'lead' AND to_name = 'clara' ORDER BY time_created DESC, rowid DESC",
+      )
+      .get(TEAM);
+    check(
+      `[${label}] 6.14 deliberação do lead persistida (from='lead', to='clara')`,
+      !!validRow && validRow.from_name === "lead" && validRow.to_name === "clara" && validRow.content === validText,
+      JSON.stringify(validRow),
+    );
+    check(
+      `[${label}] 6.15 mensagem válida e persistida LIMPA awaiting_lead_decision (=0)`,
+      flagNow() === 0 && hasAwaitingLeadDecision(db, TEAM) === false,
+      `flag=${flagNow()}`,
+    );
   }
 
   db.close();

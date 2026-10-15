@@ -29,13 +29,6 @@ export async function executeTeamMessage(
 
   const senderName = teamInfo.role === "lead" ? "lead" : (teamInfo.memberName ?? "unknown")
 
-  // HARNESS-22: a lead-authored message IS the deliberation. Lifting the
-  // pending-decision flag here resumes the room-inactivity watchdog's normal
-  // Clara autoawake (paused while team.awaiting_lead_decision = 1).
-  if (teamInfo.role === "lead") {
-    clearAwaitingLeadDecision(deps.db, teamInfo.teamId)
-  }
-
   // In-place model update (lead only). Handled before recipient session
   // resolution so it works even when the member is idle/not in the registry,
   // and rejects terminal members explicitly. See #26.
@@ -82,6 +75,12 @@ export async function executeTeamMessage(
       content: text,
     })
     log(`team_message:queued from=${senderName} to=${args.to} (recipient not yet spawned)`)
+    // HARNESS-22: the message was durably queued, so a lead-authored send is a
+    // deliberation even against a not-yet-spawned recipient — lift the pause
+    // only now that persistence succeeded.
+    if (teamInfo.role === "lead") {
+      clearAwaitingLeadDecision(deps.db, teamInfo.teamId)
+    }
     return `Message queued for ${args.to} — they haven't been spawned yet. It will be delivered when they join the team.`
   }
   if (!recipientSessionId) throw new Error(`Recipient "${args.to}" not found in team "${teamInfo.teamName}"`)
@@ -132,6 +131,17 @@ export async function executeTeamMessage(
     to: args.to,
     content: messageText,
   })
+
+  // HARNESS-22: a lead-authored message IS the deliberation — it lifts the
+  // pending-decision flag so the room-inactivity watchdog resumes its normal
+  // Clara autoawake (paused while team.awaiting_lead_decision = 1). This must
+  // run ONLY after the message is durably persisted: if any validation above
+  // rejected the call (invalid model, unknown recipient, permission error,
+  // not-in-plan-approval), the flag must survive intact so the paused
+  // watchdog does not mistake a failed send for an actual deliberation.
+  if (teamInfo.role === "lead") {
+    clearAwaitingLeadDecision(deps.db, teamInfo.teamId)
+  }
 
   const isToLead = args.to === "lead"
 

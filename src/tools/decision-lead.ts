@@ -2,6 +2,7 @@ import type { Database } from "../db"
 import type { ToolDeps } from "../types"
 import { requireTeamMember } from "./shared"
 import { setMemberStandby } from "./team-standby"
+import { sendMessage } from "../messaging"
 import { resolveLeadWakeContext, promptModelAwareWake } from "../notify"
 import { formatModelSelector, resolveFallbackChainForAgent } from "../config"
 import { log } from "../log"
@@ -56,11 +57,14 @@ export function hasAwaitingLeadDecision(db: Database, teamId: string): boolean {
  * `silentLead: true`. The tool:
  *   1. marks the team as awaiting a lead decision (SQLite flag, Migration 15);
  *   2. transitions the emitting member to `execution_status = 'standby'`;
- *   3. wakes the lead DIRECTLY — punching through silentLead — on the lead's
+ *   3. durably persists the question to the lead in `team_message` (delivered=0)
+ *      BEFORE any wake, so a rate-limited/failed lead wake can never lose it —
+ *      the row is read passively on the lead's next turn;
+ *   4. wakes the lead DIRECTLY — punching through silentLead — on the lead's
  *      agent (`team.lead_agent`) and its resilient model chain
  *      (`resolveFallbackChainForAgent`, delivered via the shared model-aware
  *      wake ladder);
- *   4. fires a high-priority toast so the human lead sees the request.
+ *   5. fires a high-priority toast so the human lead sees the request.
  *
  * The decision pause is lifted when the lead replies (a lead-authored
  * `team_message` calls clearAwaitingLeadDecision).
@@ -105,7 +109,19 @@ export async function executeDecisionLead(
   //    lead's reply wakes it with a bare message, not a replayed birth prompt.
   setMemberStandby(deps.db, teamInfo.teamId, memberName, "awaiting lead decision")
 
-  // 3. Wake the lead, punching through silentLead, on the lead's agent and its
+  // 3. Durably persist the question in the message history BEFORE any wake is
+  //    attempted. If the lead's model chain is rate-limited or the wake itself
+  //    fails, the row survives with delivered = 0 and is read passively by the
+  //    lead on its next turn (system-prompt transform) — the emergency question
+  //    is never lost to a failed promptAsync.
+  sendMessage(deps.db, {
+    teamId: teamInfo.teamId,
+    from: memberName,
+    to: "lead",
+    content: payload,
+  })
+
+  // 4. Wake the lead, punching through silentLead, on the lead's agent and its
   //    resilient fallback chain (resolveFallbackChainForAgent). The shared
   //    model-aware wake builds the retry ladder from that chain.
   const ctx = resolveLeadWakeContext(deps.db, teamInfo.teamId)
@@ -124,7 +140,7 @@ export async function executeDecisionLead(
     log(`decision-lead:no-lead team=${teamInfo.teamId} member=${memberName} — decision recorded but lead could not be resolved`)
   }
 
-  // 4. High-priority surface for the human lead.
+  // 5. High-priority surface for the human lead.
   try {
     await deps.client.tui.showToast({
       title: "Decision required",
