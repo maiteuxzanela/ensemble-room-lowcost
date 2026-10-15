@@ -166,7 +166,7 @@ Em `loadConfig`, `DEFAULT → global → project` é aplicado com dois desvios d
 - `deniedTools`: união aditiva (listas de negação acumulam, deduplicadas);
 - `fallbackModelsByAgent`: **merge por chave de agente** — um `ensemble.json` de projeto parcial (ex.: só `"build"`) **não apaga** as cadeias globais irmãs (ex.: `"diana"`); só agentes redeclarados são sobrepostos.
 
-Cadeias dedicadas por persona ficam em `~/.config/opencode/ensemble.json` (globais), ex.: Diana em cadeia própria (`opencode-go/gemini-4-argon-contributor` → `opencode-go/gpt-6-luna` → `google/antigravity-gemini-3.8-flash#high`) e demais especialistas na cadeia econômica (`opencode/mimo-v2.6-flash-free` → `opencode-go/mimo-v2.6-flash` → `opencode-go/claude-haiku-5-5` → `google/antigravity-gemini-3.8-flash#low`).
+Cadeias dedicadas por persona ficam em `~/.config/opencode/ensemble.json` (globais), ex.: Diana em cadeia própria (`opencode-go/kimi-k2.7-code` → `google/antigravity-gemini-3.8-flash#high`), Orquestrador (Dante) em `google/antigravity-gemini-3.8-flash#medium` → `opencode-go/deepseek-v4.1-flash#max`, e demais especialistas com **default `opencode/mimo-v2.6-flash-free`** (`defaultModel`/`modelsByAgent`) na cadeia econômica (`opencode/mimo-v2.6-flash-free` → `opencode-go/deepseek-v4.1-flash#low` → `opencode-go/mimo-v2.6-flash` → `google/antigravity-gemini-3.8-flash#low`).
 
 ### 5.3 Três seams de failover: membro × isolado × lead
 

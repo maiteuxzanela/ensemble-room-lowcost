@@ -305,26 +305,19 @@ export async function executeTeamTasksComplete(
       .get(teamInfo.teamId) as { lead_session_id?: string | null } | null
     const leadSessionId = leadRow?.lead_session_id
     if (leadSessionId) {
-      // F1 / HARNESS-15 B: under silentLead:true this is the ONLY wake that
-      // reaches the lead — a modelless promptAsync rides the session's
-      // primary (the rate-limited gemini) and board closure was stranded at
-      // delivered=0. Model-aware via the shared ladder: explicit agent from
-      // team.lead_agent + resolveFallbackChainForAgent(config, leadAgent)
-      // with step-down on rejection (same logic as notifyLead).
-      const agentRow = deps.db.query("SELECT lead_agent FROM team WHERE id = ?")
-        .get(teamInfo.teamId) as { lead_agent?: string | null } | null
+      // Board closure wake: neutral notification to lead session.
+      // Deliberately modelless and agentless: preserving lead sovereignty.
+      // Subagents must never dictate which model or agent the lead session runs.
       try {
-        promptModelAwareWake(deps.client, {
+        deps.client.session.promptAsync({
           sessionID: leadSessionId,
-          text: `[System: All team tasks completed on board by ${who}]`,
-          logTag: `tasks-complete:wake-lead team=${teamInfo.teamId}`,
-          agent: agentRow?.lead_agent || undefined,
-          config: deps.config,
+          parts: [{ type: "text", text: `[System: All team tasks completed on board by ${who}]` }],
+          synthetic: true,
+        }).catch((err) => {
+          log(`tasks-complete:wake-lead:failed team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`)
         })
         log(`tasks-complete:wake-lead:sent leadSession=${leadSessionId} by=${who}`)
       } catch (err) {
-        // Fail-safe: a synchronous ladder/parse defect must never fail the
-        // board-complete tool call itself — log and continue.
         log(`tasks-complete:wake-lead:failed team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`)
       }
     }

@@ -3251,14 +3251,13 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
     const leadRow = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?").get(teamInfo.teamId);
     const leadSessionId = leadRow?.lead_session_id;
     if (leadSessionId) {
-      const agentRow = deps.db.query("SELECT lead_agent FROM team WHERE id = ?").get(teamInfo.teamId);
       try {
-        promptModelAwareWake(deps.client, {
+        deps.client.session.promptAsync({
           sessionID: leadSessionId,
-          text: `[System: All team tasks completed on board by ${who}]`,
-          logTag: `tasks-complete:wake-lead team=${teamInfo.teamId}`,
-          agent: agentRow?.lead_agent || void 0,
-          config: deps.config
+          parts: [{ type: "text", text: `[System: All team tasks completed on board by ${who}]` }],
+          synthetic: true
+        }).catch((err) => {
+          log(`tasks-complete:wake-lead:failed team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`);
         });
         log(`tasks-complete:wake-lead:sent leadSession=${leadSessionId} by=${who}`);
       } catch (err) {
@@ -4121,7 +4120,13 @@ async function registerV2Tools(domain, deps) {
           claim_task: str("Task ID to auto-claim for this teammate (optional)"),
           worktree: bool("Create a git worktree for file isolation (default: true, set false for read-only agents)", true),
           plan_approval: bool("Require teammate to send a plan for approval before writing files (default: false)", false),
-          standby: bool("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)", false)
+          standby: bool("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)", false),
+          role: {
+            type: "string",
+            description: "Teammate role: 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)",
+            enum: ["qa", "member"]
+          },
+          is_qa: bool("Explicitly flag this teammate as the Quality Gate reviewer (stored in team_member.is_qa). Omitted = auto-detect (agent 'clara' or base persona 'clara' \u2192 QA)", false)
         },
         required: ["name", "prompt"],
         additionalProperties: false
@@ -6572,6 +6577,9 @@ function isSessionCompacting(sessionId, env = process.env) {
     }
   }
 }
+function resolveWatchdogNudgeAgent(row) {
+  return row.lead_session_id === row.session_id && row.lead_agent ? row.lead_agent : row.agent;
+}
 var Watchdog = class _Watchdog {
   db;
   client;
@@ -6647,7 +6655,7 @@ var Watchdog = class _Watchdog {
   async checkStalled() {
     if (!this.progressTracker || this.stallThresholdMs === 0) return;
     const busy = this.db.query(
-      `SELECT tm.team_id, tm.name, tm.session_id
+      `SELECT tm.team_id, tm.name, tm.session_id, tm.agent, t.lead_agent, t.lead_session_id
        FROM team_member tm
        JOIN team t ON tm.team_id = t.id
        WHERE t.status = 'active' AND tm.status = 'busy'`
@@ -6678,9 +6686,11 @@ var Watchdog = class _Watchdog {
         [Date.now(), member.team_id, member.name]
       );
       const stallModel = getMemberModel(this.db, member.team_id, member.name);
+      const stallAgent = resolveWatchdogNudgeAgent(member);
       this.client.session.promptAsync({
         sessionID: member.session_id,
         parts: [{ type: "text", text: "[System]: You appear stalled \u2014 no progress detected. Report your current status to the lead via team_message, or wrap up your work." }],
+        agent: stallAgent,
         ...stallModel ? { model: stallModel } : {}
       }).then(() => {
         this.progressTracker.markReported(member.session_id);
@@ -6706,7 +6716,7 @@ var Watchdog = class _Watchdog {
   async checkChatty() {
     if (!this.progressTracker || this.peerMessageLimit === 0) return;
     const busy = this.db.query(
-      `SELECT tm.team_id, tm.name, tm.session_id
+      `SELECT tm.team_id, tm.name, tm.session_id, tm.agent, t.lead_agent, t.lead_session_id
        FROM team_member tm
        JOIN team t ON tm.team_id = t.id
        WHERE t.status = 'active' AND tm.status = 'busy'`
@@ -6720,9 +6730,11 @@ var Watchdog = class _Watchdog {
       }
       this.progressTracker.markChattyReported(member.session_id);
       const chattyModel = getMemberModel(this.db, member.team_id, member.name);
+      const chattyAgent = resolveWatchdogNudgeAgent(member);
       this.client.session.promptAsync({
         sessionID: member.session_id,
         parts: [{ type: "text", text: "[System]: You've sent several messages to teammates. Focus on completing your task and send your results to the lead via team_message." }],
+        agent: chattyAgent,
         ...chattyModel ? { model: chattyModel } : {}
       }).catch((err) => {
         log(`watchdog:chatty:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`);
@@ -7034,9 +7046,16 @@ var plugin = async (input) => {
               inReviewNudges.set(reviewNudgeKey, currentCount + 1);
               log(`nudge:in-review-tasks name=${transition.memberName} task=${reviewTaskId} attempt=${currentCount + 1}`);
               const nudgeModel = getMemberModel(db, transition.teamId, transition.memberName);
+              const nudgeTarget = db.query(
+                `SELECT tm.agent AS agent, t.lead_session_id AS lead_session_id, t.lead_agent AS lead_agent
+                 FROM team_member tm JOIN team t ON tm.team_id = t.id
+                 WHERE tm.team_id = ? AND tm.name = ?`
+              ).get(transition.teamId, transition.memberName);
+              const nudgeAgent = nudgeTarget ? sessionID === nudgeTarget.lead_session_id ? nudgeTarget.lead_agent : nudgeTarget.agent : null;
               client.session.promptAsync({
                 sessionID,
                 parts: [{ type: "text", text: IN_REVIEW_NUDGE_MESSAGE }],
+                ...nudgeAgent ? { agent: nudgeAgent } : {},
                 ...nudgeModel ? { model: nudgeModel } : {},
                 synthetic: true
               }).catch((err) => {
@@ -7138,7 +7157,8 @@ var plugin = async (input) => {
             }
           }
           const member = db.query(
-            `SELECT tm.team_id, tm.name FROM team_member tm
+            `SELECT tm.team_id, tm.name, tm.agent AS member_agent, t.lead_session_id AS lead_session_id, t.lead_agent AS lead_agent
+             FROM team_member tm
              JOIN team t ON tm.team_id = t.id
              WHERE tm.session_id = ? AND t.status = 'active'`
           ).get(sessionID);
@@ -7150,9 +7170,11 @@ var plugin = async (input) => {
             if (peerMsgs.c > 0) {
               log(`wake-peer: ${member.name} has ${peerMsgs.c} pending peer messages`);
               const peerModel = getMemberModel(db, member.team_id, member.name);
+              const peerAgent = sessionID === member.lead_session_id ? member.lead_agent : member.member_agent;
               client.session.promptAsync({
                 sessionID,
                 parts: [{ type: "text", text: `[System: ${peerMsgs.c} new message(s) from teammates]` }],
+                ...peerAgent ? { agent: peerAgent } : {},
                 ...peerModel ? { model: peerModel } : {}
               }).catch((err) => {
                 log(`wake-peer:failed err=${err instanceof Error ? err.message : String(err)}`);

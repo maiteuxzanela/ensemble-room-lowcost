@@ -124,6 +124,40 @@ export function isSessionCompacting(sessionId: string, env: Record<string, strin
 }
 
 /**
+ * Row shape produced by the busy-member scans in checkStalled/checkChatty —
+ * the identity columns every nudge needs to address `promptAsync` with an
+ * explicit `agent` (HARNESS-17).
+ */
+interface NudgeTargetRow {
+  session_id: string
+  /** `team_member.agent` — TEXT NOT NULL, the member's own persona type. */
+  agent: string
+  /** `team.lead_agent` (Migration 5) — NULL on legacy teams. */
+  lead_agent: string | null
+  /** `team.lead_session_id` — to detect a busy row that IS the lead session. */
+  lead_session_id: string
+}
+
+/**
+ * Resolve the explicit `agent` for a watchdog nudge targeted at a busy member
+ * (HARNESS-17).
+ *
+ * `session.promptAsync` WITHOUT `agent` makes the OpenCode server assume the
+ * default agent of the installation (usually `dante`) and OVERWRITE the
+ * `agent` column of the `session` table — the nudged member would lose its own
+ * persona and its exclusive tool permissions (same mechanism as HARNESS-12(b),
+ * already fixed on the failover/wake paths).
+ *
+ * Rule: the member's own `team_member.agent` wins; when the busy row's session
+ * IS the team's lead session (`team.lead_session_id`), the lead's identity
+ * (`team.lead_agent`) wins instead. Legacy teams with `lead_agent = NULL`
+ * keep the member's agent — `agent` is NEVER omitted from the payload.
+ */
+function resolveWatchdogNudgeAgent(row: NudgeTargetRow): string {
+  return row.lead_session_id === row.session_id && row.lead_agent ? row.lead_agent : row.agent
+}
+
+/**
  * Periodic watchdog that times out teammates stuck in busy state.
  * Transitions them to error/timed_out, aborts their session, and fires a toast.
  */
@@ -207,12 +241,15 @@ export class Watchdog {
   async checkStalled(): Promise<void> {
     if (!this.progressTracker || this.stallThresholdMs === 0) return
 
+    // Identity columns ride along the scan so the nudge below can address
+    // promptAsync with an explicit `agent` (HARNESS-17) — see
+    // resolveWatchdogNudgeAgent.
     const busy = this.db.query(
-      `SELECT tm.team_id, tm.name, tm.session_id
+      `SELECT tm.team_id, tm.name, tm.session_id, tm.agent, t.lead_agent, t.lead_session_id
        FROM team_member tm
        JOIN team t ON tm.team_id = t.id
        WHERE t.status = 'active' AND tm.status = 'busy'`
-    ).all() as Array<{ team_id: string; name: string; session_id: string }>
+    ).all() as Array<{ team_id: string; name: string; session_id: string; agent: string; lead_agent: string | null; lead_session_id: string }>
 
     for (const member of busy) {
       if (this.progressTracker.isReported(member.session_id)) continue
@@ -268,9 +305,14 @@ export class Watchdog {
       // orphan the stall state if promptAsync throws (aborted session, invalid ID),
       // since ProgressTracker.reported is in-memory and only cleared by new activity.
       const stallModel = getMemberModel(this.db, member.team_id, member.name)
+      // HARNESS-17: `agent` is NEVER omitted — without it the server assumes
+      // the default agent (dante) and overwrites session.agent, stripping the
+      // member's persona and tool permissions (HARNESS-12(b) mechanism).
+      const stallAgent = resolveWatchdogNudgeAgent(member)
       this.client.session.promptAsync({
         sessionID: member.session_id,
         parts: [{ type: "text", text: "[System]: You appear stalled — no progress detected. Report your current status to the lead via team_message, or wrap up your work." }],
+        agent: stallAgent,
         ...(stallModel ? { model: stallModel } : {}),
       }).then(() => {
         this.progressTracker!.markReported(member.session_id)
@@ -300,12 +342,14 @@ export class Watchdog {
   async checkChatty(): Promise<void> {
     if (!this.progressTracker || this.peerMessageLimit === 0) return
 
+    // Identity columns for the explicit-`agent` nudge below (HARNESS-17) —
+    // same resolution rule as checkStalled.
     const busy = this.db.query(
-      `SELECT tm.team_id, tm.name, tm.session_id
+      `SELECT tm.team_id, tm.name, tm.session_id, tm.agent, t.lead_agent, t.lead_session_id
        FROM team_member tm
        JOIN team t ON tm.team_id = t.id
        WHERE t.status = 'active' AND tm.status = 'busy'`
-    ).all() as Array<{ team_id: string; name: string; session_id: string }>
+    ).all() as Array<{ team_id: string; name: string; session_id: string; agent: string; lead_agent: string | null; lead_session_id: string }>
 
     for (const member of busy) {
       if (this.progressTracker.isChattyReported(member.session_id)) continue
@@ -321,9 +365,13 @@ export class Watchdog {
 
       // Nudge the agent
       const chattyModel = getMemberModel(this.db, member.team_id, member.name)
+      // HARNESS-17: explicit `agent` — never omitted (persona sequester
+      // defence, see resolveWatchdogNudgeAgent / checkStalled above).
+      const chattyAgent = resolveWatchdogNudgeAgent(member)
       this.client.session.promptAsync({
         sessionID: member.session_id,
         parts: [{ type: "text", text: "[System]: You've sent several messages to teammates. Focus on completing your task and send your results to the lead via team_message." }],
+        agent: chattyAgent,
         ...(chattyModel ? { model: chattyModel } : {}),
       }).catch((err) => {
         log(`watchdog:chatty:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`)

@@ -259,9 +259,24 @@ const plugin: Plugin = async (input) => {
               inReviewNudges.set(reviewNudgeKey, currentCount + 1)
               log(`nudge:in-review-tasks name=${transition.memberName} task=${reviewTaskId} attempt=${currentCount + 1}`)
               const nudgeModel = getMemberModel(db, transition.teamId, transition.memberName)
+              // HARNESS-17 (Diana dívida #2): agent EXPLÍCITO do membro-alvo.
+              // Omitir `agent` faz o servidor OpenCode assumir o agente default
+              // ("dante") e SOBRESCREVER session.agent — sequestro da persona e
+              // perda das permissões de ferramentas exclusivas. Fonte: coluna
+              // team_member.agent; se a sessão alvo for a do lead vale
+              // team.lead_agent. Nunca omitir o campo.
+              const nudgeTarget = db.query(
+                `SELECT tm.agent AS agent, t.lead_session_id AS lead_session_id, t.lead_agent AS lead_agent
+                 FROM team_member tm JOIN team t ON tm.team_id = t.id
+                 WHERE tm.team_id = ? AND tm.name = ?`
+              ).get(transition.teamId, transition.memberName) as { agent: string | null; lead_session_id: string | null; lead_agent: string | null } | null
+              const nudgeAgent = nudgeTarget
+                ? (sessionID === nudgeTarget.lead_session_id ? nudgeTarget.lead_agent : nudgeTarget.agent)
+                : null
               client.session.promptAsync({
                 sessionID,
                 parts: [{ type: "text", text: IN_REVIEW_NUDGE_MESSAGE }],
+                ...(nudgeAgent ? { agent: nudgeAgent } : {}),
                 ...(nudgeModel ? { model: nudgeModel } : {}),
                 synthetic: true,
               }).catch((err) => {
@@ -400,10 +415,11 @@ const plugin: Plugin = async (input) => {
           // Also flush peer messages for teammates that just went idle
           // Only flush messages older than 5s to avoid double-delivery with the direct promptAsync path
           const member = db.query(
-            `SELECT tm.team_id, tm.name FROM team_member tm
+            `SELECT tm.team_id, tm.name, tm.agent AS member_agent, t.lead_session_id AS lead_session_id, t.lead_agent AS lead_agent
+             FROM team_member tm
              JOIN team t ON tm.team_id = t.id
              WHERE tm.session_id = ? AND t.status = 'active'`
-          ).get(sessionID) as { team_id: string; name: string } | null
+          ).get(sessionID) as { team_id: string; name: string; member_agent: string | null; lead_session_id: string | null; lead_agent: string | null } | null
           if (member && !hasReportedCompletion(db, member.team_id, member.name)) {
             const staleThreshold = Date.now() - 5000
             const peerMsgs = db.query(
@@ -412,9 +428,15 @@ const plugin: Plugin = async (input) => {
             if (peerMsgs.c > 0) {
               log(`wake-peer: ${member.name} has ${peerMsgs.c} pending peer messages`)
               const peerModel = getMemberModel(db, member.team_id, member.name)
+              // HARNESS-17 (Diana dívida #2): agent EXPLÍCITO — omitir `agent`
+              // faz o servidor OpenCode assumir o default ("dante") e
+              // SOBRESCREVER session.agent, sequestrando a persona do membro.
+              // Fonte: team_member.agent; sessão do lead → team.lead_agent.
+              const peerAgent = sessionID === member.lead_session_id ? member.lead_agent : member.member_agent
               client.session.promptAsync({
                 sessionID,
                 parts: [{ type: "text", text: `[System: ${peerMsgs.c} new message(s) from teammates]` }],
+                ...(peerAgent ? { agent: peerAgent } : {}),
                 ...(peerModel ? { model: peerModel } : {}),
               }).catch((err) => {
                 log(`wake-peer:failed err=${err instanceof Error ? err.message : String(err)}`)

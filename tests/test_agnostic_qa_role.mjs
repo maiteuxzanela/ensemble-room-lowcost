@@ -16,6 +16,9 @@
  *   f) Watchdog de ociosidade acordando o QA agnóstico após 30s de inatividade com tarefas inacabadas;
  *   g) Retrocompatibilidade: garantir que se o membro for nomeado 'clara' sem flag role/is_qa explícita,
  *      continue funcionando 100% como QA por auto-detecção.
+ *   h) Paridade de schema V1⇄V2: o registro V2 de team_spawn (src/v2-tools.ts e dist) declara
+ *      as propriedades `role` (enum ["qa","member"]) e `is_qa` (boolean) já presentes no V1,
+ *      preservando additionalProperties:false e required — anti-regressão do TICKET-HARNESS-11.
  *
  * Uso:  node tests/test_agnostic_qa_role.mjs
  * Exit: 0 = todos os checks PASS; 1 = há FAIL.
@@ -71,6 +74,7 @@ const REQUIRED_SYMBOLS = [
   "executeTeamTasksComplete",
   "isQAMember",
   "getTeamQAMember",
+  "registerV2Tools",
 ];
 
 const distRaw = readFileSync(DIST, "utf8");
@@ -131,6 +135,118 @@ check("0.3 cópia do src preparada para testes", prepareSrcCopy() > 0);
     if (rx.test(distRaw)) violations++;
   }
   check("0.4 zero primitivas de mock no bundle de produção", violations === 0);
+}
+
+/* ================================================================== *
+ * 0.5 PARIDADE DE SCHEMA V1 ⇄ V2 — team_spawn: role / is_qa          *
+ * (anti-regressão do TICKET-HARNESS-11: o V2 rejeitava role/is_qa     *
+ *  porque additionalProperties:false sem declarar as propriedades)    *
+ * ================================================================== */
+
+/** Valida um argumento contra um JSON Schema como faria o OpenCode Core:
+ *  type + enum + additionalProperties:false. Retorna null quando aceito. */
+function validateLikeCore(schema, value) {
+  if (!schema || typeof schema !== "object") return "schema ausente";
+  if (schema.type === "object" && (value === null || typeof value !== "object" || Array.isArray(value))) {
+    return "argumento não é object";
+  }
+  const props = schema.properties ?? {};
+  if (schema.additionalProperties === false) {
+    const extra = Object.keys(value).filter((k) => !(k in props));
+    if (extra.length) return `propriedade(s) desconhecida(s): ${extra.join(",")}`;
+  }
+  for (const [key, raw] of Object.entries(value)) {
+    const p = props[key];
+    if (!p) continue;
+    if (p.type === "string" && typeof raw !== "string") return `${key}: esperado string`;
+    if (p.type === "boolean" && typeof raw !== "boolean") return `${key}: esperado boolean`;
+    if (Array.isArray(p.enum) && !p.enum.includes(raw)) return `${key}: "${raw}" fora do enum [${p.enum.join(",")}]`;
+  }
+  return null;
+}
+
+/** Captura o schema realmente registrado por registerV2Tools (V2). */
+async function captureV2TeamSpawn(registerV2Tools) {
+  const captured = [];
+  const domain = {
+    transform: async (cb) => {
+      cb({ add: (def) => captured.push(def) });
+      return { dispose: async () => {} };
+    },
+  };
+  // deps não é dereferenciado durante o registro (apenas fechado em execute);
+  // nenhum comportamento é asserido a partir dele aqui.
+  await registerV2Tools(domain, {});
+  return captured.find((d) => d?.name === "team_spawn");
+}
+
+const v2SrcRaw = readFileSync(path.join(SRC, "v2-tools.ts"), "utf8");
+const v2Start = v2SrcRaw.indexOf('name: "team_spawn"');
+const v2End = v2SrcRaw.indexOf('name: "team_message"', v2Start);
+const v2Block = v2Start >= 0 && v2End > v2Start ? v2SrcRaw.slice(v2Start, v2End) : "";
+{
+  check("0.5.1 src/v2-tools.ts declara a propriedade 'role' no schema de team_spawn", /\n\s{10}role:\s*\{/.test(v2Block));
+  check("0.5.2 'role' usa enum [\"qa\", \"member\"] (paridade com o enum V1)", /enum:\s*\[\s*"qa"\s*,\s*"member"\s*\]/.test(v2Block));
+  check("0.5.3 src/v2-tools.ts declara a propriedade 'is_qa' booleana via helper bool(...)", /\n\s{10}is_qa:\s*bool\(/.test(v2Block));
+  check(
+    "0.5.4 required [name,prompt] e additionalProperties:false preservados no team_spawn V2",
+    /required:\s*\[\s*"name"\s*,\s*"prompt"\s*\]/.test(v2Block) && /additionalProperties:\s*false/.test(v2Block),
+  );
+}
+
+/* Referência V1 (src/index.ts) — paridade semântica exigida */
+const v1SrcRaw = readFileSync(path.join(SRC, "index.ts"), "utf8");
+const v1Start = v1SrcRaw.indexOf("team_spawn: tool({");
+const v1End = v1SrcRaw.indexOf("team_message: tool({", v1Start);
+const v1Block = v1Start >= 0 && v1End > v1Start ? v1SrcRaw.slice(v1Start, v1End) : "";
+{
+  check(
+    "0.5.5 V1 (src/index.ts) declara role: enum [\"qa\", \"member\"] no team_spawn",
+    /role:\s*tool\.schema\.enum\(\s*\[\s*"qa"\s*,\s*"member"\s*\]/.test(v1Block),
+  );
+  check("0.5.6 V1 (src/index.ts) declara is_qa: tool.schema.boolean() no team_spawn", /is_qa:\s*tool\.schema\.boolean\(\)/.test(v1Block));
+}
+
+/* Registro real no runtime V2 (dist) + validador estilo OpenCode Core */
+let spawnDist = null;
+{
+  const { registerV2Tools } = await import(HARNESS);
+  spawnDist = await captureV2TeamSpawn(registerV2Tools);
+  check("0.6.1 registerV2Tools (dist) registra a tool team_spawn no V2", Boolean(spawnDist));
+  const props = spawnDist?.input?.properties ?? {};
+  check(
+    "0.6.2 schema V2 registrado expõe properties.role com type=string e enum [qa, member]",
+    props.role?.type === "string" && JSON.stringify(props.role?.enum) === JSON.stringify(["qa", "member"]),
+    `role=${JSON.stringify(props.role)}`,
+  );
+  check("0.6.3 schema V2 registrado expõe properties.is_qa com type=boolean", props.is_qa?.type === "boolean", `is_qa=${JSON.stringify(props.is_qa)}`);
+  check(
+    "0.6.4 registro V2 preserva additionalProperties=false e required=[name,prompt]",
+    spawnDist?.input?.additionalProperties === false && JSON.stringify(spawnDist?.input?.required) === JSON.stringify(["name", "prompt"]),
+    `required=${JSON.stringify(spawnDist?.input?.required)} addProps=${String(spawnDist?.input?.additionalProperties)}`,
+  );
+  check(
+    "0.6.5 invocação V2 com role:'qa' + is_qa:true é ACEITA pelo validador (bug do TICKET-HARNESS-11 corrigido)",
+    validateLikeCore(spawnDist?.input, { name: "bob", prompt: "QA", role: "qa", is_qa: true }) === null,
+    validateLikeCore(spawnDist?.input, { name: "bob", prompt: "QA", role: "qa", is_qa: true }) ?? "aceito",
+  );
+  check(
+    "0.6.6 role inválido ('auditor') segue REJEITADO pelo enum do schema",
+    validateLikeCore(spawnDist?.input, { name: "bob", prompt: "QA", role: "auditor" }) !== null,
+    String(validateLikeCore(spawnDist?.input, { name: "bob", prompt: "QA", role: "auditor" })),
+  );
+}
+
+/* Paridade dist ⇄ src: o mesmo schema em src/v2-tools.ts compilado */
+{
+  const srcModule = await import(`${SRC_COPY}/v2-tools.ts`);
+  const spawnSrc = await captureV2TeamSpawn(srcModule.registerV2Tools);
+  check("0.7.1 src/v2-tools.ts registra team_spawn no V2 (registro idêntico ao dist)", Boolean(spawnSrc));
+  check(
+    "0.7.2 schema de team_spawn em src e dist são byte-a-byte equivalentes (JSON)",
+    JSON.stringify(spawnSrc?.input) === JSON.stringify(spawnDist?.input),
+    `srcLen=${JSON.stringify(spawnSrc?.input).length} distLen=${JSON.stringify(spawnDist?.input).length}`,
+  );
 }
 
 /* ================================================================== *

@@ -111,6 +111,12 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
           worktree: bool("Create a git worktree for file isolation (default: true, set false for read-only agents)", true),
           plan_approval: bool("Require teammate to send a plan for approval before writing files (default: false)", false),
           standby: bool("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)", false),
+          role: {
+            type: "string",
+            description: "Teammate role: 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)",
+            enum: ["qa", "member"],
+          },
+          is_qa: bool("Explicitly flag this teammate as the Quality Gate reviewer (stored in team_member.is_qa). Omitted = auto-detect (agent 'clara' or base persona 'clara' → QA)", false),
         },
         required: ["name", "prompt"],
         additionalProperties: false,

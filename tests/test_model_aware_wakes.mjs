@@ -180,14 +180,13 @@ function marker(label, needle, { src = true, dist = true } = {}) {
 // aparecer em qualquer um deles (evita falsos negativos por arquivo).
 const srcAll = () => [srcComplete, srcWatchdog, srcSpawn, srcNotify].join("\n");
 
-/* --- F1: wake 'board-complete' model-aware --- */
+/* --- F1: wake 'board-complete' soberano (modelless e agentless) --- */
 {
-  // O wake do board chama o helper compartilhado com agent do lead + config
-  // na MESMA call (proximidade ~400 chars impede marcadores espalhados).
-  const f1Wake = /promptModelAwareWake\(deps\.client,[\s\S]{0,400}agent: agentRow\?\.lead_agent[\s\S]{0,200}config: deps\.config/;
-  check("paridade F1 (src): wake do board passa agentRow.lead_agent + deps.config", f1Wake.test(srcComplete), srcComplete.match(f1Wake)?.[0]?.slice(0, 120) ?? "ausente");
-  check("paridade F1 (dist): wake do board passa agentRow.lead_agent + deps.config", f1Wake.test(distRaw), distRaw.match(f1Wake)?.[0]?.slice(0, 120) ?? "ausente");
-  marker("F1: SELECT lead_agent FROM team WHERE id = ?", "SELECT lead_agent FROM team WHERE id = ?");
+  // O wake do board dispara promptAsync neutro direto para a sessão do lead,
+  // sem forçar model ou agent (preserva o modelo soberano da sessão do Dante).
+  const f1Wake = /deps\.client\.session\.promptAsync\(\{[\s\S]{0,150}sessionID: leadSessionId,[\s\S]{0,150}synthetic: true/;
+  check("paridade F1 (src): wake do board dispara promptAsync neutro para leadSessionId", f1Wake.test(srcComplete), srcComplete.match(f1Wake)?.[0]?.slice(0, 120) ?? "ausente");
+  check("paridade F1 (dist): wake do board dispara promptAsync neutro para leadSessionId", f1Wake.test(distRaw), distRaw.match(f1Wake)?.[0]?.slice(0, 120) ?? "ausente");
   marker("F1: guard do fechamento de board (total > 0 && completed === total)", /total\d* > 0 && completed === total\d*/);
   marker("F1: texto sintético do wake do board", "[System: All team tasks completed on board by ${who}]");
 
@@ -372,8 +371,7 @@ async function runBehavior(label, mods) {
   const expectWake = (who) => `[System: All team tasks completed on board by ${who}]`;
 
   /* ================================================================ *
-   * A) [F1] Wake 'board-complete' model-aware — agent + model +       *
-   *     step-down; e contraste legado (sem config → modelless).       *
+   * A) [F1] Wake 'board-complete' soberano (modelless e agentless)     *
    * ================================================================ */
   const A = scenario("f1_board");
   {
@@ -402,111 +400,20 @@ async function runBehavior(label, mods) {
     const wakes = A.leadWakes(LEAD, base);
     check(`[${label}] A2 board fechado (2/2): wake do lead EXATAMENTE 1x`, wakes.length === 1, `delta=${wakes.length}`);
     const w = wakes[0];
-    check(`[${label}] A3 wake carrega agent 'dante' EXPLÍCITO (team.lead_agent)`, w?.agent === "dante", String(w?.agent));
-    check(
-      `[${label}] A4 wake carrega model da cadeia por-agente (prov/dante-1#low)`,
-      eq(w?.model, DANTE1),
-      JSON.stringify(w?.model),
-    );
+    check(`[${label}] A3 wake soberano: sem chave 'model' (modelless)`, w !== undefined && !("model" in w), w ? Object.keys(w).join(",") : "sem wake");
+    check(`[${label}] A4 wake soberano: sem chave 'agent' (agentless)`, w !== undefined && !("agent" in w), w ? Object.keys(w).join(",") : "sem wake");
     check(
       `[${label}] A5 wake é synthetic:true com texto exato do board`,
       w?.synthetic === true && w?.parts?.[0]?.text === expectWake(M1),
       JSON.stringify(w?.parts?.[0]?.text),
     );
-    check(`[${label}] A6 prova NÃO-modelless: chave 'model' presente`, w !== undefined && "model" in w, w ? Object.keys(w).join(",") : "sem wake");
     check(
-      `[${label}] A7 toast de progresso do board dispara "2/2 tasks complete"`,
+      `[${label}] A6 toast de progresso do board dispara "2/2 tasks complete"`,
       A.calls.toast.some((t) => String(t.message).includes("2/2 tasks complete")),
       JSON.stringify(A.calls.toast.map((t) => t.message)),
     );
   }
   A.close();
-
-  /* --- A-B: STEP-DOWN — 1º degrau rejeitado → 2º degrau entregue --- */
-  {
-    const f = scenario("f1_stepdown");
-    const LEAD = "ses_f1b_lead";
-    const MB = "f1b-member";
-    const MS = "ses_f1b_member";
-    seedTeam(f.db, "team_f1b", LEAD, "dante");
-    seedMember(f.db, "team_f1b", MB, MS);
-    f.registry.register("team_f1b", MB, MS);
-    seedTask(f.db, "t_f1b_1", "team_f1b", "pending", MB);
-    seedTask(f.db, "t_f1b_2", "team_f1b", "pending", MB);
-
-    await executeTeamTasksComplete(f.deps(CFG), { task_id: "t_f1b_1" }, MS);
-    f.failOnce.add(LEAD); // 1ª tentativa do wake rejeita; step-down entrega a 2ª
-    const base = f.calls.promptAsync.length;
-    await executeTeamTasksComplete(f.deps(CFG), { task_id: "t_f1b_2" }, MS);
-    await tick();
-    const wakes = f.leadWakes(LEAD, base);
-    check(
-      `[${label}] A8 step-down: 2 tentativas ao lead [dante-1#low → dante-2]`,
-      wakes.length === 2,
-      `delta=${wakes.length} models=${JSON.stringify(wakes.map((x) => x.model))}`,
-    );
-    check(
-      `[${label}] A9 step-down: 1º degrau prov/dante-1#low, 2º degrau prov/dante-2 (sem variante)`,
-      eq(wakes[0]?.model, DANTE1) && eq(wakes[1]?.model, DANTE2),
-      JSON.stringify(wakes.map((x) => x.model)),
-    );
-    check(
-      `[${label}] A10 ambas as tentativas com agent explícito 'dante'`,
-      wakes.length === 2 && wakes.every((x) => x.agent === "dante"),
-      JSON.stringify(wakes.map((x) => x.agent)),
-    );
-    f.close();
-  }
-
-  /* --- A-C: team SEM lead_agent → sem chave agent, model global --- */
-  {
-    const f = scenario("f1_no_agent");
-    const LEAD = "ses_f1c_lead";
-    const MC = "f1c-member";
-    const MS = "ses_f1c_member";
-    seedTeam(f.db, "team_f1c", LEAD, null); // lead_agent ausente
-    seedMember(f.db, "team_f1c", MC, MS);
-    f.registry.register("team_f1c", MC, MS);
-    seedTask(f.db, "t_f1c_1", "team_f1c", "pending", MC);
-
-    const base = f.calls.promptAsync.length;
-    await executeTeamTasksComplete(f.deps(CFG), { task_id: "t_f1c_1" }, MS);
-    await tick();
-    const wakes = f.leadWakes(LEAD, base);
-    check(`[${label}] A11 sem lead_agent: 1 wake ao lead`, wakes.length === 1, `delta=${wakes.length}`);
-    check(
-      `[${label}] A12 sem lead_agent: payload SEM chave agent, MAS COM model global (global-1#low)`,
-      wakes.length === 1 && !("agent" in wakes[0]) && eq(wakes[0]?.model, GLOBAL1),
-      wakes[0] ? JSON.stringify({ agent: "agent" in wakes[0] ? wakes[0].agent : "(ausente)", model: wakes[0].model }) : "sem wake",
-    );
-    f.close();
-  }
-
-  /* --- A-D: CONTRASTE LEGADO — config ausente → wake modelless --- */
-  {
-    const f = scenario("f1_legacy");
-    const LEAD = "ses_f1d_lead";
-    const MD = "f1d-member";
-    const MS = "ses_f1d_member";
-    seedTeam(f.db, "team_f1d", LEAD, "dante");
-    seedMember(f.db, "team_f1d", MD, MS);
-    f.registry.register("team_f1d", MD, MS);
-    seedTask(f.db, "t_f1d_1", "team_f1d", "pending", MD);
-
-    const base = f.calls.promptAsync.length;
-    // deps.config ausente = assinatura retrocompatível (contraste causal):
-    // MESMO código, SEM config → escada vazia → payload SEM model.
-    await executeTeamTasksComplete(f.deps(undefined), { task_id: "t_f1d_1" }, MS);
-    await tick();
-    const wakes = f.leadWakes(LEAD, base);
-    check(`[${label}] A13 contraste legado: wake ainda dispara 1x`, wakes.length === 1, `delta=${wakes.length}`);
-    check(
-      `[${label}] A14 contraste legado: SEM config o wake é modelless (sem chave 'model'), agent segue explícito`,
-      wakes.length === 1 && !("model" in wakes[0]) && wakes[0]?.agent === "dante",
-      wakes[0] ? JSON.stringify({ model: "model" in wakes[0] ? wakes[0].model : "(ausente)", agent: wakes[0].agent }) : "sem wake",
-    );
-    f.close();
-  }
 
   /* ================================================================ *
    * B) [F2] watchdog.ts — wrapper notifyLead com config               *

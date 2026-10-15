@@ -49,6 +49,7 @@ const SUITES = [
   { file: "test_agnostic_qa_role.mjs", label: "Papel Agnóstico do Quality Gate (Migration 14)" },
   { file: "test_model_aware_wakes.mjs", label: "Wake Ciente de Modelo (F1 board-complete + F2 watchdog/spawn)" },
   { file: "test_harness16_unblock_wake.mjs", label: "HARNESS-16 (Wake Incondicional do Assignee + Watchdog de Inatividade)" },
+  { file: "test_agent_identity_nudges.mjs", label: "HARNESS-17 (Identidade do agent nos 4 nudges secundários)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 
