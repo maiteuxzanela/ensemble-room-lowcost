@@ -20,8 +20,10 @@
  *       • Flow 0 (`action: 'sdet_pass'`): SDET-exclusivo (isSDETMEmber). Só roda
  *         em card `in_review`; grava review_notes + timestamp, o card PERMANECE
  *         em in_review (só o Quality Gate o fecha) e acorda a Clara nativamente
- *         (wakeQualityGateForSdetPass) com texto canônico, `agent: "clara"`
- *         explícito (imunidade ao sequestro de persona) e `synthetic: true`.
+ *         (wakeQualityGateForSdetPass) com texto canônico, `agent: qa.agent ||
+ *         "clara"` explícito e DINÂMICO (imunidade ao sequestro de persona A2,
+ *         sem hardcode "clara"; a literal é só o fallback retrocompat) e
+ *         `synthetic: true`.
  *
  * Cobertura:
  *   MR1  Room (toplevel git) + repo ANINHADO, ambos sujos → complete da Clara
@@ -42,11 +44,20 @@
  *   SP3  Hugo chama `sdet_pass` em card `completed` → erro de estado; ZERO wake.
  *   SP4  Hugo chama `sdet_pass` em card `in_review` → card PERMANECE in_review,
  *        review_notes gravadas, EXATAMENTE 1 wake para a sessão da Clara com
- *        texto canônico + agent 'clara' + synthetic; NENHUM commit (Portão 1 é
- *        exclusivo do complete do Quality Gate).
+ *        texto canônico + agent explícito dinâmico (qa.agent da revisora) +
+ *        synthetic; NENHUM commit (Portão 1 é exclusivo do complete do Quality
+ *        Gate).
  *   SP5  Sala sem Quality Gate → `sdet_pass` não lança, notas gravadas, ZERO wake.
+ *   SP6  Quality Gate CUSTOM (is_qa=1, agent != "clara", ex.: 'gate-custom') →
+ *        o wake do sdet_pass DEVE carregar `agent === 'gate-custom'` (A2: persona
+ *        dinâmica da revisora; nunca "clara" hardcoded).
+ *   SP7  Quality Gate LEGADO com `agent` VAZIO (is_qa=1) → fallback "clara";
+ *        SP7b retrocompat por NOME (is_qa=0, nome "clara", agent vazio) → "clara".
  *   Estáticos: paridade src↔dist dos literais 27A/27B/27C + anti-mock.
- *   PROVA DE MUTAÇÃO: 7 mutantes determinísticos patcheados no bundle dist.
+ *   PROVA DE MUTAÇÃO: 9 mutantes determinísticos patcheados no bundle dist
+ *        (M8 re-endurece o agent hardcoded "clara"; M9 adultera o fallback de
+ *        agent vazio). A guarda A1 anti-auto-review foi revertida por decisão de
+ *        produto (Maiteux/lead) — o card tem escopo exclusivamente A2.
  *
  * Único seam: cliente SDK do OpenCode (fronteira externa), reduzido a um
  * recorder determinístico de promptAsync — mesmo padrão das demais suítes do
@@ -401,6 +412,68 @@ async function runFlow(mod) {
     R("SP5.zero-wakes", calls.length === 0, `calls=${calls.length}`);
   }
 
+  // -------- SP6: Quality Gate CUSTOM (is_qa=1, agent != "clara") → A2 -----
+  //   A2: o wake do sdet_pass deve carregar o agent da PRÓPRIA revisora
+  //   (dinâmico), nunca "clara" hardcoded — senão a persona do Quality Gate
+  //   custom (ex.: 'gate-custom') é sequestrada pela persona default do server.
+  {
+    seedTeam("sp6", "squad-sdet-custom-qa", "ses_lead_sp6");
+    member("sp6", "tales", "ses_tales_sp6", "build");
+    member("sp6", "hugo", "ses_hugo_sp6", "hugo");
+    member("sp6", "gate-custom", "ses_gate_sp6", "gate-custom", 1, "qa");
+    task("sp6", "TSP6", "tales", "in_review", "Feat custom quality gate");
+    const note = "Suíte verde: gate custom";
+    calls.length = 0;
+    const r = await execute(depsSP, "ses_hugo_sp6", { task_id: "TSP6", action: "sdet_pass", notes: note });
+    const gateWakes = calls.filter((c) => c.sessionID === "ses_gate_sp6");
+    const canonical = `[System: SDET (Hugo) has verified task with passing deterministic test suite. Notes: "${note}". Ready for Quality Gate audit.]`;
+    R("SP6.no-error", r.err === null, r.err);
+    R("SP6.status-stays-in-review", taskStatus("TSP6") === "in_review", taskStatus("TSP6"));
+    R("SP6.exactly-one-wake", gateWakes.length === 1 && calls.length === 1, `calls=${calls.length}`);
+    R("SP6.custom-agent-wake", gateWakes[0]?.agent === "gate-custom", `agent=${gateWakes[0]?.agent}`);
+    R("SP6.custom-agent-not-clara", gateWakes[0]?.agent !== "clara", `agent=${gateWakes[0]?.agent}`);
+    R("SP6.wake-text-canonical", gateWakes[0]?.parts?.[0]?.text === canonical, gateWakes[0]?.parts?.[0]?.text ?? "(sem texto)");
+    R("SP6.wake-synthetic", gateWakes[0]?.synthetic === true, `synthetic=${gateWakes[0]?.synthetic}`);
+  }
+
+  // -------- SP7: Quality Gate LEGADO com agent VAZIO → fallback "clara" ----
+  //   Retrocompat de agent vazio (linha migrada): `qa.agent || "clara"` precisa
+  //   cair na persona canônica "clara" em vez de mandar `undefined` no fio.
+  {
+    seedTeam("sp7", "squad-sdet-legacy-qa", "ses_lead_sp7");
+    member("sp7", "tales", "ses_tales_sp7", "build");
+    member("sp7", "hugo", "ses_hugo_sp7", "hugo");
+    member("sp7", "legacy-gate", "ses_legacy_sp7", "", 1, "qa");
+    task("sp7", "TSP7", "tales", "in_review", "Feat legacy empty agent");
+    calls.length = 0;
+    const r = await execute(depsSP, "ses_hugo_sp7", { task_id: "TSP7", action: "sdet_pass", notes: "legado vazio" });
+    const legacyWakes = calls.filter((c) => c.sessionID === "ses_legacy_sp7");
+    R("SP7.no-error", r.err === null, r.err);
+    R("SP7.exactly-one-wake", legacyWakes.length === 1 && calls.length === 1, `calls=${calls.length}`);
+    R("SP7.fallback-clara", legacyWakes[0]?.agent === "clara", `agent=${legacyWakes[0]?.agent}`);
+  }
+
+  // SP7b: retrocompat por NOME (is_qa=0, nome "clara") + agent vazio → "clara".
+  {
+    seedTeam("sp7b", "squad-sdet-retro-qa", "ses_lead_sp7b");
+    member("sp7b", "tales", "ses_tales_sp7b", "build");
+    member("sp7b", "hugo", "ses_hugo_sp7b", "hugo");
+    member("sp7b", "clara", "ses_clara_sp7b", "", 0, null);
+    task("sp7b", "TSP7B", "tales", "in_review", "Feat retrocompat name");
+    calls.length = 0;
+    const rb = await execute(depsSP, "ses_hugo_sp7b", { task_id: "TSP7B", action: "sdet_pass", notes: "retro" });
+    const retroWakes = calls.filter((c) => c.sessionID === "ses_clara_sp7b");
+    R("SP7b.no-error", rb.err === null, rb.err);
+    R("SP7b.exactly-one-wake", retroWakes.length === 1 && calls.length === 1, `calls=${calls.length}`);
+    R("SP7b.fallback-clara", retroWakes[0]?.agent === "clara", `agent=${retroWakes[0]?.agent}`);
+  }
+
+  // -------- SP8 removido: a guarda A1 anti-auto-review foi revertida por -----
+  // decisão de produto (Maiteux/lead): o sdet_pass apenas declara a suíte verde
+  // e passa o bastão à Clara, que de fato audita/fecha; travar por assignee
+  // quebraria recuperações de crash onde o Hugo herda o card. O escopo do card
+  // é exclusivamente A2.
+
   try { db.close(); } catch { /* já fechado */ }
   rmSync(sandbox, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   return got;
@@ -442,8 +515,12 @@ check(
   SRC_TC.includes("if (primary && primary === normalizeDir(dir)) {") && distRaw.includes("if (primary && primary === normalizeDir(dir)) {"),
 );
 check(
-  "persona-sequester immunity: wake da Clara usa agent explícito 'clara' em src e dist",
-  SRC_TC.includes('agent: "clara",') && distRaw.includes('agent: "clara",'),
+  "persona-sequester immunity: wake do Quality Gate usa agent EXPLÍCITO dinâmico da revisora (qa.agent || \"clara\") em src e dist",
+  SRC_TC.includes('agent: qa.agent || "clara",') && distRaw.includes('agent: qa.agent || "clara",'),
+);
+check(
+  "A2: literal 'agent: \"clara\"' hardcoded AUSENTE do src (wake usa a persona dinâmica da revisora)",
+  !SRC_TC.includes('agent: "clara"'),
 );
 
 {
@@ -494,8 +571,8 @@ const MUTATIONS = [
   },
   {
     id: "M4",
-    desc: "agent explícito da Clara removido no wake de sdet_pass (persona sequestrável)",
-    from: 'agent: "clara",',
+    desc: "agent explícito dinâmico da revisora removido no wake de sdet_pass (persona sequestrável)",
+    from: 'agent: qa.agent || "clara",',
     to: "agent: undefined,",
     detect: ["SP4.wake-agent-clara"],
     unaffected: ["SP4.wake-text-canonical", "SP4.exactly-one-clara-wake", "SP4.status-stays-in-review"],
@@ -523,6 +600,22 @@ const MUTATIONS = [
     to: "const threshold = Date.now() - 60 * 60 * 1000",
     detect: ["MR3.fresh-sibling-committed", "MR4.fresh-sibling-committed"],
     unaffected: ["MR3.stale-sibling-not-committed", "MR4.stale-sibling-not-committed", "MR2.stale-sibling-not-committed", "SP4.wake-text-canonical"],
+  },
+  {
+    id: "M8",
+    desc: "A2 regressão: agent hardcoded 'clara' no wake do sdet_pass (persona custom sequestrada)",
+    from: 'agent: qa.agent || "clara",',
+    to: 'agent: "clara",',
+    detect: ["SP6.custom-agent-wake", "SP6.custom-agent-not-clara"],
+    unaffected: ["SP4.wake-agent-clara", "SP7.fallback-clara", "SP7b.fallback-clara"],
+  },
+  {
+    id: "M9",
+    desc: "A2 fallback retrocompat adulterado (agent vazio não cai mais em 'clara')",
+    from: 'agent: qa.agent || "clara",',
+    to: 'agent: qa.agent || "MUTATED-FALLBACK",',
+    detect: ["SP7.fallback-clara", "SP7b.fallback-clara"],
+    unaffected: ["SP6.custom-agent-wake", "SP4.wake-agent-clara"],
   },
 ];
 

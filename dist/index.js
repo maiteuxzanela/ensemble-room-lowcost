@@ -3298,7 +3298,7 @@ function wakeQualityGateForSdetPass(deps, teamId, taskId, notes, qa) {
   deps.client.session.promptAsync({
     sessionID: qa.sessionId,
     parts: [{ type: "text", text: promptText }],
-    agent: "clara",
+    agent: qa.agent || "clara",
     synthetic: true,
     ...model ? { model } : {}
   }).catch((err) => {

@@ -96,8 +96,11 @@ function wakeReviewTarget(
  * the Quality Gate reviewer (Clara — `getTeamQAMember`) with the canonical
  * handover text so the adversarial audit only starts AFTER the suite passed.
  *
- * The wake passes `agent: "clara"` and the reviewer's bound model EXPLICITLY
- * (persona-sequester immunity: omitting the agent lets the OpenCode server
+ * The wake passes the REVIEWER'S OWN `agent` (A2 — `qa.agent || "clara"`,
+ * dynamic so a custom Quality Gate persona flagged `is_qa=1` is never
+ * sequestered by a hardcoded "clara"; the literal is only the retrocompat
+ * fallback for legacy rows whose agent column is empty) and the reviewer's
+ * bound model EXPLICITLY (omitting the agent lets the OpenCode server
  * rebind the session to its default persona). Byte-compatible with the other
  * review-target wakes: a STANDBY reviewer consumes its spawn_context window
  * (resolveStandbyWake — standby → starting, reverted in the catch on transport
@@ -126,13 +129,15 @@ function wakeQualityGateForSdetPass(
     if (wake.woke) promptText = wake.text
   }
 
-  // Persona-sequester immunity: the explicit "clara" agent + the reviewer's
-  // bound model travel on the wire; never let the server pick a default.
+  // Persona-sequester immunity (A2): the REVIEWER'S OWN agent + the bound
+  // model travel on the wire; never let the server pick a default. `qa.agent`
+  // is dynamic so a custom Quality Gate reviewer (is_qa=1, non-"clara" agent)
+  // keeps its persona; "clara" is only the retrocompat fallback for empty agent.
   const model = getMemberModel(deps.db, teamId, qa.name)
   deps.client.session.promptAsync({
     sessionID: qa.sessionId,
     parts: [{ type: "text", text: promptText }],
-    agent: "clara",
+    agent: qa.agent || "clara",
     synthetic: true,
     ...(model ? { model } : {}),
   }).catch((err) => {
