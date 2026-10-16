@@ -420,17 +420,21 @@ export class Watchdog {
       if (unfinishedCount === 0) continue
 
       // Quality Gate reviewer lookup (agnostic: is_qa flag / clara retrocompat).
-      // Resolved BEFORE the busy gate because the busy exclusion below targets
-      // the reviewer's actual name (see qa-role.ts contract).
       const qa = getTeamQAMember(this.db, team.id)
 
-      const busyMember = qa
-        ? this.db.query(
-            "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
-          ).get(team.id, qa.name) as { name: string } | null
-        : this.db.query(
-            "SELECT name FROM team_member WHERE team_id = ? AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
-          ).get(team.id) as { name: string } | null
+      // HARNESS Correção 4 — never wake a QA that is itself working. Without
+      // this guard a busy/running reviewer got a synthetic inactivity wake on
+      // top of its in-flight turn (double-prompt race).
+      if (qa && (qa.status === 'busy' || qa.executionStatus === 'starting' || qa.executionStatus === 'running')) {
+        continue
+      }
+
+      // Any busy member (QA included) means the room is NOT inactive — the
+      // previous `name != ?` exclusion wrongly woke the reviewer while it was
+      // mid-task whenever the QA row itself was the only busy one.
+      const busyMember = this.db.query(
+        "SELECT name FROM team_member WHERE team_id = ? AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
+      ).get(team.id) as { name: string } | null
       if (busyMember) continue
 
       const lastActivity = lastRoomActivity(this.db, team.id)

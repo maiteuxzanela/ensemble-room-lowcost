@@ -14,6 +14,25 @@
  *   - Desativação quando todas as tarefas estão completas ou canceladas.
  *   - Degradação suave (time sem Clara, time não ativo, threshold = 0).
  *
+ * CORREÇÃO 4 (qa-role.ts + watchdog.ts) — QA ocupada nunca é acionada:
+ *   - (a) Clara com status = 'busy' → watchdog NÃO aciona (zero calls) [4.7].
+ *   - (b) Clara com execution_status = 'running' | 'starting' → zero calls
+ *         [4.8 / 4.9]; QA de volta a ready/idle restaura o wake exato [4.10],
+ *         provando que a supressão vem da ocupação e não do cooldown.
+ *   - Fix de contrato legado 4.6: o turno da Clara ('starting' desde o wake
+ *     da seção 2) é transicionado para ready/idle antes de esperar o wake —
+ *     sob a Correção 4 um QA ainda em turno suprime o wake corretamente.
+ *   - (c) Sentinela estática 0.9: query de busyMember unificada presente e
+ *     exclusão legada `name != qa.name` AUSENTE em src e dist.
+ *
+ * PROVA DE MUTAÇÃO (seção 7, dist/src reais via ENSEMBLE_PKG, descartados):
+ *   - Controle: suíte completa contra pacote limpo → 100% verde (exit 0).
+ *   - M1: reintroduzir a exclusão `name != qa.name` (dist E src) → a suíte
+ *     completa FALHA com exit != 0 exatamente na sentinela 0.9.
+ *   - M2: reverter guarda + query (pré-Correção 4) → os cenários 4.7/4.8/4.9
+ *     FALHAM (corrida de double-prompt detectada) e os fluxos intactos
+ *     (2.1/4.3/4.6/4.10/5.1/6.1) permanecem verdes (cirurgia).
+ *
  * Regras:
  *   - SEM MOCKS em código de produção ou testes.
  *   - SQLite REAL (node:sqlite) isolado em .test-scratch/.
@@ -70,6 +89,17 @@ const REQUIRED_SYMBOLS = [
 ];
 
 const distRaw = readFileSync(DIST, "utf8");
+
+/** Anexa ao bundle os exports dos símbolos exigidos (ausentes só se faltarem). */
+function buildHarnessFile(raw) {
+  const existingExport = raw.match(/export\s*\{([^}]*)\}\s*;?\s*$/)?.[1] ?? "";
+  const already = new Set(
+    existingExport.split(",").map((s) => s.trim().split(/\s+as\s+/).pop()).filter(Boolean),
+  );
+  const need = REQUIRED_SYMBOLS.filter((s) => !already.has(s));
+  return raw + (need.length ? `\nexport { ${need.join(", ")} };\n` : "");
+}
+
 {
   const missing = REQUIRED_SYMBOLS.filter(
     (s) => !new RegExp(`(function|class|var|const|let)\\s+${s}\\b`).test(distRaw),
@@ -80,13 +110,7 @@ const distRaw = readFileSync(DIST, "utf8");
     missing.join(",") || REQUIRED_SYMBOLS.length + " símbolos presentes",
   );
 
-  const existingExport = distRaw.match(/export\s*\{([^}]*)\}\s*;?\s*$/)?.[1] ?? "";
-  const already = new Set(
-    existingExport.split(",").map((s) => s.trim().split(/\s+as\s+/).pop()).filter(Boolean),
-  );
-  const need = REQUIRED_SYMBOLS.filter((s) => !already.has(s));
-  const EXPORT_APPEND = need.length ? `\nexport { ${need.join(", ")} };\n` : "";
-  writeFileSync(HARNESS, distRaw + EXPORT_APPEND);
+  writeFileSync(HARNESS, buildHarnessFile(distRaw));
 }
 
 function prepareSrcCopy() {
@@ -156,6 +180,25 @@ check(
 );
 
 /* ================================================================== *
+ * 0.9 SENTINELA ESTATICA DA CORRECAO 4                                *
+ *   Query de busyMember UNIFICADA (qualquer membro ocupado conta,     *
+ *   inclusive a propria QA) e AUSENCIA da exclusao legada             *
+ *   `name != qa.name`, que ignorava a QA e reabria a corrida de       *
+ *   double-prompt. E o alvo da prova de mutacao M1 (secao 7).         *
+ * ================================================================== */
+const BUSY_QUERY_LITERAL =
+  `"SELECT name FROM team_member WHERE team_id = ? AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"`;
+const BUSY_EXCLUSION_MARKER = "name != ? AND (status = 'busy'";
+const busyQuerySentinel = (text) =>
+  text.includes(BUSY_QUERY_LITERAL) && !text.includes(BUSY_EXCLUSION_MARKER);
+
+check(
+  "0.9 sentinela Correção 4: query de busyMember unificada SEM exclusão name != qa.name (src e dist)",
+  busyQuerySentinel(srcWatchdog) && busyQuerySentinel(distRaw),
+  `src=${busyQuerySentinel(srcWatchdog)} dist=${busyQuerySentinel(distRaw)}`,
+);
+
+/* ================================================================== *
  * FIXTURES E TRANSPORTE DE SAÍDA                                     *
  * ================================================================== */
 function createTestClient(calls) {
@@ -182,8 +225,20 @@ function createTestClient(calls) {
 
 /* ================================================================== *
  * SUÍTE COMPORTAMENTAL (executada em dist e src)                      *
+ * Registra cada check num Map devolvido; com emit=true (fase real)    *
+ * também imprime/promove via check global — com emit=false (mutantes) *
+ * silencia, permitindo inspecionar a sensibilidade por cenário.       *
  * ================================================================== */
-async function runRoomInactivityBehavior(label, mods) {
+async function runRoomInactivityBehavior(label, mods, emit = true) {
+  const got = new Map();
+  const check = (name, ok, detail) => {
+    got.set(name, { ok, detail });
+    if (emit) {
+      results.push([name, ok]);
+      console.log(`${ok ? "PASS" : "FAIL"} | ${name}${detail ? " | " + detail : ""}`);
+    }
+  };
+
   const {
     createDb,
     MemberRegistry,
@@ -367,14 +422,80 @@ async function runRoomInactivityBehavior(label, mods) {
     `calls=${calls.promptAsync.length}`,
   );
 
-  // Cenário 4.6: dev volta para 'ready' e 'idle' (não ocupado) -> agora a Clara DEVE ser acordada
+  // Cenário 4.6: dev volta para 'ready' e 'idle' (não ocupado) -> agora a Clara DEVE ser acordada.
+  // Contrato pós-Correção 4: o wake da seção 2 deixou a Clara em
+  // execution_status='starting' (turno em voo) — em runtime real os eventos
+  // devolvem a QA a idle. Modelamos aqui a conclusão do turno dela (PRONTA e
+  // IDLE) antes de esperar o wake: com a QA ainda 'starting', a guarda/query
+  // unificada suprimiria o wake CORRETAMENTE e o cenário 4.6 falharia.
+  db.run("UPDATE team_member SET status = 'ready', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = 'clara'", [inactiveTimestamp, TEAM]);
   db.run("UPDATE team_member SET status = 'ready', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = 'dev'", [inactiveTimestamp, TEAM]);
   calls.promptAsync.length = 0;
   await wd.checkRoomInactivity();
   check(
-    `[${label}] 4.6 Membro em idle/ready (não ocupado): watchdog volta a disparar wake para a Clara`,
+    `[${label}] 4.6 Membro em idle/ready (não ocupado, fim de turno da QA modelado): watchdog volta a disparar wake para a Clara`,
     calls.promptAsync.length === 1,
     `calls=${calls.promptAsync.length}`,
+  );
+
+  /* ================================================================ *
+   * 4.C CORREÇÃO 4 — QA (CLARA) OCUPADA: WATCHDOG NÃO ACIONA          *
+   * (a) status='busy' [4.7]; (b) execution_status running/starting    *
+   * [4.8/4.9]; recuperação ready/idle → wake exato [4.10].            *
+   * Cada cenário zera last_nudged_at para que o zero-wake seja         *
+   * atribuído à ocupação da QA e NUNCA ao cooldown de 30s.             *
+   * ============================================================== */
+  db.run("UPDATE team_message SET time_created = ? WHERE team_id = ?", [inactiveTimestamp, TEAM]);
+  db.run("UPDATE team_member SET last_nudged_at = NULL, time_updated = ? WHERE team_id = ?", [inactiveTimestamp, TEAM]);
+  db.run("UPDATE team_member SET status = 'ready', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = 'dev'", [inactiveTimestamp, TEAM]);
+
+  // 4.7 (a): QA com status = 'busy' → zero calls para a Clara.
+  db.run("UPDATE team_member SET status = 'busy', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = 'clara'", [inactiveTimestamp, TEAM]);
+  db.run("UPDATE team_member SET last_nudged_at = NULL WHERE team_id = ?", [TEAM]);
+  calls.promptAsync.length = 0;
+  await wd.checkRoomInactivity();
+  const claraCalls47 = calls.promptAsync.filter((c) => c.sessionID === CLARA_SESSION);
+  check(
+    `[${label}] 4.7 Correção 4 — QA (Clara) com status = 'busy': watchdog NÃO aciona (zero calls para a Clara)`,
+    claraCalls47.length === 0 && calls.promptAsync.length === 0,
+    `claraCalls=${claraCalls47.length} total=${calls.promptAsync.length}`,
+  );
+
+  // 4.8 (b1): QA com execution_status = 'running' → zero calls.
+  db.run("UPDATE team_member SET status = 'ready', execution_status = 'running', time_updated = ? WHERE team_id = ? AND name = 'clara'", [inactiveTimestamp, TEAM]);
+  db.run("UPDATE team_member SET last_nudged_at = NULL WHERE team_id = ?", [TEAM]);
+  calls.promptAsync.length = 0;
+  await wd.checkRoomInactivity();
+  const claraCalls48 = calls.promptAsync.filter((c) => c.sessionID === CLARA_SESSION);
+  check(
+    `[${label}] 4.8 Correção 4 — QA (Clara) com execution_status = 'running': watchdog NÃO aciona (zero calls)`,
+    claraCalls48.length === 0 && calls.promptAsync.length === 0,
+    `claraCalls=${claraCalls48.length} total=${calls.promptAsync.length}`,
+  );
+
+  // 4.9 (b2): QA com execution_status = 'starting' → zero calls.
+  db.run("UPDATE team_member SET status = 'ready', execution_status = 'starting', time_updated = ? WHERE team_id = ? AND name = 'clara'", [inactiveTimestamp, TEAM]);
+  db.run("UPDATE team_member SET last_nudged_at = NULL WHERE team_id = ?", [TEAM]);
+  calls.promptAsync.length = 0;
+  await wd.checkRoomInactivity();
+  const claraCalls49 = calls.promptAsync.filter((c) => c.sessionID === CLARA_SESSION);
+  check(
+    `[${label}] 4.9 Correção 4 — QA (Clara) com execution_status = 'starting': watchdog NÃO aciona (zero calls)`,
+    claraCalls49.length === 0 && calls.promptAsync.length === 0,
+    `claraCalls=${claraCalls49.length} total=${calls.promptAsync.length}`,
+  );
+
+  // 4.10: QA volta a ready/idle → wake restabelecido (1 call exata) — prova
+  // que a supressão de 4.7–4.9 vinha da ocupação da QA, não do cooldown.
+  db.run("UPDATE team_member SET status = 'ready', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = 'clara'", [inactiveTimestamp, TEAM]);
+  db.run("UPDATE team_member SET last_nudged_at = NULL WHERE team_id = ?", [TEAM]);
+  calls.promptAsync.length = 0;
+  await wd.checkRoomInactivity();
+  const claraCalls410 = calls.promptAsync.filter((c) => c.sessionID === CLARA_SESSION);
+  check(
+    `[${label}] 4.10 Correção 4 — QA volta a ready/idle: wake restabelecido (exatamente 1 call para a Clara)`,
+    claraCalls410.length === 1 && calls.promptAsync.length === 1,
+    `claraCalls=${claraCalls410.length} total=${calls.promptAsync.length}`,
   );
 
   /* ================================================================ *
@@ -450,6 +571,7 @@ async function runRoomInactivityBehavior(label, mods) {
   }
 
   db.close();
+  return got;
 }
 
 /* ================================================================== *
@@ -459,7 +581,7 @@ console.log("\n========================================================");
 console.log("▶ EXECUTANDO CONTRA O BUNDLE COMPILADO (dist/index.js)");
 console.log("========================================================");
 const distMods = await import(HARNESS);
-await runRoomInactivityBehavior("dist", distMods);
+const realDistResults = await runRoomInactivityBehavior("dist", distMods);
 
 console.log("\n========================================================");
 console.log("▶ EXECUTANDO CONTRA O CÓDIGO FONTE REAL (src/**/*.ts)");
@@ -473,6 +595,159 @@ const srcMods = {
   MIGRATIONS: (await import(`${SRC_COPY}/schema.ts`)).MIGRATIONS,
 };
 await runRoomInactivityBehavior("src", srcMods);
+
+/* ================================================================== *
+ * 7. PROVA DE MUTAÇÃO — CORREÇÃO 4 (sentinela determinística)        *
+ *   Mutantes gerados por patch determinístico sobre os bytes REAIS e  *
+ *   DESCARTADOS ao final — src/ e dist/ do repositório nunca são      *
+ *   tocados.                                                          *
+ *   - Controle: suíte completa contra pacote limpo → 100% verde,      *
+ *     provando que o layout temporário em si não causa falha.         *
+ *   - M1: reintroduzir a exclusão legada `name != qa.name` (dist e   *
+ *     src) → a SUÍTE COMPLETA termina com exit != 0 exatamente na     *
+ *     sentinela 0.9. O child é protegido contra recursão pelo flag    *
+ *     ROOM_INACTIVITY_NO_MUT_CHILD.                                   *
+ *   - M2: reverte guarda + query (pré-Correção 4) in-process → os     *
+ *     cenários 4.7/4.8/4.9 FALHAM (corrida de double-prompt) e os     *
+ *     fluxos intactos permanecem verdes (cirurgia).                   *
+ * ================================================================== */
+if (!process.env.ROOM_INACTIVITY_NO_MUT_CHILD) {
+  const CHILD_SUITE = path.join(REPO, "tests", "test_room_inactivity_watchdog.mjs");
+  const BUSY_QUERY_EXCLUSION_LITERAL =
+    `"SELECT name FROM team_member WHERE team_id = ? AND name != ? AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"`;
+  const failLines = (out) => String(out ?? "").split("\n").filter((l) => l.startsWith("FAIL | "));
+  const resultLine = (out) => String(out ?? "").split("\n").find((l) => l.startsWith("RESULT: ")) ?? "";
+
+  const runSuiteChild = (id, patchDist, patchSrc) => {
+    const pkg = path.join(TMP, `_q4_${id}_pkg`);
+    rmSync(pkg, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    mkdirSync(path.join(pkg, "dist"), { recursive: true });
+    writeFileSync(path.join(pkg, "dist", "index.js"), distRaw);
+    cpSync(SRC, path.join(pkg, "src"), { recursive: true });
+    if (patchDist) patchDist(pkg);
+    if (patchSrc) patchSrc(pkg);
+    return spawnSync(process.execPath, [CHILD_SUITE], {
+      encoding: "utf8",
+      env: { ...process.env, ENSEMBLE_PKG: pkg, ROOM_INACTIVITY_NO_MUT_CHILD: "1" },
+      timeout: 180_000,
+      cwd: REPO,
+    });
+  };
+
+  // M1 reintroduz a exclusão EXATAMENTE como no código antigo: forma
+  // condicional (qa ? query com name != qa.name : query unificada), para
+  // preservar o caminho sem-QA (6.3) — mutante fiel, não um crash sintético.
+  const m1DistFrom = `const busyMember = this.db.query(\n        ${BUSY_QUERY_LITERAL}\n      ).get(team.id);`;
+  const m1DistTo =
+    `const busyMember = qa\n` +
+    `        ? this.db.query(\n            ${BUSY_QUERY_EXCLUSION_LITERAL}\n          ).get(team.id, qa.name)\n` +
+    `        : this.db.query(\n            ${BUSY_QUERY_LITERAL}\n          ).get(team.id);`;
+  const m1SrcFrom = `const busyMember = this.db.query(\n        ${BUSY_QUERY_LITERAL}\n      ).get(team.id) as { name: string } | null`;
+  const m1SrcTo =
+    `const busyMember = qa\n` +
+    `        ? this.db.query(\n            ${BUSY_QUERY_EXCLUSION_LITERAL}\n          ).get(team.id, qa.name) as { name: string } | null\n` +
+    `        : this.db.query(\n            ${BUSY_QUERY_LITERAL}\n          ).get(team.id) as { name: string } | null`;
+  const m1DistOcc = distRaw.split(m1DistFrom).length - 1;
+  const m1SrcOcc = srcWatchdog.split(m1SrcFrom).length - 1;
+  check("7.1 M1 patch do dist aplicável (exclusão name != ?: 1 ocorrência exata)", m1DistOcc === 1, `ocorrências=${m1DistOcc}`);
+  check("7.2 M1 patch do src aplicável (exclusão name != ?: 1 ocorrência exata)", m1SrcOcc === 1, `ocorrências=${m1SrcOcc}`);
+
+  // 7.3 Controle: pacote limpo (dist e src intactos) → suíte completa verde.
+  {
+    const r = runSuiteChild("clean", null, null);
+    const fl = failLines(r.stdout);
+    check(
+      "7.3 controle: suíte completa contra pacote limpo → 100% verde (exit 0, zero FAIL)",
+      r.status === 0 && fl.length === 0,
+      `exit=${r.status} fails=${fl.length} ${resultLine(r.stdout)}`,
+    );
+  }
+
+  // 7.4 M1-dist: exclusão reintroduzida no bundle → suíte FALHA só na sentinela 0.9.
+  if (m1DistOcc === 1) {
+    const r = runSuiteChild("m1dist", (pkg) => {
+      const f = path.join(pkg, "dist", "index.js");
+      writeFileSync(f, readFileSync(f, "utf8").split(m1DistFrom).join(m1DistTo));
+    }, null);
+    const fl = failLines(r.stdout);
+    check(
+      "7.4 M1-dist: suíte completa contra dist COM exclusão name != qa.name → FALHA (exit != 0) na sentinela 0.9",
+      r.status !== 0 && fl.length === 1 && fl[0].includes("0.9"),
+      `exit=${r.status} fails=${fl.map((l) => l.slice(0, 70)).join(" ; ") || "-"} ${resultLine(r.stdout)}`,
+    );
+  }
+
+  // 7.5 M1-src: exclusão reintroduzida no fonte → suíte FALHA só na sentinela 0.9.
+  if (m1SrcOcc === 1) {
+    const r = runSuiteChild("m1src", null, (pkg) => {
+      const f = path.join(pkg, "src", "watchdog.ts");
+      writeFileSync(f, readFileSync(f, "utf8").split(m1SrcFrom).join(m1SrcTo));
+    });
+    const fl = failLines(r.stdout);
+    check(
+      "7.5 M1-src: suíte completa contra src COM exclusão name != qa.name → FALHA (exit != 0) na sentinela 0.9",
+      r.status !== 0 && fl.length === 1 && fl[0].includes("0.9"),
+      `exit=${r.status} fails=${fl.map((l) => l.slice(0, 70)).join(" ; ") || "-"} ${resultLine(r.stdout)}`,
+    );
+  }
+
+  // 7.6–7.9 M2: reversão completa da Correção 4 (guarda removida + query
+  // com exclusão) no dist, executada in-process com emissão silenciosa.
+  const m2From =
+    `if (qa && (qa.status === "busy" || qa.executionStatus === "starting" || qa.executionStatus === "running")) {\n` +
+    `        continue;\n      }\n` +
+    `      const busyMember = this.db.query(\n        ${BUSY_QUERY_LITERAL}\n      ).get(team.id);`;
+  const m2To =
+    `const busyMember = qa\n` +
+    `        ? this.db.query(\n            ${BUSY_QUERY_EXCLUSION_LITERAL}\n          ).get(team.id, qa.name)\n` +
+    `        : this.db.query(\n            ${BUSY_QUERY_LITERAL}\n          ).get(team.id);`;
+  const m2Occ = distRaw.split(m2From).length - 1;
+  check("7.6 M2 patch aplicável (guarda + query revertidas: 1 ocorrência exata no dist)", m2Occ === 1, `ocorrências=${m2Occ}`);
+  if (m2Occ === 1) {
+    const m2File = path.join(TMP, "_q4_m2_guard_revert.mjs");
+    writeFileSync(m2File, buildHarnessFile(distRaw.split(m2From).join(m2To)));
+    let m2results = null;
+    let m2err = null;
+    try {
+      m2results = await runRoomInactivityBehavior("m2", await import(m2File), false);
+    } catch (e) {
+      m2err = e;
+    }
+    check(
+      "7.7 M2 mutante executável (fluxo completo, mesmo nº de checks do dist real)",
+      m2err === null && m2results?.size === realDistResults.size,
+      `err=${m2err ? String(m2err).slice(0, 120) : "-"} checks=${m2results?.size ?? 0}/${realDistResults.size}`,
+    );
+    const lookup = (tag) => {
+      for (const [k, v] of m2results ?? []) if (k.includes(tag)) return v;
+      return undefined;
+    };
+    const detectTags = ["] 4.7 ", "] 4.8 ", "] 4.9 "];
+    const missed = detectTags.filter((t) => lookup(t)?.ok !== false);
+    check(
+      "7.8 M2 sensibilidade: cenários Correção 4 (4.7/4.8/4.9) FALHAM no mutante — double-prompt detectado",
+      missed.length === 0,
+      missed.length
+        ? `não detectaram: ${missed.map((t) => t.trim()).join(", ")}`
+        : `${detectTags.length}/${detectTags.length} sentinelas falharam`,
+    );
+    const keepTags = ["] 2.1 ", "] 4.3 ", "] 4.6 ", "] 4.10 ", "] 5.1 ", "] 6.1 "];
+    const broken = keepTags.filter((t) => lookup(t)?.ok !== true);
+    check(
+      "7.9 M2 cirurgia: fluxos intactos (2.1/4.3/4.6/4.10/5.1/6.1) preservados verdes no mutante",
+      broken.length === 0,
+      broken.length
+        ? `quebrou: ${broken.map((t) => t.trim()).join(", ")}`
+        : `${keepTags.length}/${keepTags.length} verdes preservados`,
+    );
+    rmSync(m2File, { force: true });
+  }
+
+  // Descarte determinístico dos pacotes mutantes (controle incluso).
+  for (const id of ["clean", "m1dist", "m1src"]) {
+    rmSync(path.join(TMP, `_q4_${id}_pkg`), { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+}
 
 /* ================================================================== *
  * RESULTADO                                                          *

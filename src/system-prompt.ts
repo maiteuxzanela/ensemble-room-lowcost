@@ -1,6 +1,7 @@
 import type { Database } from "./db"
 import { markDelivered } from "./messaging"
 import { parseTaskResult, formatTaskResult } from "./result-parser"
+import { getTeamSDETMember, isSDETMEmber, isQAMember } from "./qa-role"
 import type { EnsembleConfig } from "./config"
 
 /** Truncate a string to maxLen chars, appending "..." if truncated. */
@@ -201,10 +202,40 @@ export function buildTeammateSystemPrompt(db: Database, teamId: string, memberNa
     "Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit on specific files. Never dump files >300 lines or raw command outputs into context.",
     "",
     "DELIVERY CONTRACT:",
-    "For partial or in-progress work, use team_tasks_complete(task_id, action: 'submit_review', notes: '...') as the SINGLE delivery channel.",
-    "Do NOT also send a redundant team_message(to: 'lead') for partial work — report to the lead only when the task is fully complete.",
+    "Intermediate interactions and partial/in-progress deliveries during development happen EXCLUSIVELY via team_message(to: '<colleague>') — coordinate peer-to-peer; never open a review for partial work.",
+    "submit_review is the SINGLE channel for the FINAL consolidation of the functionality: it moves the card in_progress -> in_review and wakes the reviewer. Use it ONLY when the deliverable is complete.",
+    "Do NOT send a redundant team_message(to: 'lead') for partial work — report to the lead only when the task is fully complete.",
     "If a genuinely blocking decision requires the lead, escalate with decision_lead instead of a best-effort message.",
   ]
+
+  // HARNESS-23 (TASK-02): SDET-first delivery order, resolved against the LIVE
+  // room membership every turn (spawn-order independent):
+  //   - Implementers with an SDET in the room hand the baton EXCLUSIVELY to the
+  //     SDET after submit_review; the Quality Gate is not a direct peer for them.
+  //   - The Quality Gate guardian waits for the SDET's deterministic suite before
+  //     auditing — the wake only reaches it after the SDET verdict.
+  //   - The SDET itself is reminded never to self-audit (auto-review is banned).
+  const roomSdet = getTeamSDETMember(db, teamId)
+  if (roomSdet && isSDETMEmber(db, teamId, memberName) && memberName === roomSdet.name) {
+    lines.push(
+      "",
+      "SDET HANDOVER:",
+      "You are the deterministic-test engineer (SDET) for this room. After you submit a task via submit_review, the Quality Gate reviewer is woken automatically — do not audit your own delivery and do not message the reviewer directly to hand off.",
+      "Once your REAL deterministic suite for a delivery in 'in_review' is 100% green, record the verdict with team_tasks_complete(action: 'sdet_pass', notes: '...') — the Quality Gate reviewer is woken automatically to audit (never approve the card yourself via action: 'complete').",
+    )
+  } else if (roomSdet && !isQAMember(db, teamId, memberName)) {
+    lines.push(
+      "",
+      "SDET HANDOVER:",
+      `After submitting a task via submit_review, pass the baton exclusively to the SDET (${roomSdet.name}) via team_message(to: '${roomSdet.name}') for the deterministic test suite. The Quality Gate is NOT a direct peer for you — it only enters after the SDET verdict.`,
+    )
+  } else if (roomSdet) {
+    lines.push(
+      "",
+      "QUALITY GATE ORDER:",
+      `Wait for the SDET's (${roomSdet.name}) deterministic test suite before auditing: implementers pass the baton to the SDET after submit_review, and only then is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`,
+    )
+  }
 
   // Deliver pending peer messages addressed to this teammate
   const pendingMessages = db.query(

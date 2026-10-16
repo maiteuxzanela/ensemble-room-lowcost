@@ -41,8 +41,10 @@ export interface TeamTask {
 
 /**
  * A single `team_member` row as returned by SQLite queries.
- * `is_qa` (Migration 14) flags the Quality Gate reviewer explicitly; it is
- * optional here so callers that select a narrower column subset still type-check.
+ * `is_qa` (Migration 14) flags the Quality Gate reviewer explicitly; `role`
+ * (Migration 16) carries the explicit role designation ('sdet' for the
+ * deterministic-test engineer). Both are optional here so callers that select
+ * a narrower column subset still type-check.
  */
 export interface TeamMember {
   team_id: string
@@ -62,6 +64,7 @@ export interface TeamMember {
   reported_to_lead: number
   last_nudged_at: number | null
   is_qa?: number
+  role?: string | null
 }
 
 /** A single permission rule for session-level enforcement. */

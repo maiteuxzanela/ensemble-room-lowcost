@@ -295,6 +295,15 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE team ADD COLUMN awaiting_lead_decision INTEGER NOT NULL DEFAULT 0;
    ALTER TABLE team ADD COLUMN awaiting_decision_member TEXT;
    ALTER TABLE team ADD COLUMN awaiting_decision_at INTEGER;`,
+  // Migration 16 (TICKET-HARNESS-23): explicit role designation on team_member.
+  // 'sdet' marks the deterministic-test engineer (Hugo) — the Quality Gate
+  // reviewer remains covered exclusively by is_qa (Migration 14). Additive-only
+  // (same non-negotiable as Migrations 9-11/14/15): nullable TEXT, no CHECK
+  // constraint, no table rebuild. The central helpers in src/qa-role.ts
+  // (isSDETMEmber / getTeamSDETMember) read this column first and fall back to
+  // agent / base-persona === 'hugo' detection, so existing databases and rows
+  // created before this migration keep working unchanged.
+  `ALTER TABLE team_member ADD COLUMN role TEXT;`,
 ]
 
 /**

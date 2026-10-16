@@ -477,7 +477,16 @@ var MIGRATIONS = [
   // `awaiting_decision_at` the raise timestamp, purely for observability.
   `ALTER TABLE team ADD COLUMN awaiting_lead_decision INTEGER NOT NULL DEFAULT 0;
    ALTER TABLE team ADD COLUMN awaiting_decision_member TEXT;
-   ALTER TABLE team ADD COLUMN awaiting_decision_at INTEGER;`
+   ALTER TABLE team ADD COLUMN awaiting_decision_at INTEGER;`,
+  // Migration 16 (TICKET-HARNESS-23): explicit role designation on team_member.
+  // 'sdet' marks the deterministic-test engineer (Hugo) — the Quality Gate
+  // reviewer remains covered exclusively by is_qa (Migration 14). Additive-only
+  // (same non-negotiable as Migrations 9-11/14/15): nullable TEXT, no CHECK
+  // constraint, no table rebuild. The central helpers in src/qa-role.ts
+  // (isSDETMEmber / getTeamSDETMember) read this column first and fall back to
+  // agent / base-persona === 'hugo' detection, so existing databases and rows
+  // created before this migration keep working unchanged.
+  `ALTER TABLE team_member ADD COLUMN role TEXT;`
 ];
 function applyMigrations(db) {
   const { user_version: current } = db.query("PRAGMA user_version").get();
@@ -549,8 +558,8 @@ function getDbPath(env = process.env) {
   const home = env.HOME ?? env.USERPROFILE ?? "~";
   return path.join(home, ".config", "opencode", "ensemble.db");
 }
-function createDb(path6) {
-  const db = openDatabase(path6);
+function createDb(path7) {
+  const db = openDatabase(path7);
   db.exec("PRAGMA journal_mode=WAL");
   db.exec("PRAGMA foreign_keys=ON");
   applyMigrations(db);
@@ -1236,7 +1245,7 @@ function isQAMember(db, teamId, memberName) {
   return false;
 }
 function getTeamQAMember(db, teamId) {
-  const cols = "name, session_id, execution_status, agent, last_nudged_at";
+  const cols = "name, session_id, status, execution_status, agent, last_nudged_at";
   const flagged = db.query(
     `SELECT ${cols} FROM team_member
      WHERE team_id = ? AND is_qa = 1 AND status NOT IN ('shutdown', 'error')
@@ -1246,6 +1255,7 @@ function getTeamQAMember(db, teamId) {
     return {
       name: flagged.name,
       sessionId: flagged.session_id,
+      status: flagged.status,
       executionStatus: flagged.execution_status,
       agent: flagged.agent,
       lastNudgedAt: flagged.last_nudged_at
@@ -1262,6 +1272,54 @@ function getTeamQAMember(db, teamId) {
     return {
       name: match.name,
       sessionId: match.session_id,
+      status: match.status,
+      executionStatus: match.execution_status,
+      agent: match.agent,
+      lastNudgedAt: match.last_nudged_at
+    };
+  }
+  return null;
+}
+function isSDETMEmber(db, teamId, memberName) {
+  const row = db.query(
+    "SELECT role, agent FROM team_member WHERE team_id = ? AND name = ?"
+  ).get(teamId, memberName);
+  if (!row) return false;
+  if (row.role === "sdet") return true;
+  if (resolveBasePersona2(memberName) === "hugo") return true;
+  if (row.agent === "hugo") return true;
+  return false;
+}
+function getTeamSDETMember(db, teamId) {
+  const cols = "name, session_id, status, execution_status, agent, last_nudged_at";
+  const explicit = db.query(
+    `SELECT ${cols} FROM team_member
+     WHERE team_id = ? AND (role = 'sdet' OR agent = 'hugo') AND status NOT IN ('shutdown', 'error')
+     ORDER BY CASE WHEN role = 'sdet' THEN 0 ELSE 1 END
+     LIMIT 1`
+  ).get(teamId);
+  if (explicit) {
+    return {
+      name: explicit.name,
+      sessionId: explicit.session_id,
+      status: explicit.status,
+      executionStatus: explicit.execution_status,
+      agent: explicit.agent,
+      lastNudgedAt: explicit.last_nudged_at
+    };
+  }
+  const candidates = db.query(
+    `SELECT ${cols} FROM team_member
+     WHERE team_id = ? AND status NOT IN ('shutdown', 'error')`
+  ).all(teamId);
+  const match = candidates.find(
+    (c) => resolveBasePersona2(c.name) === "hugo"
+  );
+  if (match) {
+    return {
+      name: match.name,
+      sessionId: match.session_id,
+      status: match.status,
       executionStatus: match.execution_status,
       agent: match.agent,
       lastNudgedAt: match.last_nudged_at
@@ -1711,14 +1769,7 @@ function dispatchV2Event(db, registry, tracker, event, failoverCtx) {
 
 // src/member-model.ts
 function parseModelId(model) {
-  const hash = model.indexOf("#");
-  const variant = hash >= 0 ? model.slice(hash + 1) : void 0;
-  const base = hash >= 0 ? model.slice(0, hash) : model;
-  const slash = base.indexOf("/");
-  if (slash <= 0 || slash === base.length - 1) return void 0;
-  const parsed = { providerID: base.slice(0, slash), modelID: base.slice(slash + 1) };
-  if (variant) parsed.variant = variant;
-  return parsed;
+  return parseModelSelector(model);
 }
 function getMemberModel(db, teamId, memberName) {
   const row = db.query("SELECT model FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
@@ -2309,6 +2360,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
   if (existing) throw new Error(`Teammate "${args.name}" already exists in team "${teamInfo.teamName}"`);
   const basePersonaName = resolveBasePersona3(args.name);
   const isHugo = basePersonaName === "hugo" || agent === "hugo";
+  const spawnIsSDET = isHugo || args.role === "sdet";
   const spawnIsQA = args.role === "qa" || args.is_qa === true || agent === "clara" || basePersonaName === "clara";
   if (spawnIsQA) {
     const existingQA = getTeamQAMember(deps.db, teamInfo.teamId);
@@ -2318,11 +2370,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
       );
     }
   }
-  if (isHugo) {
-    const activeMembers = deps.db.query(
-      "SELECT name, agent FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error')"
-    ).all(teamInfo.teamId);
-    const existingSDET = activeMembers.find((m) => resolveBasePersona3(m.name) === "hugo" || m.agent === "hugo");
+  if (spawnIsSDET) {
+    const existingSDET = getTeamSDETMember(deps.db, teamInfo.teamId);
     if (existingSDET) {
       throw new Error(
         `Engenheiro de Testes 'hugo' j\xE1 est\xE1 ativo na equipe '${teamInfo.teamName}'. Pap\xE9is de engenharia de testes s\xE3o exclusivos e n\xE3o admitem inst\xE2ncias concorrentes.`
@@ -2330,6 +2379,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     }
   }
   const roomQa = getTeamQAMember(deps.db, teamInfo.teamId);
+  const roomSdet = spawnIsSDET ? null : getTeamSDETMember(deps.db, teamInfo.teamId);
   const isReadOnly = agent === "plan" || agent === "explore";
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory);
   const usePlanApproval = args.plan_approval === true;
@@ -2358,7 +2408,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
       log(`spawn:auto-standby member=${args.name} agent=${agent} reason=quality_gate_active_team`);
     }
   }
-  if (!autoStandby && isHugo && args.standby !== false) {
+  if (!autoStandby && spawnIsSDET && args.standby !== false) {
     autoStandby = true;
     autoStandbyReason = "hugo sdet default standby";
     log(`spawn:auto-standby member=${args.name} agent=${agent} reason=hugo_sdet_default`);
@@ -2515,8 +2565,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
   const fallbackModel = selectFallbackModel(agentFallbackChain, resolvedModel);
   if (fallbackModel) log(`spawn:fallback name=${args.name} agent=${agent} fallback=${formatModelSelector(fallbackModel)}`);
   deps.db.run(
-    `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, is_qa, time_created, time_updated)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, is_qa, role, time_created, time_updated)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       teamInfo.teamId,
       args.name,
@@ -2535,6 +2585,10 @@ async function executeTeamSpawn(deps, args, sessionId) {
       workspaceId,
       planApproval,
       spawnIsQA ? 1 : 0,
+      // Explicit role designation (Migration 16): only 'sdet' is persisted here
+      // — the Quality Gate reviewer is already flagged by is_qa (Migration 14),
+      // so writing 'qa' as well would duplicate sources of truth.
+      spawnIsSDET ? "sdet" : null,
       now,
       now
     ]
@@ -2654,28 +2708,52 @@ async function executeTeamSpawn(deps, args, sessionId) {
     );
   }
   const qaPeerName = roomQa?.name;
+  const sdetPeerName = roomSdet?.name ?? null;
+  const finishStep2 = (claimScope) => {
+    const tail = claimScope === "a standalone task" ? "Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete." : "Otherwise, if you claimed a task, mark it complete using team_tasks_complete.";
+    if (spawnIsSDET) {
+      return `2. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) \u2014 the Quality Gate reviewer is woken automatically after your deterministic suite is submitted. Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. ${tail}`;
+    }
+    if (sdetPeerName) {
+      return `2. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes), then pass the baton exclusively to the SDET ${sdetPeerName} via team_message(to: '${sdetPeerName}') for the deterministic test suite. Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. ${tail}`;
+    }
+    if (qaPeerName) {
+      return claimScope === "a standalone task" ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so ${qaPeerName} can validate and approve. Coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.` : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`;
+    }
+    return claimScope === "a standalone task" ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.` : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`;
+  };
+  if (spawnIsSDET) {
+    context.push(
+      "",
+      "SDET ORIENTATION:",
+      "You are the deterministic-test engineer (SDET). Design and run REAL deterministic test suites (never mocks). After you submit a task via submit_review, the Quality Gate reviewer is woken automatically \u2014 do not audit your own delivery.",
+      "When you have verified a delivery in 'in_review' with a REAL deterministic suite that is 100% green, record the verdict with team_tasks_complete(action: 'sdet_pass', notes: '...') \u2014 it hands the baton to the Quality Gate reviewer automatically (never approve the card yourself via action: 'complete')."
+    );
+  } else if (spawnIsQA && sdetPeerName) {
+    context.push(
+      "",
+      "QUALITY GATE ORIENTATION:",
+      `Wait for the SDET's (${sdetPeerName}) deterministic test suite before auditing: implementers pass the baton to the SDET after submit_review, and only then is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`
+    );
+  }
   context.push("", "When you finish your task:");
   if (!isReadOnly && worktreeBranch) {
     context.push(`1. Commit your changes: git add -A && git commit -m "your summary"`);
-    context.push(
-      qaPeerName ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). For partial or in-progress deliveries, submit_review is the SINGLE channel \u2014 do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.` : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). For partial or in-progress deliveries, submit_review is the SINGLE channel \u2014 do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`
-    );
+    context.push(finishStep2("a task"));
     context.push(
       "3. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:"
     );
   } else if (!isReadOnly) {
     context.push(
-      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for Quality Gate inspection and anti-early-commit governance)."
+      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for inspection and anti-early-commit governance). The runtime commits the shared workspace LOCALLY and automatically the moment the Quality Gate reviewer (Clara) approves your card via team_tasks_complete(action: 'complete') \u2014 no manual git commit is needed. Pushing stays reserved for the pre-push batch gate."
     );
-    context.push(
-      qaPeerName ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so ${qaPeerName} can validate and approve. Coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). For partial or in-progress deliveries, submit_review is the SINGLE channel \u2014 do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.` : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). For partial or in-progress deliveries, submit_review is the SINGLE channel \u2014 do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`
-    );
+    context.push(finishStep2("a standalone task"));
     context.push(
       "3. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:"
     );
   } else {
     context.push(
-      qaPeerName ? `1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). If you claimed a task, mark it complete using team_tasks_complete.` : `1. If your task requires Quality Gate review or peer feedback, coordinate with the team lead via team_message. If you claimed a task, mark it complete using team_tasks_complete.`
+      sdetPeerName && !spawnIsSDET ? `1. If your task requires review or peer feedback, pass the baton to the SDET ${sdetPeerName} via team_message(to: '${sdetPeerName}') for the deterministic test suite. If you claimed a task, mark it complete using team_tasks_complete.` : qaPeerName ? `1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). If you claimed a task, mark it complete using team_tasks_complete.` : `1. If your task requires Quality Gate review or peer feedback, coordinate with the team lead via team_message. If you claimed a task, mark it complete using team_tasks_complete.`
     );
     context.push(
       "2. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:"
@@ -2702,7 +2780,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit. Keep command outputs concise \u2014 never dump files >300 lines.",
     "",
     "MANDATORY CLOSING RULE: Approval without tools does not exist. It is strictly forbidden to finish your response with only plain text or Markdown. When concluding any task or audit/review, you MUST execute:",
-    "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' if submitting for review \u2014 the SINGLE channel for partial/in-progress deliveries)",
+    "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' ONLY for the final consolidation of the functionality \u2014 intermediate/partial work is coordinated via team_message)",
     "2. team_message(to: 'lead', text: '<task-result>...') \u2014 ONLY on final completion. Do NOT duplicate a partial/in-progress report via team_message(to: 'lead').",
     "",
     "Your plain text output is NOT visible to the team. You MUST use team_message to communicate."
@@ -3155,117 +3233,147 @@ async function executeTeamTasksAdd(deps, args, sessionId) {
 }
 
 // src/tools/team-tasks-complete.ts
+init_process();
 init_log();
-async function executeTeamTasksComplete(deps, args, sessionId) {
-  const teamInfo = requireTeamMember(deps, sessionId);
-  const caller = teamInfo.role === "lead" ? "lead" : teamInfo.memberName ?? "unknown";
-  const task = deps.db.query("SELECT id, content, status, assignee, rejection_count, review_notes FROM team_task WHERE id = ? AND team_id = ?").get(args.task_id, teamInfo.teamId);
-  if (!task) throw new Error(`Task "${args.task_id}" not found`);
+import path4 from "node:path";
+import { existsSync as existsSync2, readdirSync, statSync } from "node:fs";
+function wakeReviewTarget(deps, teamId, taskId, caller, target, notes, kind) {
+  if (!target.sessionId) return false;
   const now = Date.now();
-  const notes = args.review_notes ?? args.notes ?? null;
-  const qaMember = getTeamQAMember(deps.db, teamInfo.teamId);
-  const qaLabel = qaMember?.name ?? "the Quality Gate reviewer";
-  const isSubmitReview = args.action === "submit_review" || args.action === "in_review" || args.status === "in_review";
-  if (isSubmitReview) {
-    if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`);
-    if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`);
-    if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`);
-    if (task.status === "in_review") throw new Error(`Task "${args.task_id}" is already in review`);
-    if (task.assignee && teamInfo.role !== "lead" && caller !== task.assignee) {
-      throw new Error(`Task "${args.task_id}" is claimed by ${task.assignee}`);
+  deps.db.run(
+    "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
+    [now, teamId, target.name]
+  );
+  const baseWakeText = kind === "sdet" ? `[System: Task "${taskId}" was submitted for review by ${caller}${notes ? ` (notes: ${notes})` : ""} \u2014 SDET handover: run the deterministic test suite for this delivery before the Quality Gate audits.]` : `[System: Task "${taskId}" was submitted for review by ${caller}${notes ? ` (notes: ${notes})` : ""}]`;
+  let promptText = baseWakeText;
+  let promptAgent = target.agent;
+  if (target.executionStatus === "standby") {
+    const wake = resolveStandbyWake(deps.db, teamId, target.name, baseWakeText);
+    if (wake.woke) {
+      promptText = wake.text;
+      promptAgent = wake.agent ?? target.agent;
     }
-    const assignee = task.assignee ?? caller;
-    deps.db.run(
-      "UPDATE team_task SET status = 'in_review', assignee = ?, review_notes = ?, time_updated = ? WHERE id = ?",
-      [assignee, notes ?? task.review_notes ?? null, now, args.task_id]
-    );
-    if (qaMember) inReviewNudges.delete(`${teamInfo.teamId}:${qaMember.name}:${args.task_id}`);
-    let qaNotified = false;
-    if (qaMember && !isQAMember(deps.db, teamInfo.teamId, caller)) {
-      if (qaMember.sessionId) {
-        deps.db.run(
-          "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
-          [now, teamInfo.teamId, qaMember.name]
-        );
-        const baseWakeText = `[System: Task "${args.task_id}" was submitted for review by ${caller}${notes ? ` (notes: ${notes})` : ""}]`;
-        let promptText = baseWakeText;
-        let promptAgent = qaMember.agent;
-        if (qaMember.executionStatus === "standby") {
-          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, qaMember.name, baseWakeText);
-          if (wake.woke) {
-            promptText = wake.text;
-            promptAgent = wake.agent ?? qaMember.agent;
-          }
-        }
-        const qaModel = getMemberModel(deps.db, teamInfo.teamId, qaMember.name);
-        deps.client.session.promptAsync({
-          sessionID: qaMember.sessionId,
-          parts: [{ type: "text", text: promptText }],
-          agent: promptAgent,
-          synthetic: true,
-          ...qaModel ? { model: qaModel } : {}
-        }).catch((err) => {
-          if (qaMember.executionStatus === "standby") {
-            deps.db.run(
-              "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
-              [Date.now(), teamInfo.teamId, qaMember.name]
-            );
-          }
-          log(`tasks-complete:wake-clara:failed err=${String(err)}`);
-        });
-        log(`tasks-complete:wake-clara:ok task=${args.task_id} sessionID=${qaMember.sessionId}`);
-        qaNotified = true;
-      }
-    }
-    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${qaNotified ? ` (notified ${qaMember?.name} for review)` : ""}`;
   }
-  const isReject = args.action === "reject" || args.action === "reject_review" || task.status === "in_review" && (args.action === "in_progress" || args.status === "in_progress");
-  if (isReject) {
-    if (task.status !== "in_review") {
-      throw new Error(`Task "${args.task_id}" is not in review (current status: ${task.status})`);
+  const model = getMemberModel(deps.db, teamId, target.name);
+  deps.client.session.promptAsync({
+    sessionID: target.sessionId,
+    parts: [{ type: "text", text: promptText }],
+    agent: promptAgent,
+    synthetic: true,
+    ...model ? { model } : {}
+  }).catch((err) => {
+    if (target.executionStatus === "standby") {
+      deps.db.run(
+        "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+        [Date.now(), teamId, target.name]
+      );
     }
-    if (teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {
-      throw new Error(`Only ${qaLabel} or the team lead can reject tasks in review`);
+    if (kind === "sdet") {
+      log(`tasks-complete:wake-sdet:failed err=${String(err)}`);
+    } else {
+      log(`tasks-complete:wake-clara:failed err=${String(err)}`);
     }
-    const newRejectionCount = (task.rejection_count ?? 0) + 1;
-    deps.db.run(
-      "UPDATE team_task SET status = 'in_progress', rejection_count = ?, review_notes = ?, time_updated = ? WHERE id = ?",
-      [newRejectionCount, notes, now, args.task_id]
-    );
-    return `Rejected task: ${task.content} (rejection #${newRejectionCount})${notes ? ` - ${notes}` : ""}`;
-  }
-  if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`);
-  if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`);
-  if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`);
-  if (task.status === "in_review") {
-    if (teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {
-      throw new Error(`Task "${args.task_id}" is in review; only ${qaLabel} or the team lead can complete it`);
-    }
-  } else if (task.status === "in_progress" && task.assignee && teamInfo.role !== "lead" && caller !== task.assignee) {
-    throw new Error(`Task "${args.task_id}" is claimed by ${task.assignee}`);
-  }
-  if (task.assignee) {
-    deps.db.run("UPDATE team_task SET status = 'completed', time_updated = ? WHERE id = ?", [now, args.task_id]);
+  });
+  if (kind === "sdet") {
+    log(`tasks-complete:wake-sdet:ok task=${taskId} sessionID=${target.sessionId}`);
   } else {
-    const result = deps.db.run(
-      "UPDATE team_task SET status = 'completed', assignee = ?, time_updated = ? WHERE id = ? AND assignee IS NULL",
-      [caller, now, args.task_id]
-    );
-    if (result.changes === 0) {
-      throw new Error(`Task "${args.task_id}" was just completed by another teammate`);
+    log(`tasks-complete:wake-clara:ok task=${taskId} sessionID=${target.sessionId}`);
+  }
+  return true;
+}
+function wakeQualityGateForSdetPass(deps, teamId, taskId, notes, qa) {
+  if (!qa.sessionId) return false;
+  const now = Date.now();
+  deps.db.run(
+    "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
+    [now, teamId, qa.name]
+  );
+  const baseWakeText = `[System: SDET (Hugo) has verified task with passing deterministic test suite. Notes: "${notes ?? ""}". Ready for Quality Gate audit.]`;
+  let promptText = baseWakeText;
+  if (qa.executionStatus === "standby") {
+    const wake = resolveStandbyWake(deps.db, teamId, qa.name, baseWakeText);
+    if (wake.woke) promptText = wake.text;
+  }
+  const model = getMemberModel(deps.db, teamId, qa.name);
+  deps.client.session.promptAsync({
+    sessionID: qa.sessionId,
+    parts: [{ type: "text", text: promptText }],
+    agent: "clara",
+    synthetic: true,
+    ...model ? { model } : {}
+  }).catch((err) => {
+    if (qa.executionStatus === "standby") {
+      deps.db.run(
+        "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+        [Date.now(), teamId, qa.name]
+      );
+    }
+    log(`tasks-complete:sdet-pass:wake-clara:failed task=${taskId} err=${String(err)}`);
+  });
+  log(`tasks-complete:sdet-pass:wake-clara:ok task=${taskId} sessionID=${qa.sessionId}`);
+  return true;
+}
+function notifyRejectedImplementer(deps, teamId, taskId, reviewer, implementer, notes, reviewerIsSDET) {
+  const row = deps.db.query(
+    "SELECT session_id, agent, execution_status FROM team_member WHERE team_id = ? AND name = ?"
+  ).get(teamId, implementer);
+  const sessionId = row?.session_id;
+  if (!sessionId) return false;
+  const reviewerLabel = reviewerIsSDET ? "the SDET" : "the Quality Gate reviewer";
+  const baseText = `[System: Task "${taskId}" was rejected by ${reviewer} (${reviewerLabel})${notes ? ` (notes: ${notes})` : ""} \u2014 the card is back in 'in_progress'; address the findings and resubmit.]`;
+  let promptText = baseText;
+  let promptAgent = row?.agent || void 0;
+  if (row?.execution_status === "standby") {
+    const wake = resolveStandbyWake(deps.db, teamId, implementer, baseText);
+    if (wake.woke) {
+      promptText = wake.text;
+      promptAgent = wake.agent ?? row.agent;
     }
   }
+  const model = getMemberModel(deps.db, teamId, implementer);
+  deps.client.session.promptAsync({
+    sessionID: sessionId,
+    parts: [{ type: "text", text: promptText }],
+    agent: promptAgent,
+    synthetic: true,
+    ...model ? { model } : {}
+  }).catch((err) => {
+    if (row?.execution_status === "standby") {
+      deps.db.run(
+        "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+        [Date.now(), teamId, implementer]
+      );
+    }
+    log(`tasks-complete:reject-notify:failed member=${implementer} err=${String(err)}`);
+  });
+  log(`tasks-complete:reject-notify:ok member=${implementer} task=${taskId} reviewer=${reviewer}`);
+  return true;
+}
+function isValidationProfileTask(deps, teamInfo, task) {
+  if (!task.assignee) return false;
+  return isSDETMEmber(deps.db, teamInfo.teamId, task.assignee) || isQAMember(deps.db, teamInfo.teamId, task.assignee);
+}
+function countPendingDevelopmentTasks(deps, teamInfo, excludeTaskId) {
+  const rows = deps.db.query(
+    "SELECT assignee FROM team_task WHERE team_id = ? AND status IN ('pending', 'in_progress') AND id != ?"
+  ).all(teamInfo.teamId, excludeTaskId);
+  return rows.filter((r) => !isValidationProfileTask(deps, teamInfo, r)).length;
+}
+function unblockDependents(deps, teamInfo, triggerTaskId, now) {
   const allTasks = deps.db.query("SELECT id, depends_on, status, assignee FROM team_task WHERE team_id = ?").all(teamInfo.teamId);
   let unblocked = 0;
   let wokeMembers = 0;
   for (const t of allTasks) {
     if (t.status !== "blocked" || !t.depends_on) continue;
     const depIds = JSON.parse(t.depends_on);
-    if (!depIds.includes(args.task_id)) continue;
+    if (!depIds.includes(triggerTaskId)) continue;
+    const downstreamIsValidation = isValidationProfileTask(deps, teamInfo, t);
     const allResolved = depIds.every((depId) => {
-      if (depId === args.task_id) return true;
       const dep = allTasks.find((d) => d.id === depId);
-      return dep && (dep.status === "completed" || dep.status === "cancelled");
+      if (!dep) return false;
+      if (dep.status === "completed" || dep.status === "cancelled") return true;
+      if (dep.status === "in_review" && downstreamIsValidation) return true;
+      return false;
     });
     if (allResolved) {
       const nextStatus = t.assignee ? "in_progress" : "pending";
@@ -3331,6 +3439,310 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
       }
     }
   }
+  return { unblocked, wokeMembers };
+}
+function formatUnblockedSuffix(unblocked, wokeMembers) {
+  if (unblocked <= 0) return "";
+  let msg = ` (unblocked ${unblocked} task${unblocked !== 1 ? "s" : ""}`;
+  if (wokeMembers > 0) {
+    msg += `, woke ${wokeMembers} member${wokeMembers !== 1 ? "s" : ""}`;
+  }
+  return `${msg})`;
+}
+function normalizeDir(dir) {
+  return dir.replace(/\/+$/, "");
+}
+var NESTED_REPO_SCAN_DEPTH = 2;
+function resolveFreshnessSince(deps, teamId, taskTimeCreated) {
+  const row = deps.db.query("SELECT time_created FROM team WHERE id = ?").get(teamId);
+  const stamps = [row?.time_created, taskTimeCreated].filter(
+    (v) => typeof v === "number" && Number.isFinite(v)
+  );
+  if (stamps.length === 0) return Number.POSITIVE_INFINITY;
+  return Math.min(...stamps);
+}
+async function gitToplevel(cwd) {
+  const res = await runCommand(["git", "rev-parse", "--show-toplevel"], { cwd });
+  if (res.exitCode !== 0) return null;
+  const top = res.stdout.trim();
+  return top.length > 0 ? normalizeDir(top) : null;
+}
+function isRepoRoot(dir) {
+  return existsSync2(path4.join(dir, ".git"));
+}
+function findNestedRepoRoots(root, maxDepth) {
+  const found = [];
+  const walk = (dir, depth) => {
+    if (depth > maxDepth) return;
+    let entries;
+    try {
+      entries = readdirSync(dir).sort();
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.startsWith(".") || entry === "node_modules") continue;
+      const child = path4.join(dir, entry);
+      let isDir = false;
+      try {
+        isDir = statSync(child).isDirectory();
+      } catch {
+        continue;
+      }
+      if (!isDir) continue;
+      if (isRepoRoot(child)) {
+        found.push(normalizeDir(child));
+        continue;
+      }
+      walk(child, depth + 1);
+    }
+  };
+  walk(root, 1);
+  return found;
+}
+function findSiblingRepoRoots(dir) {
+  const normalized = normalizeDir(dir);
+  const parent = path4.dirname(normalized);
+  const self = path4.basename(normalized);
+  const found = [];
+  let entries;
+  try {
+    entries = readdirSync(parent).sort();
+  } catch {
+    return found;
+  }
+  for (const entry of entries) {
+    if (entry === self || entry.startsWith(".")) continue;
+    const child = path4.join(parent, entry);
+    try {
+      if (!statSync(child).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    if (isRepoRoot(child)) found.push(normalizeDir(child));
+  }
+  return found;
+}
+async function hasFreshDirt(repo, sinceMs) {
+  const status = await runCommand(["git", "status", "--porcelain"], { cwd: repo });
+  if (status.exitCode !== 0) return false;
+  const lines = status.stdout.split("\n").map((l) => l.replace(/\s+$/, "")).filter((l) => l.length > 0);
+  if (lines.length === 0) return false;
+  const threshold = sinceMs;
+  for (const line of lines) {
+    let rel = line.slice(3);
+    const arrow = rel.indexOf(" -> ");
+    if (arrow !== -1) rel = rel.slice(arrow + 4);
+    rel = rel.replace(/^"|"$/g, "").trim();
+    if (rel.length === 0) continue;
+    try {
+      if (statSync(path4.join(repo, rel)).mtimeMs >= threshold) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+function extraRepoRoots() {
+  const raw = process.env.ENSEMBLE_AUTOCOMMIT_REPOS;
+  if (!raw) return [];
+  return raw.split(/[\n,;:]+/).map((p) => p.trim()).filter((p) => p.length > 0);
+}
+async function resolveCommitTargets(dir, sinceMs) {
+  const targets = [];
+  const seen = /* @__PURE__ */ new Set();
+  const add = (rawPath) => {
+    const p = normalizeDir(rawPath);
+    if (seen.has(p)) return;
+    seen.add(p);
+    targets.push({ path: p, name: path4.basename(p) });
+  };
+  const primary = await gitToplevel(dir);
+  if (primary && primary === normalizeDir(dir)) {
+    add(primary);
+  } else if (primary) {
+    log(`tasks-complete:autocommit:skip-non-root dir=${dir}`);
+  }
+  for (const nested of findNestedRepoRoots(dir, NESTED_REPO_SCAN_DEPTH)) {
+    if (nested !== normalizeDir(dir)) add(nested);
+  }
+  for (const sibling of findSiblingRepoRoots(dir)) {
+    if (await hasFreshDirt(sibling, sinceMs)) add(sibling);
+  }
+  for (const extra of extraRepoRoots()) {
+    if (extra !== normalizeDir(dir) && isRepoRoot(extra)) add(extra);
+  }
+  const depth = (p) => p.split(path4.sep).filter(Boolean).length;
+  targets.sort((a, b) => depth(b.path) - depth(a.path));
+  return targets;
+}
+async function autoCommitApprovedTask(deps, taskContent, sinceMs) {
+  const dir = deps.directory;
+  try {
+    const targets = await resolveCommitTargets(dir, sinceMs);
+    if (targets.length === 0) return "";
+    const message = `feat(runtime): ${taskContent}`;
+    const committed = [];
+    let sawDirty = false;
+    for (const target of targets) {
+      try {
+        const status = await runCommand(["git", "status", "--porcelain"], { cwd: target.path });
+        if (status.exitCode !== 0) {
+          log(`tasks-complete:autocommit:status-failed dir=${target.path} err=${status.stderr.trim()}`);
+          continue;
+        }
+        if (status.stdout.trim().length === 0) continue;
+        sawDirty = true;
+        const commit = await runCommand(
+          ["sh", "-c", 'git -C "$1" add -A && git -C "$1" commit -m "$2"', "ensemble-autocommit", target.path, message],
+          { cwd: target.path }
+        );
+        if (commit.exitCode !== 0) {
+          log(`tasks-complete:autocommit:commit-failed dir=${target.path} err=${commit.stderr.trim()}`);
+          continue;
+        }
+        const rev = await runCommand(["git", "rev-parse", "--short", "HEAD"], { cwd: target.path });
+        const hash = rev.exitCode === 0 ? rev.stdout.trim() : "";
+        committed.push({ name: target.name, hash, path: target.path });
+        log(`tasks-complete:autocommit:committed dir=${target.path} repo=${target.name} hash=${hash || "?"} task="${taskContent}"`);
+      } catch (err) {
+        log(`tasks-complete:autocommit:error dir=${target.path} err=${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (committed.length === 0) {
+      return sawDirty ? "" : " Task completed; working tree already clean (no commit needed)";
+    }
+    const roomDir = normalizeDir(dir);
+    const ordered = [...committed].sort((a, b) => Number(b.path === roomDir) - Number(a.path === roomDir));
+    const evidence = ordered.map((c) => c.hash ? `${c.name} (${c.hash})` : c.name).join(", ");
+    return ` Task completed and locally committed: ${evidence}`;
+  } catch (err) {
+    log(`tasks-complete:autocommit:error dir=${dir} err=${err instanceof Error ? err.message : String(err)}`);
+    return "";
+  }
+}
+async function executeTeamTasksComplete(deps, args, sessionId) {
+  const teamInfo = requireTeamMember(deps, sessionId);
+  const caller = teamInfo.role === "lead" ? "lead" : teamInfo.memberName ?? "unknown";
+  const task = deps.db.query("SELECT id, content, status, assignee, rejection_count, review_notes, time_created FROM team_task WHERE id = ? AND team_id = ?").get(args.task_id, teamInfo.teamId);
+  if (!task) throw new Error(`Task "${args.task_id}" not found`);
+  const now = Date.now();
+  const notes = args.review_notes ?? args.notes ?? null;
+  const qaMember = getTeamQAMember(deps.db, teamInfo.teamId);
+  const qaLabel = qaMember?.name ?? "the Quality Gate reviewer";
+  if (args.action === "sdet_pass") {
+    if (!isSDETMEmber(deps.db, teamInfo.teamId, caller)) {
+      throw new Error("Only SDET can invoke sdet_pass");
+    }
+    if (task.status !== "in_review") {
+      throw new Error("Task must be in review to record sdet_pass");
+    }
+    deps.db.run(
+      "UPDATE team_task SET review_notes = ?, time_updated = ? WHERE id = ?",
+      [notes, now, args.task_id]
+    );
+    if (qaMember) {
+      wakeQualityGateForSdetPass(deps, teamInfo.teamId, args.task_id, notes, qaMember);
+    }
+    return `Task ${args.task_id} SDET verification recorded: ${notes ?? ""}. Quality Gate guardian notified.`;
+  }
+  const isSubmitReview = args.action === "submit_review" || args.action === "in_review" || args.status === "in_review";
+  if (isSubmitReview) {
+    if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`);
+    if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`);
+    if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`);
+    if (task.status === "in_review") throw new Error(`Task "${args.task_id}" is already in review`);
+    if (task.assignee && teamInfo.role !== "lead" && caller !== task.assignee) {
+      throw new Error(`Task "${args.task_id}" is claimed by ${task.assignee}`);
+    }
+    const assignee = task.assignee ?? caller;
+    deps.db.run(
+      "UPDATE team_task SET status = 'in_review', assignee = ?, review_notes = ?, time_updated = ? WHERE id = ?",
+      [assignee, notes ?? task.review_notes ?? null, now, args.task_id]
+    );
+    if (qaMember) inReviewNudges.delete(`${teamInfo.teamId}:${qaMember.name}:${args.task_id}`);
+    const sdetMember = getTeamSDETMember(deps.db, teamInfo.teamId);
+    const callerIsSDET = isSDETMEmber(deps.db, teamInfo.teamId, caller);
+    let sdetNotified = false;
+    let sdetWakeHeld = false;
+    let qaNotified = false;
+    if (sdetMember && !callerIsSDET) {
+      const pendingDev = countPendingDevelopmentTasks(deps, teamInfo, args.task_id);
+      if (pendingDev > 0) {
+        sdetWakeHeld = true;
+        log(`tasks-complete:sdet-wake:held team=${teamInfo.teamId} task=${args.task_id} pendingDev=${pendingDev}`);
+      } else {
+        sdetNotified = wakeReviewTarget(deps, teamInfo.teamId, args.task_id, caller, sdetMember, notes, "sdet");
+      }
+    } else if (qaMember && !isQAMember(deps.db, teamInfo.teamId, caller)) {
+      qaNotified = wakeReviewTarget(deps, teamInfo.teamId, args.task_id, caller, qaMember, notes, "clara");
+    }
+    const notifiedLabel = sdetNotified && sdetMember ? ` (notified ${sdetMember.name} for deterministic tests)` : qaNotified && qaMember ? ` (notified ${qaMember.name} for review)` : "";
+    const batchHeldLabel = sdetWakeHeld && sdetMember ? ` (SDET wake held until the functional batch is consolidated)` : "";
+    const submittedUnblock = unblockDependents(deps, teamInfo, args.task_id, now);
+    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${notifiedLabel}${batchHeldLabel}${formatUnblockedSuffix(submittedUnblock.unblocked, submittedUnblock.wokeMembers)}`;
+  }
+  const isReject = args.action === "reject" || args.action === "reject_review" || task.status === "in_review" && (args.action === "in_progress" || args.status === "in_progress");
+  if (isReject) {
+    if (task.status !== "in_review") {
+      throw new Error(`Task "${args.task_id}" is not in review (current status: ${task.status})`);
+    }
+    const rejecterIsQA = isQAMember(deps.db, teamInfo.teamId, caller);
+    const rejecterIsSDET = isSDETMEmber(deps.db, teamInfo.teamId, caller);
+    if (teamInfo.role !== "lead" && !rejecterIsQA && !rejecterIsSDET) {
+      const rejecters = getTeamSDETMember(deps.db, teamInfo.teamId) ? `${qaLabel}, the SDET, or the team lead` : `${qaLabel} or the team lead`;
+      throw new Error(`Only ${rejecters} can reject tasks in review`);
+    }
+    if (rejecterIsQA || rejecterIsSDET) {
+      if (task.assignee && caller === task.assignee) {
+        throw new Error(`Task "${args.task_id}" is assigned to you; you cannot reject your own review (auto-review is forbidden)`);
+      }
+    }
+    const newRejectionCount = (task.rejection_count ?? 0) + 1;
+    deps.db.run(
+      "UPDATE team_task SET status = 'in_progress', rejection_count = ?, review_notes = ?, time_updated = ? WHERE id = ?",
+      [newRejectionCount, notes, now, args.task_id]
+    );
+    let notifiedAssignee = "";
+    if (task.assignee && task.assignee !== caller) {
+      const notified = notifyRejectedImplementer(
+        deps,
+        teamInfo.teamId,
+        args.task_id,
+        caller,
+        task.assignee,
+        notes,
+        rejecterIsSDET && !rejecterIsQA
+      );
+      if (notified) notifiedAssignee = ` (notified ${task.assignee})`;
+    }
+    return `Rejected task: ${task.content} (rejection #${newRejectionCount})${notes ? ` - ${notes}` : ""}${notifiedAssignee}`;
+  }
+  if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`);
+  if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`);
+  if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`);
+  if (task.status === "in_review") {
+    if (teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {
+      if (isSDETMEmber(deps.db, teamInfo.teamId, caller)) {
+        throw new Error(`Task "${args.task_id}" is in review; the SDET runs the deterministic suite but cannot approve \u2014 only ${qaLabel} or the team lead can complete it`);
+      }
+      throw new Error(`Task "${args.task_id}" is in review; only ${qaLabel} or the team lead can complete it`);
+    }
+  } else if (task.status === "in_progress" && task.assignee && teamInfo.role !== "lead" && caller !== task.assignee) {
+    throw new Error(`Task "${args.task_id}" is claimed by ${task.assignee}`);
+  }
+  if (task.assignee) {
+    deps.db.run("UPDATE team_task SET status = 'completed', time_updated = ? WHERE id = ?", [now, args.task_id]);
+  } else {
+    const result = deps.db.run(
+      "UPDATE team_task SET status = 'completed', assignee = ?, time_updated = ? WHERE id = ? AND assignee IS NULL",
+      [caller, now, args.task_id]
+    );
+    if (result.changes === 0) {
+      throw new Error(`Task "${args.task_id}" was just completed by another teammate`);
+    }
+  }
+  const { unblocked, wokeMembers } = unblockDependents(deps, teamInfo, args.task_id, now);
   const counts = deps.db.query(
     "SELECT status, COUNT(*) as c FROM team_task WHERE team_id = ? GROUP BY status"
   ).all(teamInfo.teamId);
@@ -3370,15 +3782,12 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
       }
     }
   }
-  let unblockedMsg = "";
-  if (unblocked > 0) {
-    unblockedMsg = ` (unblocked ${unblocked} task${unblocked !== 1 ? "s" : ""}`;
-    if (wokeMembers > 0) {
-      unblockedMsg += `, woke ${wokeMembers} member${wokeMembers !== 1 ? "s" : ""}`;
-    }
-    unblockedMsg += ")";
+  let commitSuffix = "";
+  if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {
+    const sinceMs = resolveFreshnessSince(deps, teamInfo.teamId, task.time_created);
+    commitSuffix = await autoCommitApprovedTask(deps, task.content, sinceMs);
   }
-  return `Completed task: ${task.content}${unblockedMsg}`;
+  return `Completed task: ${task.content}${formatUnblockedSuffix(unblocked, wokeMembers)}${commitSuffix}`;
 }
 async function executeTeamTasksReview(deps, args, sessionId) {
   return executeTeamTasksComplete(deps, { ...args, action: "submit_review" }, sessionId);
@@ -4310,7 +4719,7 @@ async function registerV2Tools(domain, deps) {
         type: "object",
         properties: {
           task_id: str("ID of the task to mark complete, submit for review, or reject"),
-          action: str("Action: 'complete' (default), 'submit_review', or 'reject'"),
+          action: str("Action: 'complete' (default), 'submit_review', 'reject', or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate)"),
           notes: str("Review notes or rejection reason")
         },
         required: ["task_id"],
@@ -4870,10 +5279,32 @@ function buildTeammateSystemPrompt(db, teamId, memberName, config) {
     "Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit on specific files. Never dump files >300 lines or raw command outputs into context.",
     "",
     "DELIVERY CONTRACT:",
-    "For partial or in-progress work, use team_tasks_complete(task_id, action: 'submit_review', notes: '...') as the SINGLE delivery channel.",
-    "Do NOT also send a redundant team_message(to: 'lead') for partial work \u2014 report to the lead only when the task is fully complete.",
+    "Intermediate interactions and partial/in-progress deliveries during development happen EXCLUSIVELY via team_message(to: '<colleague>') \u2014 coordinate peer-to-peer; never open a review for partial work.",
+    "submit_review is the SINGLE channel for the FINAL consolidation of the functionality: it moves the card in_progress -> in_review and wakes the reviewer. Use it ONLY when the deliverable is complete.",
+    "Do NOT send a redundant team_message(to: 'lead') for partial work \u2014 report to the lead only when the task is fully complete.",
     "If a genuinely blocking decision requires the lead, escalate with decision_lead instead of a best-effort message."
   ];
+  const roomSdet = getTeamSDETMember(db, teamId);
+  if (roomSdet && isSDETMEmber(db, teamId, memberName) && memberName === roomSdet.name) {
+    lines.push(
+      "",
+      "SDET HANDOVER:",
+      "You are the deterministic-test engineer (SDET) for this room. After you submit a task via submit_review, the Quality Gate reviewer is woken automatically \u2014 do not audit your own delivery and do not message the reviewer directly to hand off.",
+      "Once your REAL deterministic suite for a delivery in 'in_review' is 100% green, record the verdict with team_tasks_complete(action: 'sdet_pass', notes: '...') \u2014 the Quality Gate reviewer is woken automatically to audit (never approve the card yourself via action: 'complete')."
+    );
+  } else if (roomSdet && !isQAMember(db, teamId, memberName)) {
+    lines.push(
+      "",
+      "SDET HANDOVER:",
+      `After submitting a task via submit_review, pass the baton exclusively to the SDET (${roomSdet.name}) via team_message(to: '${roomSdet.name}') for the deterministic test suite. The Quality Gate is NOT a direct peer for you \u2014 it only enters after the SDET verdict.`
+    );
+  } else if (roomSdet) {
+    lines.push(
+      "",
+      "QUALITY GATE ORDER:",
+      `Wait for the SDET's (${roomSdet.name}) deterministic test suite before auditing: implementers pass the baton to the SDET after submit_review, and only then is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`
+    );
+  }
   const pendingMessages = db.query(
     "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND to_name = ? AND delivered = 0 ORDER BY time_created ASC"
   ).all(teamId, memberName);
@@ -6597,7 +7028,7 @@ async function setupEnsemble(ctx, options = {}) {
 // src/index.ts
 import { tool } from "@opencode-ai/plugin";
 import { OpencodeClient } from "@opencode-ai/sdk/v2";
-import path5 from "node:path";
+import path6 from "node:path";
 import { mkdirSync } from "node:fs";
 
 // src/client.ts
@@ -6666,12 +7097,12 @@ function wrapThrowingClient(raw, agentResolver) {
 // src/watchdog.ts
 init_merge_helper();
 import { createRequire as createRequire2 } from "node:module";
-import path4 from "node:path";
+import path5 from "node:path";
 init_log();
 var requireSessionModule = createRequire2(import.meta.url);
 function sessionStorePath(env = process.env) {
   const home = env.HOME ?? env.USERPROFILE ?? "~";
-  return path4.join(home, ".local", "share", "opencode", "opencode.db");
+  return path5.join(home, ".local", "share", "opencode", "opencode.db");
 }
 function openSessionStore(dbPath) {
   if (typeof process.versions.bun === "string") {
@@ -6892,9 +7323,10 @@ var Watchdog = class _Watchdog {
       const unfinishedCount = taskCountRow?.count ?? 0;
       if (unfinishedCount === 0) continue;
       const qa = getTeamQAMember(this.db, team.id);
-      const busyMember = qa ? this.db.query(
-        "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
-      ).get(team.id, qa.name) : this.db.query(
+      if (qa && (qa.status === "busy" || qa.executionStatus === "starting" || qa.executionStatus === "running")) {
+        continue;
+      }
+      const busyMember = this.db.query(
         "SELECT name FROM team_member WHERE team_id = ? AND (status = 'busy' OR execution_status IN ('starting', 'running')) LIMIT 1"
       ).get(team.id);
       if (busyMember) continue;
@@ -7046,7 +7478,7 @@ var DEFAULT_RATE_LIMIT_INTERVAL_MS = 1e3;
 var DEFAULT_WATCHDOG_CHECK_MS = 60 * 1e3;
 var plugin = async (input) => {
   const dbPath = getDbPath();
-  mkdirSync(path5.dirname(dbPath), { recursive: true });
+  mkdirSync(path6.dirname(dbPath), { recursive: true });
   const db = createDb(dbPath);
   const config = loadConfig(input.directory);
   const registry = new MemberRegistry();
@@ -7485,7 +7917,7 @@ var plugin = async (input) => {
         description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
         args: {
           task_id: tool.schema.string().describe("ID of the task to mark complete, submit for review, or reject"),
-          action: tool.schema.string().optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), or 'reject' (in_review -> in_progress)"),
+          action: tool.schema.string().optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), 'reject' (in_review -> in_progress), or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate)"),
           notes: tool.schema.string().optional().describe("Review notes or rejection reason")
         },
         async execute(args, ctx) {
@@ -7661,6 +8093,7 @@ export {
   executeTeamTasksReview,
   failoverCooldown,
   getTeamQAMember,
+  getTeamSDETMember,
   handleRetryModelFailover,
   hasActivePeerDialogue,
   hasAwaitingLeadDecision,
@@ -7670,6 +8103,7 @@ export {
   hasPendingBoardTasks,
   inReviewNudges,
   isQAMember,
+  isSDETMEmber,
   lastRoomActivity,
   markAwaitingLeadDecision,
   setMemberStandby,

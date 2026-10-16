@@ -11,7 +11,7 @@ import {
   selectFallbackModel,
 } from "../config"
 import { log } from "../log"
-import { getTeamQAMember } from "../qa-role"
+import { getTeamQAMember, getTeamSDETMember } from "../qa-role"
 import type { EnsembleConfig } from "../config"
 import { getTeamResourceParts, teamWorktreeName } from "./merge-helper"
 import { existsSync, readFileSync } from "node:fs"
@@ -121,7 +121,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  */
 export async function executeTeamSpawn(
   deps: ToolDeps,
-  args: { name: string; agent?: string | null; prompt: string; model?: string; claim_task?: string; worktree?: boolean; plan_approval?: boolean; standby?: boolean; role?: "qa" | "member"; is_qa?: boolean },
+  args: { name: string; agent?: string | null; prompt: string; model?: string; claim_task?: string; worktree?: boolean; plan_approval?: boolean; standby?: boolean; role?: "qa" | "member" | "sdet"; is_qa?: boolean },
   sessionId: string,
 ): Promise<string> {
   // Normalize agent: the tool schema defaults to "build", but Zod's .default()
@@ -151,7 +151,11 @@ export async function executeTeamSpawn(
   // SDET / Test Engineering role detection (agnostic): the canonical test-
   // engineering persona is "hugo" — matched either as the explicit agent type
   // or via the base persona of a multi-instance name ("hugo-sdet" → "hugo").
+  // An explicit `role: "sdet"` arg (direct API; V1/V2 tool schemas keep the
+  // ["qa","member"] enum) also marks the member as SDET and is persisted in
+  // team_member.role (Migration 16) so qa-role.ts can resolve it back.
   const isHugo = basePersonaName === "hugo" || agent === "hugo"
+  const spawnIsSDET = isHugo || args.role === "sdet"
 
   // Quality Gate role detection (agnostic): explicit `role: "qa"` / `is_qa: true`
   // args OR the retrocompat signals (agent "clara", base persona "clara"). The
@@ -182,15 +186,18 @@ export async function executeTeamSpawn(
   }
 
   // SDET / Test Engineering uniqueness lock: engineering-audit roles are
-  // exclusive. While another ACTIVE SDET (canonical persona "hugo", matched by
-  // agent type or by the base persona of a multi-instance name such as
-  // "hugo-sdet") exists in the team, no second SDET may spawn. Deterministic,
+  // exclusive. While another ACTIVE SDET exists in the team (qa-role.ts:
+  // role='sdet' flag, agent type "hugo", or base persona of a multi-instance
+  // name such as "hugo-sdet"), no second SDET may spawn. Deterministic,
   // fail-fast (before any worktree/session side effect).
-  if (isHugo) {
-    const activeMembers = deps.db.query(
-      "SELECT name, agent FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error')",
-    ).all(teamInfo.teamId) as Array<{ name: string; agent: string }>
-    const existingSDET = activeMembers.find(m => resolveBasePersona(m.name) === "hugo" || m.agent === "hugo")
+  //
+  // Message shape (runtime-asserted by test_hugo_sdet_integration — keep the
+  // template byte-stable):
+  //   Engenheiro de Testes 'hugo' já está ativo na equipe '<team>'.
+  //   Papéis de engenharia de testes são exclusivos e não admitem
+  //   instâncias concorrentes.
+  if (spawnIsSDET) {
+    const existingSDET = getTeamSDETMember(deps.db, teamInfo.teamId)
     if (existingSDET) {
       throw new Error(
         `Engenheiro de Testes 'hugo' já está ativo na equipe '${teamInfo.teamName}'. Papéis de engenharia de testes são exclusivos e não admitem instâncias concorrentes.`,
@@ -202,6 +209,12 @@ export async function executeTeamSpawn(
   // so a first-time QA spawn doesn't address itself in its own peer-to-peer
   // template below (subsequent spawns will see it once inserted).
   const roomQa = getTeamQAMember(deps.db, teamInfo.teamId)
+
+  // Room's existing SDET resolved BEFORE this member's INSERT — same rationale
+  // as roomQa. Consumed by the SDET-first delivery templates below (TASK-02):
+  // implementers hand the baton to the SDET; the Quality Gate waits for the
+  // deterministic suite (see team-tasks-complete submit_review routing).
+  const roomSdet = spawnIsSDET ? null : getTeamSDETMember(deps.db, teamInfo.teamId)
 
   const isReadOnly = agent === "plan" || agent === "explore"
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory)
@@ -248,8 +261,10 @@ export async function executeTeamSpawn(
   // regardless of the room's membership or board state — because its role is
   // reactive (design and validate deliveries) and it must not burn tokens
   // speculating before work lands. Only an explicit `standby: false` overrides
-  // this default.
-  if (!autoStandby && isHugo && args.standby !== false) {
+  // this default. Also covers explicit `role: "sdet"` members (direct API).
+  // NOTE: the reason string is runtime-asserted by test_hugo_sdet_integration —
+  // keep it byte-stable.
+  if (!autoStandby && spawnIsSDET && args.standby !== false) {
     autoStandby = true
     autoStandbyReason = "hugo sdet default standby"
     log(`spawn:auto-standby member=${args.name} agent=${agent} reason=hugo_sdet_default`)
@@ -446,8 +461,8 @@ export async function executeTeamSpawn(
   if (fallbackModel) log(`spawn:fallback name=${args.name} agent=${agent} fallback=${formatModelSelector(fallbackModel)}`)
 
   deps.db.run(
-    `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, is_qa, time_created, time_updated)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, is_qa, role, time_created, time_updated)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       teamInfo.teamId, args.name, childSessionId, agent,
       // Standby members are born 'ready'/'standby', not 'busy'/'starting':
@@ -457,7 +472,12 @@ export async function executeTeamSpawn(
       useStandby ? "ready" : "busy",
       useStandby ? "standby" : "starting",
       resolvedModel ?? null, args.prompt, worktreeDir, worktreeBranch, workspaceId, planApproval,
-      spawnIsQA ? 1 : 0, now, now,
+      spawnIsQA ? 1 : 0,
+      // Explicit role designation (Migration 16): only 'sdet' is persisted here
+      // — the Quality Gate reviewer is already flagged by is_qa (Migration 14),
+      // so writing 'qa' as well would duplicate sources of truth.
+      spawnIsSDET ? "sdet" : null,
+      now, now,
     ]
   )
 
@@ -605,38 +625,80 @@ export async function executeTeamSpawn(
     )
   }
 
-  // Quality Gate peer-to-peer clause: addresses the room's existing reviewer by
-  // its actual name (roomQa resolved pre-INSERT). Teams without a reviewer get
-  // the generic fallback instead of a dangling reference to a non-member.
+  // HARNESS-23 (TASK-02) delivery-flow peers, resolved pre-INSERT:
+  //   1. This member IS the SDET → submit_review wakes the Quality Gate by
+  //      itself (team-tasks-complete SDET-first routing) — no peer message.
+  //   2. The room has an SDET (and this member is not it) → the baton goes
+  //      EXCLUSIVELY to the SDET for the deterministic test suite; the Quality
+  //      Gate is not cited in implementer prompts at all — it only enters after
+  //      the SDET verdict, via the automatic wake.
+  //   3. No SDET in the room → legacy QA peer-to-peer clause (retrocompat —
+  //      byte-stable, runtime-asserted by test_agnostic_qa_role A.10).
+  //   4. Nobody to review → generic fallback (no dangling member references).
   const qaPeerName = roomQa?.name
+  const sdetPeerName = roomSdet?.name ?? null
+  const finishStep2 = (claimScope: "a task" | "a standalone task"): string => {
+    const tail = claimScope === "a standalone task"
+      ? "Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete."
+      : "Otherwise, if you claimed a task, mark it complete using team_tasks_complete."
+    if (spawnIsSDET) {
+      return `2. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) — the Quality Gate reviewer is woken automatically after your deterministic suite is submitted. Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. ${tail}`
+    }
+    if (sdetPeerName) {
+      return `2. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes), then pass the baton exclusively to the SDET ${sdetPeerName} via team_message(to: '${sdetPeerName}') for the deterministic test suite. Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. ${tail}`
+    }
+    if (qaPeerName) {
+      return claimScope === "a standalone task"
+        ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so ${qaPeerName} can validate and approve. Coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`
+        : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`
+    }
+    return claimScope === "a standalone task"
+      ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`
+      : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`
+  }
+
+  // Role-specific delivery orientation (TASK-02): the SDET runs real
+  // deterministic suites and never self-audits; the Quality Gate guardian
+  // waits for the SDET verdict before auditing. A guardian spawned BEFORE the
+  // SDET still receives the wait-order via the per-turn system prompt
+  // (buildTeammateSystemPrompt), so coverage does not depend on spawn order.
+  if (spawnIsSDET) {
+    context.push(
+      "",
+      "SDET ORIENTATION:",
+      "You are the deterministic-test engineer (SDET). Design and run REAL deterministic test suites (never mocks). After you submit a task via submit_review, the Quality Gate reviewer is woken automatically — do not audit your own delivery.",
+      "When you have verified a delivery in 'in_review' with a REAL deterministic suite that is 100% green, record the verdict with team_tasks_complete(action: 'sdet_pass', notes: '...') — it hands the baton to the Quality Gate reviewer automatically (never approve the card yourself via action: 'complete').",
+    )
+  } else if (spawnIsQA && sdetPeerName) {
+    context.push(
+      "",
+      "QUALITY GATE ORIENTATION:",
+      `Wait for the SDET's (${sdetPeerName}) deterministic test suite before auditing: implementers pass the baton to the SDET after submit_review, and only then is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`,
+    )
+  }
+
   context.push("", "When you finish your task:")
   if (!isReadOnly && worktreeBranch) {
     context.push(`1. Commit your changes: git add -A && git commit -m "your summary"`)
-    context.push(
-      qaPeerName
-        ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). For partial or in-progress deliveries, submit_review is the SINGLE channel — do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`
-        : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). For partial or in-progress deliveries, submit_review is the SINGLE channel — do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`,
-    )
+    context.push(finishStep2("a task"))
     context.push(
       "3. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:",
     )
   } else if (!isReadOnly) {
     context.push(
-      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for Quality Gate inspection and anti-early-commit governance).",
+      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for inspection and anti-early-commit governance). The runtime commits the shared workspace LOCALLY and automatically the moment the Quality Gate reviewer (Clara) approves your card via team_tasks_complete(action: 'complete') — no manual git commit is needed. Pushing stays reserved for the pre-push batch gate.",
     )
-    context.push(
-      qaPeerName
-        ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so ${qaPeerName} can validate and approve. Coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). For partial or in-progress deliveries, submit_review is the SINGLE channel — do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`
-        : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes). For partial or in-progress deliveries, submit_review is the SINGLE channel — do NOT also send a redundant team_message(to: 'lead'). Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.`,
-    )
+    context.push(finishStep2("a standalone task"))
     context.push(
       "3. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:",
     )
   } else {
     context.push(
-      qaPeerName
-        ? `1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). If you claimed a task, mark it complete using team_tasks_complete.`
-        : `1. If your task requires Quality Gate review or peer feedback, coordinate with the team lead via team_message. If you claimed a task, mark it complete using team_tasks_complete.`,
+      sdetPeerName && !spawnIsSDET
+        ? `1. If your task requires review or peer feedback, pass the baton to the SDET ${sdetPeerName} via team_message(to: '${sdetPeerName}') for the deterministic test suite. If you claimed a task, mark it complete using team_tasks_complete.`
+        : qaPeerName
+          ? `1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). If you claimed a task, mark it complete using team_tasks_complete.`
+          : `1. If your task requires Quality Gate review or peer feedback, coordinate with the team lead via team_message. If you claimed a task, mark it complete using team_tasks_complete.`,
     )
     context.push(
       "2. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:",
@@ -663,7 +725,7 @@ export async function executeTeamSpawn(
     "ANTI-DUMPING DIRECTIVE: Never run open grep or broad shell scans across codebases. Use targeted search tools (e.g. qmd_search, ripgrep) or targeted read/edit. Keep command outputs concise — never dump files >300 lines.",
     "",
     "MANDATORY CLOSING RULE: Approval without tools does not exist. It is strictly forbidden to finish your response with only plain text or Markdown. When concluding any task or audit/review, you MUST execute:",
-    "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' if submitting for review — the SINGLE channel for partial/in-progress deliveries)",
+    "1. team_tasks_complete(task_id: '...', action: 'complete' | 'reject') (or action: 'submit_review' ONLY for the final consolidation of the functionality — intermediate/partial work is coordinated via team_message)",
     "2. team_message(to: 'lead', text: '<task-result>...') — ONLY on final completion. Do NOT duplicate a partial/in-progress report via team_message(to: 'lead').",
     "",
     "Your plain text output is NOT visible to the team. You MUST use team_message to communicate.",

@@ -233,7 +233,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
         type: "object",
         properties: {
           task_id: str("ID of the task to mark complete, submit for review, or reject"),
-          action: str("Action: 'complete' (default), 'submit_review', or 'reject'"),
+          action: str("Action: 'complete' (default), 'submit_review', 'reject', or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate)"),
           notes: str("Review notes or rejection reason"),
         },
         required: ["task_id"],

@@ -53,6 +53,11 @@ const SUITES = [
   { file: "test_hugo_sdet_integration.mjs", label: "Hugo/SDET (Standby default, Trava de Exclusividade & Paridade V1↔V2)" },
   { file: "test_decision_lead_anti_redundancy.mjs", label: "HARNESS-22 (decision_lead, Pausa da Clara & Anti-Redundância)" },
   { file: "test_global_agent_injection.mjs", label: "HARNESS-21 (Injeção Global de Persona: choke point V1 + transporte V2)" },
+  { file: "test_sdet_handover_flow.mjs", label: "HARNESS-23 (Handover SDET: submit_review SDET-first, retrocompat Clara & prova de mutação)" },
+  { file: "test_sdet_dependency_unblock.mjs", label: "HARNESS-24 (Desrepresamento no submit_review: SDET/QA blocked→in_progress, contrato estrito & prova de mutação)" },
+  { file: "test_harness25_guardians.mjs", label: "HARNESS-25 (Guardiões em in_review: reject SDET, complete QA, guarda de lote consolidado & expurgo textual)" },
+  { file: "test_auto_commit_on_complete.mjs", label: "HARNESS-26A (Auto-commit local nativo no complete QA/lead: git real em sandbox, árvore limpa, não-repo, aninhado, fail-graceful, injeção & prova de mutação)" },
+  { file: "test_multi_repo_commit_and_sdet_pass.mjs", label: "HARNESS-27A/27B (Auto-commit multi-repo: room+aninhado, frescor de irmãos & sdet_pass: autorização, estado, card em in_review, wake canônico da Clara, git real + prova de mutação)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

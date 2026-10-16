@@ -288,6 +288,11 @@ check(
   JSON.stringify(srcMemberModel.parseModelId("google/antigravity-gemini-3.8-flash#low")),
 );
 check(
+  "parseModelId: sentinela #default é normalizado para ausência de variant",
+  eq(srcMemberModel.parseModelId("google/antigravity-gemini-3.8-flash#default"), { providerID: "google", modelID: "antigravity-gemini-3.8-flash" }),
+  JSON.stringify(srcMemberModel.parseModelId("google/antigravity-gemini-3.8-flash#default")),
+);
+check(
   "parseModelId: malformados continuam retornando undefined",
   srcMemberModel.parseModelId("") === undefined && srcMemberModel.parseModelId("sem-barra") === undefined,
 );

@@ -1,17 +1,8 @@
 import type { Database } from "./db"
+import { parseModelSelector, type ParsedModelSelector } from "./config"
 
 /** A parsed provider/model pair, as accepted by session.promptAsync. */
-export interface ParsedModel {
-  providerID: string
-  modelID: string
-  /**
-   * Thinking-level variant from an OpenCode selector suffix (e.g. "#low" in
-   * "google/antigravity-gemini-3.8-flash#low"). It is never folded into
-   * `modelID` — it rides along in the prompt body as `model.variant` so the
-   * server can resolve variant overlays at request time.
-   */
-  variant?: string
-}
+export type ParsedModel = ParsedModelSelector
 
 /**
  * Parse a "provider/model" string into { providerID, modelID } for the SDK.
@@ -20,16 +11,12 @@ export interface ParsedModel {
  * An optional "#variant" suffix (OpenCode selector format, e.g.
  * "google/antigravity-gemini-3.8-flash#low") is stripped here — variants
  * travel via promptAsync's model.variant, never inside modelID.
+ *
+ * Delegates to parseModelSelector to ensure server sentinels like `#default`
+ * are normalized away into absence of variant.
  */
 export function parseModelId(model: string): ParsedModel | undefined {
-  const hash = model.indexOf("#")
-  const variant = hash >= 0 ? model.slice(hash + 1) : undefined
-  const base = hash >= 0 ? model.slice(0, hash) : model
-  const slash = base.indexOf("/")
-  if (slash <= 0 || slash === base.length - 1) return undefined
-  const parsed: ParsedModel = { providerID: base.slice(0, slash), modelID: base.slice(slash + 1) }
-  if (variant) parsed.variant = variant
-  return parsed
+  return parseModelSelector(model)
 }
 
 /**

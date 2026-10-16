@@ -27,7 +27,7 @@ export { executeDecisionLead, markAwaitingLeadDecision, clearAwaitingLeadDecisio
 // Central QA-reviewer helpers (Migration 14) — exported so wake/CC/watchdog
 // consumers and deterministic test harnesses can resolve the reviewer without
 // hardcoding the string "clara". See src/qa-role.ts for the lookup contract.
-export { isQAMember, getTeamQAMember, type QAMemberInfo } from "./qa-role"
+export { isQAMember, getTeamQAMember, isSDETMEmber, getTeamSDETMember, type QAMemberInfo, type SDETMemberInfo } from "./qa-role"
 export { buildTeammateSystemPrompt, buildLeadSystemPrompt } from "./system-prompt"
 export { lastRoomActivity } from "./config"
 export { Watchdog } from "./watchdog"
@@ -669,7 +669,7 @@ const plugin: Plugin = async (input) => {
         description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
         args: {
           task_id: tool.schema.string().describe("ID of the task to mark complete, submit for review, or reject"),
-          action: tool.schema.string().optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), or 'reject' (in_review -> in_progress)"),
+          action: tool.schema.string().optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), 'reject' (in_review -> in_progress), or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate)"),
           notes: tool.schema.string().optional().describe("Review notes or rejection reason"),
         },
         async execute(args, ctx) {
