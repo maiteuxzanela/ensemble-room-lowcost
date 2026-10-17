@@ -505,24 +505,38 @@ function handleDashboardRequest(
 
           if (options?.client && pending.length) {
             // HARNESS-35 — same model/agent/standby preservation as the DM path.
+            // The raw promises are kept UNWRAPPED: attaching `.catch()` here would
+            // turn every rejection into a `fulfilled` allSettled entry and make
+            // the partial-failure guard below vacuously true.
             const deliveries = pending.map((m) => {
               const wake = resolveStandbyWake(db, teamId, m.name, `[Team broadcast from human]: ${text}`)
               const model = getMemberModel(db, teamId, m.name)
               const agent = wake.agent ?? m.agent ?? undefined
-              return options.client!.session.promptAsync({
+              return { name: m.name, promise: options.client!.session.promptAsync({
                 sessionID: m.session_id,
                 parts: [{ type: "text", text: wake.text }],
                 synthetic: true,
                 ...(agent ? { agent } : {}),
                 ...(model ? { model } : {}),
-              }).catch((err: unknown) => log(`dashboard:chat broadcast failed to ${m.name} err=${err}`))
+              }) }
             })
 
             // The broadcast is persisted as a single shared row (to_name = NULL),
             // so stamp it delivered only once every recipient transport settled
-            // successfully; a partial failure leaves it pending for recovery.
-            Promise.allSettled(deliveries).then((settled) => {
-              if (settled.every((s) => s.status === "fulfilled")) markDelivered(db, messageId)
+            // successfully; a partial rejection leaves it delivered=0 so the
+            // recovery sweep replays it (matching broadcastMessageFanout's
+            // per-recipient delivered tracking intent).
+            Promise.allSettled(deliveries.map((d) => d.promise)).then((settled) => {
+              const failed = settled
+                .map((s, i) => ({ s, name: deliveries[i]!.name }))
+                .filter(({ s }) => s.status === "rejected")
+              if (failed.length === 0) {
+                markDelivered(db, messageId)
+              } else {
+                for (const { s, name } of failed) {
+                  log(`dashboard:chat broadcast failed to ${name} err=${s.status === "rejected" ? s.reason : "-"}`)
+                }
+              }
             }).catch(() => { /* best effort — never crash the response path */ })
           }
         } else if (to === "lead") {

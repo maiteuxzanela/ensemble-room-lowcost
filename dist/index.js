@@ -6797,16 +6797,23 @@ function handleDashboardRequest(db, port, req, res, options) {
               const wake = resolveStandbyWake(db, teamId, m.name, `[Team broadcast from human]: ${text}`);
               const model = getMemberModel(db, teamId, m.name);
               const agent = wake.agent ?? m.agent ?? void 0;
-              return options.client.session.promptAsync({
+              return { name: m.name, promise: options.client.session.promptAsync({
                 sessionID: m.session_id,
                 parts: [{ type: "text", text: wake.text }],
                 synthetic: true,
                 ...agent ? { agent } : {},
                 ...model ? { model } : {}
-              }).catch((err) => log(`dashboard:chat broadcast failed to ${m.name} err=${err}`));
+              }) };
             });
-            Promise.allSettled(deliveries).then((settled) => {
-              if (settled.every((s) => s.status === "fulfilled")) markDelivered(db, messageId);
+            Promise.allSettled(deliveries.map((d) => d.promise)).then((settled) => {
+              const failed = settled.map((s, i) => ({ s, name: deliveries[i].name })).filter(({ s }) => s.status === "rejected");
+              if (failed.length === 0) {
+                markDelivered(db, messageId);
+              } else {
+                for (const { s, name } of failed) {
+                  log(`dashboard:chat broadcast failed to ${name} err=${s.status === "rejected" ? s.reason : "-"}`);
+                }
+              }
             }).catch(() => {
             });
           }
