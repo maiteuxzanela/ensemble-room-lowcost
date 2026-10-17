@@ -462,6 +462,41 @@ export interface SessionErrorPayload {
 }
 
 /**
+ * Error NAMES that mean the turn was stopped ON PURPOSE (TICKET-HARNESS-34 A2).
+ * OpenCode's session.abort() surfaces `MessageAbortedError`; other SDK layers
+ * use `AbortError`/`InterruptedError`.
+ */
+const ABORT_ERROR_NAME = /abort|interrupt/i
+
+/**
+ * Error MESSAGE signatures of an intentional abort — the host's canonical
+ * wording is "The running turn was stopped before OpenCode could send the next
+ * message.", but failover/timeout/forced-shutdown paths may surface a variant
+ * that names the mechanism explicitly. Generic words like "error" or "failed"
+ * are deliberately NOT matched: a real model/tool failure must stay visible.
+ */
+const ABORT_ERROR_MESSAGE =
+  /\babort(?:ed|ing|s)?\b|\bstopped before opencode\b|\bwas (?:intentionally )?(?:stopped|interrupted|cancell?ed)\b|\bforce(?:d)?[ -]shutdown\b|\b(?:failover|timeout)[ -]?abort\b/i
+
+/**
+ * True when a `session.error` payload is an INTENTIONAL abort — the noise
+ * emitted after `session.abort()` from a rate-limit failover, a watchdog
+ * timeout or a forced shutdown.
+ *
+ * TICKET-HARNESS-34 (A2): the host fires `session.error` with
+ * `MessageAbortedError` on every abort, including the ones the plugin itself
+ * triggers on purpose. Notifying the lead there produced a false "teammate had
+ * a session error" alarm — and, with silentLead off, a spurious wake — on a
+ * turn that was stopped by design. Filtered events only log.
+ */
+export function isAbortError(error: SessionErrorPayload | undefined): boolean {
+  if (!error) return false
+  if (error.name && ABORT_ERROR_NAME.test(error.name)) return true
+  const message = error.data?.message ?? ""
+  return message.length > 0 && ABORT_ERROR_MESSAGE.test(message)
+}
+
+/**
  * Handle a session.error event. Surfaces tool/model failures from a teammate
  * as a system message to the lead, so otherwise-silent failures are visible.
  *
@@ -473,6 +508,9 @@ export interface SessionErrorPayload {
  * Ignored when:
  * - sessionID is undefined
  * - the session is not a registered teammate (leads are not in the registry)
+ * - the error is an INTENTIONAL abort (TICKET-HARNESS-34 A2 — failover,
+ *   watchdog timeout or forced shutdown call session.abort(), and the host's
+ *   MessageAbortedError for that turn must not raise a false lead alarm).
  */
 export function handleSessionErrorEvent(
   db: Database,
@@ -489,6 +527,15 @@ export function handleSessionErrorEvent(
   const teamInfo = findTeamBySession(db, registry, sessionId)
   if (!teamInfo || teamInfo.role !== "member" || !teamInfo.memberName) return
 
+  // TICKET-HARNESS-34 (A2) — abort/failover noise filter, BEFORE any notify.
+  // The turn was stopped on purpose (failover, timeout, force shutdown):
+  // persist nothing, wake nobody, only log the decision.
+  if (isAbortError(error)) {
+    const abortMsg = error?.data?.message ?? error?.name ?? "aborted"
+    log(`session-error:aborted member=${teamInfo.memberName} team=${teamInfo.teamId} err=${abortMsg}`)
+    return
+  }
+
   const errMsg = error?.data?.message ?? error?.name ?? "unknown error"
   notifyLead(
     client,
@@ -498,7 +545,9 @@ export function handleSessionErrorEvent(
     // HARNESS-15 B: when the caller threads the config through, the wake is
     // model-aware (agent + fallback-chain ladder inside notifyLead). Omitting
     // it keeps the legacy wake — retrocompatible for callers without config.
-    config ? { config } : undefined,
+    // TICKET-HARNESS-34 (A1): a GENUINE (non-abort) session error is an
+    // unrecoverable failure — it must punch through `silentLead`.
+    config ? { config, forceWake: true } : { forceWake: true },
   )
 }
 

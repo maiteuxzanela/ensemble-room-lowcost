@@ -996,6 +996,20 @@ export async function executeTeamTasksComplete(
   if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`)
   if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`)
 
+  // TICKET-HARNESS-34 (A6) — Quality Gate anti-bypass lock. When the room has
+  // an active Quality Gate reviewer, an implementer must NEVER close a card by
+  // invoking action='complete' directly: the only legitimate hand-off is
+  // submit_review (in_progress/pending -> in_review), after which the QA
+  // reviewer or the team lead owns the close. Fired BEFORE any UPDATE so the
+  // task row stays byte-identical in its ORIGINAL status (in_progress/pending)
+  // and no dependent is unblocked / no Portão 1 commit runs. The lead
+  // (sovereign override) and the QA reviewer (audit close) stay exempt.
+  if (qaMember && teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {
+    if (task.status === "in_progress" || task.status === "pending") {
+      throw new Error(`Task "${args.task_id}" cannot be completed directly by an implementer; only ${qaLabel} or the team lead can complete it after review submission via submit_review`)
+    }
+  }
+
   // Guardiã lock: if task is in_review, only the QA reviewer or Lead can approve and complete
   if (task.status === "in_review") {
     // HARNESS-25 hardened: the Quality Gate reviewer (isQAMember) approves

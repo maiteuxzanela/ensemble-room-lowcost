@@ -812,7 +812,9 @@ export async function executeTeamSpawn(
           `Teammate "${args.name}" failed to start and was removed${modelInfo}. Error: ${errMsg}. You may retry the spawn.`,
           // F2: model-aware wake — agent from team.lead_agent + fallback-chain
           // ladder with step-down (HARNESS-15 B), same as notifyLead elsewhere.
-          { config: deps.config },
+          // TICKET-HARNESS-34 (A1): a spawn that failed and was rolled back is
+          // an unrecoverable failure — forceWake punches through silentLead.
+          { config: deps.config, forceWake: true },
         )
       } catch { /* rollback failed — watchdog will clean up stale member */ }
     })

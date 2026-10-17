@@ -663,6 +663,9 @@ check(
   );
 
   // g2: opções com agent + config → ladder com degrau de retry.
+  // TICKET-HARNESS-34 (A1): com config silentLead:true (default) o wake só
+  // ocorre com forceWake:true — é o caminho de falha irrecuperável que usa a
+  // escada de modelo. O objeto abaixo isola a ESCADA.
   seedLead("team-g-ladder", "lead-g-ladder", null);
   const ladderCalls = [];
   const ladderClient = {
@@ -676,7 +679,7 @@ check(
     tui: { showToast: async () => undefined },
   };
   notifyLead(ladderClient, db, "team-g-ladder", "wake ciente do modelo", {
-    agent: "cris", config: CFG, primaryModel: "prov/primary#low",
+    agent: "cris", config: CFG, primaryModel: "prov/primary#low", forceWake: true,
   });
   await tick();
   check(
@@ -695,13 +698,15 @@ check(
   // g4: TODOS os degraus falham → mensagem continua persistida (backstop).
   // TICKET-32B: sem primaryModel explícito o degrau 0 é o MODELO NATIVO da
   // sessão (payload SEM `model`) e a cadeia global só entra como retry.
+  // TICKET-HARNESS-34 (A1): forceWake:true (falha irrecuperável) mantém o
+  // teste focado na ESCADA sob o default silentLead:true.
   seedLead("team-g-allfail", "lead-g-allfail", null);
   const failCalls = [];
   const failClient = {
     session: { promptAsync: async (opts) => { failCalls.push(opts); throw new Error("429 always"); } },
     tui: { showToast: async () => undefined },
   };
-  notifyLead(failClient, db, "team-g-allfail", "nunca entregue", { agent: "cris", config: CFG });
+  notifyLead(failClient, db, "team-g-allfail", "nunca entregue", { agent: "cris", config: CFG, forceWake: true });
   await tick();
   check(
     "g4: ladder inteiro rejeitado → 3 tentativas (nativo → global-1#low → global-2) + mensagem ainda persistida",

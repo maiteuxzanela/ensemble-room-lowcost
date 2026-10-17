@@ -121,6 +121,21 @@ export interface NotifyLeadWakeOptions {
    * sentinel — parseModelSelector normalizes it away.
    */
   primaryModel?: string
+  /**
+   * TICKET-HARNESS-34 (A1) — punches through `silentLead`.
+   *
+   * Under the economic default (`silentLead: true`) the SQLite row written by
+   * notifyLead IS the delivery channel: the lead drains it through the
+   * system-prompt transform on its next turn. The proactive promptAsync wake
+   * is therefore reserved for events the lead CANNOT recover from passively:
+   *   - unrecoverable failures (watchdog timeout + session.abort, spawn
+   *     rollback, a genuine non-abort session error);
+   *   - explicit emergencies (decision_lead, board closure) — those paths do
+   *     not go through notifyLead's silent gate, but set it for completeness.
+   * Non-fatal system noise (fast-idle, stall, chatty) MUST NOT set it: the row
+   * is persisted and the wake stays suppressed to protect the Silent Lead.
+   */
+  forceWake?: boolean
 }
 
 /** Lead wake context resolved from a team row: session id + known agent. */
@@ -243,10 +258,16 @@ export function promptModelAwareWake(
  *
  * This is the delivery path for system events (teammate errors, timeouts,
  * stalls, spawn failures). Unlike the passive wake-lead path in the event
- * hook, this ALWAYS fires a promptAsync regardless of whether teammates are
- * still busy — an errored/aborted teammate is precisely the case where the
- * "all teammates done" gate would otherwise suppress the wake and strand the
- * message in the DB with delivered=0.
+ * hook, this wakes the lead even when teammates are still busy — an
+ * errored/aborted teammate is precisely the case where the "all teammates
+ * done" gate would otherwise suppress the wake and strand the message with
+ * delivered=0.
+ *
+ * TICKET-HARNESS-34 (A1) — SILENT-LEAD COHERENCE: the message row is ALWAYS
+ * persisted, but the proactive wake obeys `silentLead` (default: true). Only
+ * `forceWake: true` (unrecoverable failures) or `silentLead: false` (legacy)
+ * reach promptModelAwareWake; every other system event is delivered passively
+ * through the lead's system prompt.
  *
  * HARNESS-15 B / TICKET-32B — MODEL-AWARE WAKE: when wake options carry the
  * config (and an agent resolves — options.agent, else team.lead_agent), the
@@ -269,6 +290,29 @@ export function notifyLead(
   options?: NotifyLeadWakeOptions,
 ): string {
   const id = sendMessage(db, { teamId, from: "system", to: "lead", content })
+
+  // TICKET-HARNESS-34 (A1) — silentLead coherence.
+  //
+  // `silentLead: true` is the product default (src/config.ts DEFAULT_CONFIG).
+  // In that mode the SQLite row written above IS the delivery channel: the
+  // lead's next turn drains it via the system-prompt transform. The proactive
+  // promptAsync wake is a token-expensive interruption, so it is emitted ONLY
+  // when one of these holds:
+  //   - `forceWake: true` — unrecoverable failure (watchdog timeout/abort,
+  //     spawn rollback, genuine non-abort session error);
+  //   - the threaded config has `silentLead: false` — legacy room that asked
+  //     for aggressive wakes;
+  //   - NO config is threaded at all — the pre-existing RETROCOMPATIBLE
+  //     contract: a caller without config has no silentLead setting to honour
+  //     and degrades to the legacy wake (watchdog-only-in-memory/test
+  //     constructions). Production call sites ALWAYS thread config.
+  // Non-fatal system noise (fast-idle, stall, chatty) is persisted silently
+  // when a config is present with the default `silentLead: true`.
+  const silentLead = options?.config !== undefined && options.config.silentLead !== false
+  if (silentLead && !options?.forceWake) {
+    log(`notifyLead:silent team=${teamId} wake=suppressed`)
+    return id
+  }
 
   const ctx = resolveLeadWakeContext(db, teamId)
   if (!ctx) return id

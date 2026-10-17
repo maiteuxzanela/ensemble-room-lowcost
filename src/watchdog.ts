@@ -203,9 +203,17 @@ export class Watchdog {
    * model-aware ladder (agent from team.lead_agent + fallback chain with
    * step-down). Without a config (legacy construction / test harnesses) it
    * degrades to the exact legacy wake — signature-safe.
+   *
+   * TICKET-HARNESS-34 (A1): `forceWake` is true ONLY for the timeout path — a
+   * member aborted by the watchdog is an unrecoverable failure the lead must
+   * act on. Stall/chatty nudges are non-fatal noise: their message row is
+   * persisted and the proactive wake stays suppressed under `silentLead`.
    */
-  private notifyLead(teamId: string, message: string): void {
-    notifyLead(this.client, this.db, teamId, message, this.config ? { config: this.config } : undefined)
+  private notifyLead(teamId: string, message: string, forceWake = false): void {
+    notifyLead(this.client, this.db, teamId, message, {
+      ...(this.config ? { config: this.config } : {}),
+      ...(forceWake ? { forceWake: true } : {}),
+    })
   }
 
   private static STALE_THRESHOLD_MS = Number(process.env.STALE_WORKTREE_THRESHOLD_MS) || 300_000
@@ -564,9 +572,13 @@ export class Watchdog {
       // Notify AND wake the lead — a timed-out teammate is otherwise a silent
       // failure. This is the "leave recovery to the lead" path: we surface the
       // timeout, we do not auto-resume the teammate.
+      // TICKET-HARNESS-34 (A1): unrecoverable failure → forceWake punches
+      // through silentLead (the member was just aborted; the lead must know).
+      // (stall/chatty above deliberately omit it — non-fatal noise.)
       this.notifyLead(
         member.team_id,
         `Teammate "${member.name}" timed out after exceeding the busy time limit and was aborted. Their in-progress work has been released. Review their session, then re-spawn or reassign the task if needed.`,
+        true,
       )
 
       // Abort session (best effort)

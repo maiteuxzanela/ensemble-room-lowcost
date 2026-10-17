@@ -226,7 +226,9 @@ const srcAll = () => [srcComplete, srcWatchdog, srcSpawn, srcNotify].join("\n");
 
   // (3) Call sites de notifyLead — hooks.ts (session.error) e index.ts
   // (fast-idle) precisam entregar o config, senão a escada reativa não existe.
-  const hooksCfg = /had a session error[\s\S]{0,900}?config \? \{ config \} : (undefined|void 0)/;
+  // TICKET-HARNESS-34 (A1): o session.error GENUÍNO (não-abort) é falha
+  // irrecuperável → repassa { config } JUNTO de forceWake: true.
+  const hooksCfg = /had a session error[\s\S]{0,900}?config \? \{ config, forceWake: true \} : \{ forceWake: true \}/;
   check("paridade 32B (src): hooks.ts handleSessionErrorEvent repassa { config }", hooksCfg.test(srcHooks), srcHooks.match(hooksCfg)?.[0].slice(-60) ?? "ausente");
   check("paridade 32B (dist): hooks.ts handleSessionErrorEvent repassa { config }", hooksCfg.test(distRaw), distRaw.match(hooksCfg)?.[0].slice(-60) ?? "ausente");
   const idxCfg = /went idle immediately after spawning[\s\S]{0,1400}?\{ config \}/;
@@ -243,11 +245,22 @@ const srcAll = () => [srcComplete, srcWatchdog, srcSpawn, srcNotify].join("\n");
   marker("F2: construtor do Watchdog persiste opts.config", "this.config = opts.config");
   check(
     "paridade F2 (src): wrapper notifyLead repassa { config } condicionalmente",
-    /this\.config \? \{ config: this\.config \} : undefined/.test(srcWatchdog),
+    /this\.config \? \{ config: this\.config \} : \{\}/.test(srcWatchdog),
   );
   check(
     "paridade F2 (dist): wrapper notifyLead repassa { config } condicionalmente",
-    /this\.config \? \{ config: this\.config \} : void 0/.test(distRaw),
+    /this\.config \? \{ config: this\.config \} : \{\}/.test(distRaw),
+  );
+  // TICKET-HARNESS-34 (A1): o wrapper ganhou o 3º parâmetro forceWake (só o
+  // timeout o usa — stall/chatty são ruído não-fatal e ficam silenciados).
+  check(
+    "paridade HARNESS-34 (src): wrapper notifyLead aceita forceWake (timeout)",
+    /notifyLead\(teamId: string, message: string, forceWake = false\)/.test(srcWatchdog) &&
+      /\.\.\.\(forceWake \? \{ forceWake: true \} : \{\}\)/.test(srcWatchdog),
+  );
+  check(
+    "paridade HARNESS-34 (dist): wrapper notifyLead aceita forceWake (timeout)",
+    /forceWake \? \{ forceWake: true \} : \{\}/.test(distRaw),
   );
   const countCalls = (text) => (text.match(/this\.notifyLead\(/g) ?? []).length;
   check(
@@ -259,9 +272,10 @@ const srcAll = () => [srcComplete, srcWatchdog, srcSpawn, srcNotify].join("\n");
 
 /* --- F2: team-spawn.ts threads config no rollback --- */
 {
-  const spawnCfg = /failed to start and was removed[\s\S]{0,600}\{ config: deps\.config \}/;
-  check("paridade F2 (src): rollback de spawn repassa { config: deps.config }", spawnCfg.test(srcSpawn), srcSpawn.match(spawnCfg)?.[0]?.slice(0, 100) ?? "ausente");
-  check("paridade F2 (dist): rollback de spawn repassa { config: deps.config }", spawnCfg.test(distRaw), distRaw.match(spawnCfg)?.[0]?.slice(0, 100) ?? "ausente");
+  // TICKET-HARNESS-34 (A1): rollback de spawn = falha irrecuperável → forceWake.
+  const spawnCfg = /failed to start and was removed[\s\S]{0,600}\{ config: deps\.config, forceWake: true \}/;
+  check("paridade F2 (src): rollback de spawn repassa { config: deps.config } + forceWake", spawnCfg.test(srcSpawn), srcSpawn.match(spawnCfg)?.[0]?.slice(0, 100) ?? "ausente");
+  check("paridade F2 (dist): rollback de spawn repassa { config: deps.config } + forceWake", spawnCfg.test(distRaw), distRaw.match(spawnCfg)?.[0]?.slice(0, 100) ?? "ausente");
 }
 
 /* ================================================================== *
@@ -562,7 +576,10 @@ async function runBehavior(label, mods) {
       ttlMs: 0, progressTracker: f.progressTracker,
       stallThresholdMs: 300_000, stallMinSteps: 3, stallTokenThreshold: 500,
       peerMessageLimit: 0, roomInactivityThresholdMs: 0,
-      config: CFG,
+      // TICKET-HARNESS-34 (A1): o cenário isola a ESCADA de modelo — com o
+      // default silentLead:true o wake de stall é (corretamente) suprimido.
+      // silentLead:false mantém o foco no degrau nativo → cadeia.
+      config: { ...CFG, silentLead: false },
     });
     const base = f.calls.promptAsync.length;
     await wd.checkStalled();
@@ -597,7 +614,9 @@ async function runBehavior(label, mods) {
       ttlMs: 0, progressTracker: f.progressTracker,
       stallThresholdMs: 0, peerMessageLimit: 2, peerMessageWindowMs: 300_000,
       roomInactivityThresholdMs: 0,
-      config: CFG,
+      // TICKET-HARNESS-34 (A1): idem B3 — chatty é ruído não-fatal; o teste
+      // isola a escada de modelo rodando com silentLead:false.
+      config: { ...CFG, silentLead: false },
     });
     const base = f.calls.promptAsync.length;
     await wd.checkChatty();

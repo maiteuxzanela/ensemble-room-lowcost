@@ -1205,6 +1205,11 @@ function promptModelAwareWake(client, params) {
 }
 function notifyLead(client, db, teamId, content, options) {
   const id = sendMessage(db, { teamId, from: "system", to: "lead", content });
+  const silentLead = options?.config !== void 0 && options.config.silentLead !== false;
+  if (silentLead && !options?.forceWake) {
+    log(`notifyLead:silent team=${teamId} wake=suppressed`);
+    return id;
+  }
   const ctx = resolveLeadWakeContext(db, teamId);
   if (!ctx) return id;
   const leadAgent = options?.agent ?? ctx.leadAgent;
@@ -1550,10 +1555,23 @@ function shouldNudgeInReviewTasks(db, teamId, memberName) {
   }
   return false;
 }
+var ABORT_ERROR_NAME = /abort|interrupt/i;
+var ABORT_ERROR_MESSAGE = /\babort(?:ed|ing|s)?\b|\bstopped before opencode\b|\bwas (?:intentionally )?(?:stopped|interrupted|cancell?ed)\b|\bforce(?:d)?[ -]shutdown\b|\b(?:failover|timeout)[ -]?abort\b/i;
+function isAbortError(error) {
+  if (!error) return false;
+  if (error.name && ABORT_ERROR_NAME.test(error.name)) return true;
+  const message = error.data?.message ?? "";
+  return message.length > 0 && ABORT_ERROR_MESSAGE.test(message);
+}
 function handleSessionErrorEvent(db, registry, client, sessionId, error, config) {
   if (!sessionId) return;
   const teamInfo = findTeamBySession(db, registry, sessionId);
   if (!teamInfo || teamInfo.role !== "member" || !teamInfo.memberName) return;
+  if (isAbortError(error)) {
+    const abortMsg = error?.data?.message ?? error?.name ?? "aborted";
+    log(`session-error:aborted member=${teamInfo.memberName} team=${teamInfo.teamId} err=${abortMsg}`);
+    return;
+  }
   const errMsg = error?.data?.message ?? error?.name ?? "unknown error";
   notifyLead(
     client,
@@ -1563,7 +1581,9 @@ function handleSessionErrorEvent(db, registry, client, sessionId, error, config)
     // HARNESS-15 B: when the caller threads the config through, the wake is
     // model-aware (agent + fallback-chain ladder inside notifyLead). Omitting
     // it keeps the legacy wake — retrocompatible for callers without config.
-    config ? { config } : void 0
+    // TICKET-HARNESS-34 (A1): a GENUINE (non-abort) session error is an
+    // unrecoverable failure — it must punch through `silentLead`.
+    config ? { config, forceWake: true } : { forceWake: true }
   );
 }
 var FAILOVER_COOLDOWN_MS = 10 * 60 * 1e3;
@@ -2890,7 +2910,9 @@ async function executeTeamSpawn(deps, args, sessionId) {
           `Teammate "${args.name}" failed to start and was removed${modelInfo}. Error: ${errMsg}. You may retry the spawn.`,
           // F2: model-aware wake — agent from team.lead_agent + fallback-chain
           // ladder with step-down (HARNESS-15 B), same as notifyLead elsewhere.
-          { config: deps.config }
+          // TICKET-HARNESS-34 (A1): a spawn that failed and was rolled back is
+          // an unrecoverable failure — forceWake punches through silentLead.
+          { config: deps.config, forceWake: true }
         );
       } catch {
       }
@@ -3888,6 +3910,11 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
   if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`);
   if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`);
   if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`);
+  if (qaMember && teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {
+    if (task.status === "in_progress" || task.status === "pending") {
+      throw new Error(`Task "${args.task_id}" cannot be completed directly by an implementer; only ${qaLabel} or the team lead can complete it after review submission via submit_review`);
+    }
+  }
   if (task.status === "in_review") {
     if (teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {
       if (isSDETMEmber(deps.db, teamInfo.teamId, caller)) {
@@ -7348,9 +7375,17 @@ var Watchdog = class _Watchdog {
    * model-aware ladder (agent from team.lead_agent + fallback chain with
    * step-down). Without a config (legacy construction / test harnesses) it
    * degrades to the exact legacy wake — signature-safe.
+   *
+   * TICKET-HARNESS-34 (A1): `forceWake` is true ONLY for the timeout path — a
+   * member aborted by the watchdog is an unrecoverable failure the lead must
+   * act on. Stall/chatty nudges are non-fatal noise: their message row is
+   * persisted and the proactive wake stays suppressed under `silentLead`.
    */
-  notifyLead(teamId, message) {
-    notifyLead(this.client, this.db, teamId, message, this.config ? { config: this.config } : void 0);
+  notifyLead(teamId, message, forceWake = false) {
+    notifyLead(this.client, this.db, teamId, message, {
+      ...this.config ? { config: this.config } : {},
+      ...forceWake ? { forceWake: true } : {}
+    });
   }
   static STALE_THRESHOLD_MS = Number(process.env.STALE_WORKTREE_THRESHOLD_MS) || 3e5;
   /** Clean up worktrees and workspaces for shutdown/error members past the stale threshold. */
@@ -7596,7 +7631,8 @@ var Watchdog = class _Watchdog {
       if (released > 0) log(`watchdog:tasks:released name=${member.name} count=${released}`);
       this.notifyLead(
         member.team_id,
-        `Teammate "${member.name}" timed out after exceeding the busy time limit and was aborted. Their in-progress work has been released. Review their session, then re-spawn or reassign the task if needed.`
+        `Teammate "${member.name}" timed out after exceeding the busy time limit and was aborted. Their in-progress work has been released. Review their session, then re-spawn or reassign the task if needed.`,
+        true
       );
       try {
         await this.client.session.abort({ sessionID: member.session_id });
