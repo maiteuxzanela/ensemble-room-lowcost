@@ -290,11 +290,11 @@ async function runRoomInactivityBehavior(label, mods, emit = true) {
   insertMember(TEAM, "clara", CLARA_SESSION, "clara", "standby", "Diretrizes de Governança Clara Quality Gate", inactiveTimestamp);
   insertMember(TEAM, "dev", DEV_SESSION, "build", "idle", null, inactiveTimestamp);
 
-  // Inserir tarefas inacabadas no board (pending, in_progress, in_review, blocked)
+  // Inserir tarefas inacabadas no board (pending, in_progress, in_review)
   insertTask("t_pend", TEAM, "Tarefa Pendente", "pending", null, inactiveTimestamp);
   insertTask("t_prog", TEAM, "Tarefa Em Progresso", "in_progress", "dev", inactiveTimestamp);
   insertTask("t_rev", TEAM, "Tarefa Em Revisão", "in_review", "dev", inactiveTimestamp);
-  insertTask("t_block", TEAM, "Tarefa Bloqueada", "blocked", null, inactiveTimestamp);
+  insertTask("t_extra", TEAM, "Tarefa Pendente Extra", "pending", null, inactiveTimestamp);
 
   const wd = new Watchdog({
     db,
@@ -503,7 +503,7 @@ async function runRoomInactivityBehavior(label, mods, emit = true) {
    * ================================================================ */
   // Colocar todas as tarefas como completed ou cancelled
   db.run("UPDATE team_task SET status = 'completed', time_updated = ? WHERE team_id = ? AND id IN ('t_pend', 't_prog', 't_rev')", [inactiveTimestamp, TEAM]);
-  db.run("UPDATE team_task SET status = 'cancelled', time_updated = ? WHERE team_id = ? AND id = 't_block'", [inactiveTimestamp, TEAM]);
+  db.run("UPDATE team_task SET status = 'cancelled', time_updated = ? WHERE team_id = ? AND id = 't_extra'", [inactiveTimestamp, TEAM]);
 
   // Forçar timestamp de atividade antigo em todas as entidades para simular ociosidade
   db.run("UPDATE team_message SET time_created = ? WHERE team_id = ?", [inactiveTimestamp, TEAM]);

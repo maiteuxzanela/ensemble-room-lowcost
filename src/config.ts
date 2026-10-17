@@ -270,11 +270,11 @@ export function selectNextFallback(
 export interface EnsembleConfig {
   /** Auto-merge worktree branches on cleanup (default: true) */
   mergeOnCleanup?: boolean
-  /** Stall detection threshold in ms (default: 180000 = 3 min, 0 to disable) */
+  /** Stall detection threshold in ms (default: 300000 = 5 min, 0 to disable) */
   stallThresholdMs?: number
-  /** Min steps before token-based stall check (default: 3) */
+  /** Min steps before token-based stall check (default: 5) */
   stallMinSteps?: number
-  /** Output token threshold for stall detection (default: 500) */
+  /** Output token threshold for stall detection (default: 200) */
   stallTokenThreshold?: number
   /** Hard timeout for busy members in ms (default: 1800000 = 30 min, 0 to disable) */
   timeoutMs?: number

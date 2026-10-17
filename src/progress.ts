@@ -59,21 +59,36 @@ export class ProgressTracker {
     return this.chattyReported.has(sessionId)
   }
 
-  /** Clear chatty report (e.g., when agent sends result to lead). */
+  /**
+   * Clear chatty report for a session, re-arming chatty detection.
+   *
+   * HARNESS-38 (M10): the flag is a one-shot suppression, so without a reset a
+   * member flagged once would never be re-evaluated for the rest of its
+   * session (stale report). It is reset on the pertinent "progress" transitions:
+   * a message bound for the lead (a legitimate report) and a task completion.
+   * Full session teardown is handled by `remove()`.
+   */
   clearChattyReport(sessionId: string): void {
     this.chattyReported.delete(sessionId)
   }
 
-  /** Record that this member sent a team_message. Clears stall report. */
-  recordMessage(sessionId: string): void {
+  /**
+   * Record that this member sent a team_message. Clears the stall report, and —
+   * when the message is bound for the lead (`toLead`) — also clears the chatty
+   * report: reporting to the lead is the desired behaviour that ends the
+   * over-coordination window, so chatty detection starts fresh afterwards.
+   */
+  recordMessage(sessionId: string, toLead = false): void {
     this.lastMessageAt.set(sessionId, Date.now())
     this.clearReport(sessionId)
+    if (toLead) this.clearChattyReport(sessionId)
   }
 
-  /** Record that this member completed a task. Clears stall report. */
+  /** Record that this member completed a task. Clears stall and chatty reports. */
   recordTaskComplete(sessionId: string): void {
     this.lastTaskAt.set(sessionId, Date.now())
     this.clearReport(sessionId)
+    this.clearChattyReport(sessionId)
   }
 
   /** Token-based stall: last `minSteps` steps all produced < `threshold` output tokens. */

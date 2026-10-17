@@ -1,26 +1,17 @@
 #!/usr/bin/env node
 /**
- * QUALITY GATE DETERMINÍSTICO — HARNESS-16 (T11): Wake Incondicional do
- * Assignee no Desbloqueio + Watchdog de Inatividade da Sala
+ * QUALITY GATE DETERMINÍSTICO — Pool plano do board + Watchdog de Inatividade
  * @maiteuxzanela/ensemble-room-lowcost
  *
  * Sob teste (código REAL, sem mocks de decisão):
- *   - src/tools/team-tasks-complete.ts — ao resolver `depends_on`, o
- *     assignee PRÉ-ATRIBUÍDO é acordado INCONDICIONALMENTE (não importa
- *     ready / idle / busy): o bug original só dispara para standby
- *     (resolveStandbyWake) e o dono dormia com o status já avançado
- *     (deadlock silencioso). Os 3 estados são cobertos aqui:
- *       (a) ready/idle  → 1 promptAsync ao assignee, com agent + model;
- *       (b) busy        → 1 promptAsync (mesmo caminho incondicional);
- *       (c) standby     → 1 promptAsync com PREPEND de spawn_context
- *                         (caminho standby byte-compatível, transição
- *                         execution_status → 'starting').
+ *   - src/tools/team-tasks-complete.ts — TICKET-HARNESS-51: o board é um pool
+ *     plano, totalmente paralelo. Não existe mais `depends_on`/`blocked` nem
+ *     desbloqueio de dependentes: concluir uma tarefa NÃO altera as demais e
+ *     NÃO acorda ninguém (o wake só ocorre no fechamento total do board).
  *   - src/watchdog.ts checkRoomInactivity — (d) roomInactivityThresholdMs
  *     > 0 + sala inativa + tarefas pendentes → 1 wake à QA (is_qa,
  *     Migration 14); threshold = 0 → 0 wakes (gate de desativação);
  *     re-chamada dentro do threshold → 0 wakes (cooldown).
- *   - src/tools/shared.ts resolveStandbyWake — janela atômica
- *     standby → starting + prepend de spawn_context.
  *
  * Único ponto de emenda do dist: cláusulas de export anexadas à cópia do
  * bundle (padrão homologado). Único "client": TRANSPORT RECORDER
@@ -149,33 +140,20 @@ const srcComplete = readSrc("tools/team-tasks-complete.ts");
 const srcWatchdog = readSrc("watchdog.ts");
 const srcShared = readSrc("tools/shared.ts");
 
-// (a/b/c) O wake incondicional do assignee: ramo `wakeTarget === t.assignee`
-// chamando promptModelAwareWake com logTag tasks-complete:wake-member.
+// (a) Flat pool (TICKET-HARNESS-51): o board não tem mais `depends_on` nem
+// desbloqueio de dependentes — nem no src nem no dist.
 {
-  const proximidade = /promptModelAwareWake\(deps\.client,[\s\S]{0,500}tasks-complete:wake-member/;
-  check("paridade (src): wake incondicional usa promptModelAwareWake + logTag wake-member", proximidade.test(srcComplete), srcComplete.match(proximidade)?.[0]?.slice(0, 120) ?? "ausente");
-  check("paridade (dist): wake incondicional usa promptModelAwareWake + logTag wake-member", proximidade.test(distRaw), distRaw.match(proximidade)?.[0]?.slice(0, 120) ?? "ausente");
   check(
-    "paridade src↔dist: ramo incondicional `wakeTarget === t.assignee`",
-    srcComplete.includes("wakeTarget === t.assignee") && distRaw.includes("wakeTarget === t.assignee"),
+    "paridade src↔dist: sem `unblockDependents` (mecanismo DAG expurgado)",
+    !srcComplete.includes("unblockDependents") && !distRaw.includes("unblockDependents"),
   );
   check(
-    "paridade src↔dist: marcador de log unconditional=true (T10/T11)",
-    srcComplete.includes("unconditional=true") && distRaw.includes("unconditional=true"),
+    "paridade src↔dist: sem texto de desbloqueio 'was unblocked and is ready'",
+    !srcComplete.includes("was unblocked and is ready") && !distRaw.includes("was unblocked and is ready"),
   );
   check(
-    "paridade src↔dist: texto de desbloqueio do assignee",
-    srcComplete.includes("was unblocked and is ready for you to start")
-      && distRaw.includes("was unblocked and is ready for you to start"),
-  );
-  check(
-    "paridade src↔dist: standby via resolveStandbyWake no unblock (prepend de spawn_context)",
-    srcComplete.includes("resolveStandbyWake(deps.db, teamInfo.teamId, wakeTarget")
-      && distRaw.includes("resolveStandbyWake(deps.db, teamInfo.teamId, wakeTarget"),
-  );
-  check(
-    "paridade (src): comentário HARNESS-16 UNCONDITIONAL documenta o fix",
-    srcComplete.includes("HARNESS-16 UNCONDITIONAL"),
+    "paridade src↔dist: sem erro 'blocked by unresolved dependencies'",
+    !srcComplete.includes("blocked by unresolved dependencies") && !distRaw.includes("blocked by unresolved dependencies"),
   );
 }
 
@@ -316,127 +294,49 @@ async function runBehavior(label, mods) {
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [team, name, sess, agent, status, exec, model, spawnContext, isQa, lastNudgedAt, "do the work", time, time],
     );
-  const seedTask = (db, id, team, status, assignee, dependsOn = null, time = Date.now()) =>
+  // TICKET-HARNESS-51: no depends_on column anymore — the legacy 6th argument
+  // is accepted and ignored; the board is a flat, fully-parallel pool.
+  const seedTask = (db, id, team, status, assignee, _dependsOn = null, time = Date.now()) =>
     db.run(
-      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, depends_on, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?,?)",
-      [id, team, `task ${id}`, status, "medium", assignee, dependsOn, time, time],
+      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?)",
+      [id, team, `task ${id}`, status, "medium", assignee, time, time],
     );
 
   /**
-   * Cenário base de DESBLOQUEIO (a/b/c): t1 (pending, assignee C) bloqueia
-   * t2 (blocked, assignee M). Concluir t1 desbloqueia t2 e acorda M.
-   * `mExec`/`mStatus`/`mSpawnContext` variam o ESTADO do assignee M.
+   * Cenário de POOL PLANO (TICKET-HARNESS-51): duas tarefas independentes no
+   * board. Concluir uma NÃO altera a outra nem acorda ninguém — o wake só
+   * ocorre no fechamento total do board (board-close), nunca por dependência.
    */
-  function unblockFixture(name, { mExec = "idle", mStatus = "ready", mSpawnContext = null } = {}) {
-    const f = scenario(name);
-    const LEAD = `ses_${name}_lead`;
-    const C = "completer";
-    const C_SESSION = `ses_${name}_c`;
-    const M = "assignee-m";
-    const M_SESSION = `ses_${name}_m`;
-    seedTeam(f.db, `team_${name}`, LEAD, { leadAgent: "dante" });
-    seedMember(f.db, `team_${name}`, C, C_SESSION, { status: "ready", exec: "idle" });
-    seedMember(f.db, `team_${name}`, M, M_SESSION, {
-      agent: "build", status: mStatus, exec: mExec,
-      model: "prov/mm#low", spawnContext: mSpawnContext,
-    });
-    f.registry.register(`team_${name}`, C, C_SESSION);
-    f.registry.register(`team_${name}`, M, M_SESSION);
-    seedTask(f.db, `t${name}_1`, `team_${name}`, "pending", C);
-    seedTask(f.db, `t${name}_2`, `team_${name}`, "blocked", M, JSON.stringify([`t${name}_1`]));
-    return { ...f, LEAD, C, C_SESSION, M, M_SESSION, t1: `t${name}_1`, t2: `t${name}_2`, teamId: `team_${name}` };
-  }
-
-  /* ================================================================ *
-   * A) Assignee READY/IDLE → 1 wake incondicional com agent + model   *
-   * ================================================================ */
   {
-    const f = unblockFixture("h16a", { mExec: "idle", mStatus: "ready" });
+    const f = scenario("h16flat");
+    const LEAD = "ses_h16flat_lead";
+    const C = "completer";
+    const C_SESSION = "ses_h16flat_c";
+    const M = "assignee-m";
+    const M_SESSION = "ses_h16flat_m";
+    seedTeam(f.db, "team_h16flat", LEAD, { leadAgent: "dante" });
+    seedMember(f.db, "team_h16flat", C, C_SESSION, { status: "ready", exec: "idle" });
+    seedMember(f.db, "team_h16flat", M, M_SESSION, {
+      agent: "build", status: "ready", exec: "idle", model: "prov/mm#low",
+    });
+    f.registry.register("team_h16flat", C, C_SESSION);
+    f.registry.register("team_h16flat", M, M_SESSION);
+    seedTask(f.db, "t_h16flat_1", "team_h16flat", "pending", C);
+    seedTask(f.db, "t_h16flat_2", "team_h16flat", "pending", M);
+
     const base = f.calls.promptAsync.length;
-    const ret = await executeTeamTasksComplete(f.deps(DEFAULT_CONFIG), { task_id: f.t1 }, f.C_SESSION);
+    const ret = await executeTeamTasksComplete(f.deps(DEFAULT_CONFIG), { task_id: "t_h16flat_1" }, C_SESSION);
     await tick();
 
     check(
-      `[${label}] A1 retorno reflete desbloqueio + wake ("unblocked 1 task", "woke 1 member")`,
-      ret.includes("unblocked 1 task") && ret.includes("woke 1 member"),
+      `[${label}] A1 retorno NÃO menciona desbloqueio (pool plano)`,
+      !ret.includes("unblocked") && !ret.includes("woke"),
       ret.slice(0, 120),
     );
-    const t2 = f.db.query("SELECT status, assignee FROM team_task WHERE id=?").get(f.t2);
-    check(`[${label}] A2 t2 desbloqueada para in_progress (pré-atribuída)`, t2?.status === "in_progress" && t2?.assignee === f.M, `${t2?.status}/${t2?.assignee}`);
-
+    const t2 = f.db.query("SELECT status, assignee FROM team_task WHERE id=?").get("t_h16flat_2");
+    check(`[${label}] A2 a outra tarefa permanece pending (independente)`, t2?.status === "pending" && t2?.assignee === M, `${t2?.status}/${t2?.assignee}`);
     const delta = f.calls.promptAsync.length - base;
-    check(`[${label}] A3 EXATAMENTE 1 promptAsync no desbloqueio (não 0, não 2)`, delta === 1, `delta=${delta}`);
-    const wakes = f.toSession(f.M_SESSION, base);
-    check(`[${label}] A4 o promptAsync é endereçado ao assignee M (ready/idle)`, wakes.length === 1, `wakes=${wakes.length}`);
-    check(`[${label}] A5 wake carrega agent 'build' explícito`, wakes[0]?.agent === "build", String(wakes[0]?.agent));
-    check(`[${label}] A6 wake carrega model do membro (prov/mm#low)`, eq(wakes[0]?.model, MEMBER_MODEL), JSON.stringify(wakes[0]?.model));
-    check(
-      `[${label}] A7 texto de desbloqueio + synthetic:true`,
-      wakes[0]?.synthetic === true && String(wakes[0]?.parts?.[0]?.text).includes("was unblocked and is ready for you to start"),
-      JSON.stringify(wakes[0]?.parts?.[0]?.text?.slice(0, 100)),
-    );
-    const mRow = f.db.query("SELECT execution_status FROM team_member WHERE team_id=? AND name=?").get(f.teamId, f.M);
-    check(`[${label}] A8 ramo NÃO-standby mantém execution_status intacto (idle)`, mRow?.execution_status === "idle", mRow?.execution_status);
-    f.close();
-  }
-
-  /* ================================================================ *
-   * B) Assignee BUSY → 1 wake incondicional (mesmo caminho)           *
-   * ================================================================ */
-  {
-    const f = unblockFixture("h16b", { mExec: "running", mStatus: "busy" });
-    const base = f.calls.promptAsync.length;
-    const ret = await executeTeamTasksComplete(f.deps(DEFAULT_CONFIG), { task_id: f.t1 }, f.C_SESSION);
-    await tick();
-
-    check(`[${label}] B1 retorno reflete "woke 1 member" com assignee busy`, ret.includes("woke 1 member"), ret.slice(0, 120));
-    const delta = f.calls.promptAsync.length - base;
-    check(`[${label}] B2 EXATAMENTE 1 promptAsync com assignee busy (não 0)`, delta === 1, `delta=${delta}`);
-    const wakes = f.toSession(f.M_SESSION, base);
-    check(
-      `[${label}] B3 wake com agent 'build' + model prov/mm#low (mesmo caminho incondicional)`,
-      wakes.length === 1 && wakes[0]?.agent === "build" && eq(wakes[0]?.model, MEMBER_MODEL),
-      JSON.stringify({ n: wakes.length, agent: wakes[0]?.agent, model: wakes[0]?.model }),
-    );
-    const mRow = f.db.query("SELECT execution_status FROM team_member WHERE team_id=? AND name=?").get(f.teamId, f.M);
-    check(`[${label}] B4 busy não é revertido (execution_status segue 'running')`, mRow?.execution_status === "running", mRow?.execution_status);
-    const t2 = f.db.query("SELECT status FROM team_task WHERE id=?").get(f.t2);
-    check(`[${label}] B5 t2 desbloqueada para in_progress`, t2?.status === "in_progress", t2?.status);
-    f.close();
-  }
-
-  /* ================================================================ *
-   * C) Assignee STANDBY → 1 wake com PREPEND de spawn_context         *
-   * ================================================================ */
-  {
-    const SPAWN_CTX = "INIT PROMPT CONTEXT — teammates: cris, ana; lead: dante.";
-    const f = unblockFixture("h16c", { mExec: "standby", mStatus: "ready", mSpawnContext: SPAWN_CTX });
-    const base = f.calls.promptAsync.length;
-    const ret = await executeTeamTasksComplete(f.deps(DEFAULT_CONFIG), { task_id: f.t1 }, f.C_SESSION);
-    await tick();
-
-    check(`[${label}] C1 retorno reflete "woke 1 member" com assignee em standby`, ret.includes("woke 1 member"), ret.slice(0, 120));
-    const delta = f.calls.promptAsync.length - base;
-    check(`[${label}] C2 EXATAMENTE 1 promptAsync com assignee standby`, delta === 1, `delta=${delta}`);
-    const wakes = f.toSession(f.M_SESSION, base);
-    check(`[${label}] C3 wake endereçado ao assignee standby`, wakes.length === 1, `wakes=${wakes.length}`);
-    const text = String(wakes[0]?.parts?.[0]?.text ?? "");
-    check(
-      `[${label}] C4 texto com PREPEND integral de spawn_context + desbloqueio`,
-      text.startsWith(SPAWN_CTX) && text.includes("was unblocked and is ready for you to start"),
-      JSON.stringify(text.slice(0, 140)),
-    );
-    check(
-      `[${label}] C5 wake com agent 'build' + model prov/mm#low`,
-      wakes[0]?.agent === "build" && eq(wakes[0]?.model, MEMBER_MODEL),
-      JSON.stringify({ agent: wakes[0]?.agent, model: wakes[0]?.model }),
-    );
-    const mRow = f.db.query("SELECT execution_status, spawn_context FROM team_member WHERE team_id=? AND name=?").get(f.teamId, f.M);
-    check(
-      `[${label}] C6 standby → starting (janela consumida) com spawn_context preservado`,
-      mRow?.execution_status === "starting" && mRow?.spawn_context === SPAWN_CTX,
-      `${mRow?.execution_status} ctx=${mRow?.spawn_context ? "ok" : "null"}`,
-    );
+    check(`[${label}] A3 ZERO promptAsync ao concluir 1 de 2 tarefas`, delta === 0, `delta=${delta}`);
     f.close();
   }
 

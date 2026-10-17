@@ -147,7 +147,8 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
       },
       execute: run(executeTeamMessage, (sessionID, args) => {
         const to = args.to ?? ""
-        deps.progressTracker.recordMessage(sessionID)
+        // HARNESS-38 (M10): a message to the lead resets the chatty report.
+        deps.progressTracker.recordMessage(sessionID, to === "lead")
         if (to !== "lead") deps.progressTracker.recordPeerMessage(sessionID)
       }),
     })
@@ -190,25 +191,18 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
               properties: {
                 content: str("Task description"),
                 priority: priority(),
-                depends_on: {
-                  type: "array",
-                  items: { type: "string" },
-                  description: "Task IDs this depends on",
-                },
               },
               required: ["content"],
               additionalProperties: false,
             },
           },
-          sequential: bool("If true, tasks are added in sequence where each task depends on the previous one. Defaults to false (tasks are independent/parallel unless depends_on is explicitly specified).", false),
         },
         required: ["tasks"],
         additionalProperties: false,
       },
       execute: async (input: unknown, context: { sessionID: string }) => {
         const args = input as {
-          tasks: Array<{ content: string; priority?: string; depends_on?: string[] }>
-          sequential?: boolean
+          tasks: Array<{ content: string; priority?: string }>
         }
         const content = await executeTeamTasksAdd(
           deps,
@@ -216,9 +210,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
             tasks: args.tasks.map((task) => ({
               content: task.content,
               priority: normalizePriority(task.priority),
-              ...(task.depends_on ? { depends_on: task.depends_on } : {}),
             })),
-            sequential: args.sequential,
           },
           context.sessionID,
         )
@@ -228,7 +220,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
 
     editor.add({
       name: "team_tasks_complete",
-      description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
+      description: "Mark a task as completed on the shared board, or submit/reject a review.",
       input: {
         type: "object",
         properties: {
@@ -250,7 +242,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
 
     editor.add({
       name: "team_claim",
-      description: "Claim a pending task from the shared task list. Only unclaimed, unblocked tasks can be claimed.",
+      description: "Claim a pending task from the shared task list. Only unclaimed tasks can be claimed.",
       input: {
         type: "object",
         properties: { task_id: str("ID of the task to claim") },
@@ -262,11 +254,11 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
 
     editor.add({
       name: "team_standby",
-      description: "Suspend active execution and enter standby mode voluntarily until unblocked or awakened by new messages or task dependencies.",
+      description: "Suspend active execution and enter standby mode voluntarily until awakened by new messages or task activity.",
       input: {
         type: "object",
         properties: {
-          reason: str("Reason for entering standby (e.g. waiting for dependencies or reviews)"),
+          reason: str("Reason for entering standby (e.g. waiting for peer messages or reviews)"),
         },
         additionalProperties: false,
       },

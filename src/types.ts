@@ -22,8 +22,11 @@ export interface ToolDeps {
   progressTracker: ProgressTracker
 }
 
-/** Status values for team tasks supported by the database schema (Migration 13). */
-export type TaskStatus = "pending" | "in_progress" | "in_review" | "completed" | "cancelled" | "blocked"
+/** Status values for team tasks supported by the database schema (Migration 13).
+ *
+ * TICKET-HARNESS-51 — the board is a flat, fully-parallel pool: there is no
+ * 'blocked' status and no dependency/DAG state. */
+export type TaskStatus = "pending" | "in_progress" | "in_review" | "completed" | "cancelled"
 
 export interface TeamTask {
   id: string
@@ -32,7 +35,6 @@ export interface TeamTask {
   status: TaskStatus
   priority: "high" | "medium" | "low"
   assignee: string | null
-  depends_on: string | null
   time_created: number
   time_updated: number
   rejection_count: number

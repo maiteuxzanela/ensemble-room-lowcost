@@ -527,7 +527,42 @@ var MIGRATIONS = [
   // (latest raise) for observability and backward compatibility. Additive-only
   // (same non-negotiable as Migrations 9-11/14/15/16/17): nullable TEXT, no
   // CHECK constraint, no table rebuild.
-  `ALTER TABLE team ADD COLUMN awaiting_decision_members TEXT;`
+  `ALTER TABLE team ADD COLUMN awaiting_decision_members TEXT;`,
+  // Migration 19 (TICKET-HARNESS-51): definitive purge of the dependency/DAG
+  // mechanism from the task board. SQLite cannot drop a column nor ALTER a
+  // CHECK constraint in place, so this rebuilds team_task exactly like
+  // Migrations 8/12/13 (rename → create → copy → drop):
+  //   - drops the `depends_on` column entirely;
+  //   - removes 'blocked' from the status CHECK constraint;
+  //   - maps any legacy 'blocked' row to 'pending' (assignee preserved) so a
+  //     pre-existing database never violates the new constraint and the
+  //     migration transaction never rolls back.
+  // Recreates the three indexes that die with the old table. The board is now a
+  // flat, fully-parallel pool: every task is born 'pending' and claimable.
+  `ALTER TABLE team_task RENAME TO team_task_old_m19;
+   CREATE TABLE IF NOT EXISTS team_task (
+     id              TEXT PRIMARY KEY,
+     team_id         TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     content         TEXT NOT NULL,
+     status          TEXT NOT NULL DEFAULT 'pending'
+                       CHECK(status IN ('pending', 'in_progress', 'in_review', 'completed', 'cancelled')),
+     priority        TEXT NOT NULL DEFAULT 'medium'
+                       CHECK(priority IN ('high', 'medium', 'low')),
+     assignee        TEXT,
+     time_created    INTEGER NOT NULL,
+     time_updated    INTEGER NOT NULL,
+     rejection_count INTEGER NOT NULL DEFAULT 0,
+     review_notes    TEXT
+   );
+   INSERT INTO team_task (id, team_id, content, status, priority, assignee, time_created, time_updated, rejection_count, review_notes)
+     SELECT id, team_id, content,
+            CASE WHEN status = 'blocked' THEN 'pending' ELSE status END,
+            priority, assignee, time_created, time_updated, rejection_count, review_notes
+     FROM team_task_old_m19;
+   DROP TABLE team_task_old_m19;
+   CREATE INDEX IF NOT EXISTS team_task_team_idx ON team_task(team_id);
+   CREATE INDEX IF NOT EXISTS team_task_assignee_idx ON team_task(assignee);
+   CREATE INDEX IF NOT EXISTS team_task_status_idx ON team_task(team_id, status);`
 ];
 function applyMigrations(db) {
   const { user_version: current } = db.query("PRAGMA user_version").get();
@@ -1244,11 +1279,7 @@ function releaseMemberTasks(db, teamId, memberName) {
     "UPDATE team_task SET status = 'pending', assignee = NULL, time_updated = ? WHERE team_id = ? AND assignee = ? AND status IN ('in_progress', 'in_review')",
     [Date.now(), teamId, memberName]
   );
-  const unassigned = db.run(
-    "UPDATE team_task SET assignee = NULL, time_updated = ? WHERE team_id = ? AND assignee = ? AND status = 'blocked'",
-    [Date.now(), teamId, memberName]
-  );
-  return released.changes + unassigned.changes;
+  return released.changes;
 }
 
 // src/types.ts
@@ -1482,28 +1513,6 @@ function checkToolIsolation(registry, tracker, toolName, sessionId, db) {
     throw new Error("Team tools are not available to sub-agents. Report findings to your parent teammate via your normal output.");
   }
 }
-function hasBlockedAssignedTasks(db, teamId, memberName) {
-  const tasks = db.query(
-    "SELECT status, depends_on FROM team_task WHERE team_id = ? AND assignee = ?"
-  ).all(teamId, memberName);
-  for (const task of tasks) {
-    if (task.status === "blocked") return true;
-    if (!task.depends_on) continue;
-    let depIds;
-    try {
-      depIds = JSON.parse(task.depends_on);
-    } catch {
-      return true;
-    }
-    if (!Array.isArray(depIds)) return true;
-    for (const depId of depIds) {
-      if (typeof depId !== "string") return true;
-      const dep = db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?").get(depId, teamId);
-      if (!dep || dep.status !== "completed") return true;
-    }
-  }
-  return false;
-}
 function hasInReviewAssignedTasks(db, teamId, memberName) {
   const row = db.query(
     "SELECT id FROM team_task WHERE team_id = ? AND assignee = ? AND status = 'in_review' LIMIT 1"
@@ -1534,7 +1543,6 @@ function shouldNudgeIdleMember(db, teamId, memberName, config) {
   const member = db.query("SELECT status, execution_status FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
   if (!member || member.status !== "ready") return false;
   if (member.execution_status === "standby") return false;
-  if (hasBlockedAssignedTasks(db, teamId, memberName)) return false;
   if (hasInReviewAssignedTasks(db, teamId, memberName)) return false;
   if (hasActivePeerDialogue(db, teamId, memberName)) return false;
   const msg = db.query("SELECT id FROM team_message WHERE team_id = ? AND from_name = ? AND (to_name = 'lead' OR to_name IS NULL) LIMIT 1").get(teamId, memberName);
@@ -1544,7 +1552,6 @@ function shouldAlarmFastIdle(db, teamId, memberName, now = Date.now()) {
   const member = db.query("SELECT time_created, execution_status FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
   if (!member) return false;
   if (member.execution_status === "standby") return false;
-  if (hasBlockedAssignedTasks(db, teamId, memberName)) return false;
   if (hasInReviewAssignedTasks(db, teamId, memberName)) return false;
   if (hasPendingBoardTasks(db, teamId)) return false;
   if (hasOtherActiveMembers(db, teamId, memberName)) return false;
@@ -2320,9 +2327,6 @@ function claimTask(db, teamId, taskId, assignee) {
   const task = db.query("SELECT content, status, assignee FROM team_task WHERE id = ? AND team_id = ?").get(taskId, teamId);
   if (!task) throw new Error(`Task "${taskId}" not found`);
   if (task.assignee === assignee) {
-    if (task.status === "blocked") {
-      return { content: task.content, status: "blocked", isBlocked: true };
-    }
     if (task.status === "pending") {
       const result2 = db.run(
         "UPDATE team_task SET status = 'in_progress', time_updated = ? WHERE id = ? AND team_id = ? AND status = 'pending' AND assignee = ?",
@@ -2331,28 +2335,18 @@ function claimTask(db, teamId, taskId, assignee) {
       if (result2.changes === 0) {
         const current = db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?").get(taskId, teamId);
         if (current?.status === "in_progress") {
-          return { content: task.content, status: "in_progress", isBlocked: false, alreadyInProgress: true };
+          return { content: task.content, status: "in_progress", alreadyInProgress: true };
         }
         throw new Error(`Task "${taskId}" could not be claimed (status: ${current?.status ?? "unknown"})`);
       }
-      return { content: task.content, status: "in_progress", isBlocked: false };
+      return { content: task.content, status: "in_progress" };
     }
     if (task.status === "in_progress") {
-      return { content: task.content, status: "in_progress", isBlocked: false, alreadyInProgress: true };
+      return { content: task.content, status: "in_progress", alreadyInProgress: true };
     }
     throw new Error(`Task "${taskId}" cannot be claimed (status: ${task.status})`);
   }
   if (task.assignee) throw new Error(`Task "${taskId}" is already claimed by ${task.assignee}`);
-  if (task.status === "blocked") {
-    const result2 = db.run(
-      "UPDATE team_task SET assignee = ?, time_updated = ? WHERE id = ? AND team_id = ? AND status = 'blocked' AND assignee IS NULL",
-      [assignee, Date.now(), taskId, teamId]
-    );
-    if (result2.changes === 0) {
-      throw new Error(`Task "${taskId}" is already claimed (race condition)`);
-    }
-    return { content: task.content, status: "blocked", isBlocked: true };
-  }
   if (task.status !== "pending") throw new Error(`Task "${taskId}" is not pending (status: ${task.status})`);
   const result = db.run(
     "UPDATE team_task SET status = 'in_progress', assignee = ?, time_updated = ? WHERE id = ? AND team_id = ? AND status = 'pending' AND assignee IS NULL",
@@ -2361,15 +2355,12 @@ function claimTask(db, teamId, taskId, assignee) {
   if (result.changes === 0) {
     throw new Error(`Task "${taskId}" is already claimed (race condition)`);
   }
-  return { content: task.content, status: "in_progress", isBlocked: false };
+  return { content: task.content, status: "in_progress" };
 }
 async function executeTeamClaim(deps, args, sessionId) {
   const teamInfo = requireTeamMember(deps, sessionId);
   const claimerName = teamInfo.role === "lead" ? "lead" : teamInfo.memberName ?? "unknown";
   const result = claimTask(deps.db, teamInfo.teamId, args.task_id, claimerName);
-  if (result.isBlocked) {
-    return `Pre-claimed blocked task "${args.task_id}": "${result.content}". This task is blocked by unresolved dependencies. Stop execution and enter standby (yield) via team_standby \u2014 the runtime will automatically wake you when dependencies resolve.`;
-  }
   if (result.alreadyInProgress) {
     return `Task "${args.task_id}" is already in progress and assigned to you: "${result.content}".`;
   }
@@ -2474,16 +2465,6 @@ async function executeTeamSpawn(deps, args, sessionId) {
   const usePlanApproval = args.plan_approval === true;
   let autoStandby = false;
   let autoStandbyReason = "";
-  let claimedTaskBlocked = false;
-  if (args.claim_task) {
-    const task = deps.db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?").get(args.claim_task, teamInfo.teamId);
-    if (task && task.status === "blocked") {
-      autoStandby = true;
-      claimedTaskBlocked = true;
-      autoStandbyReason = `claimed task ${args.claim_task} is blocked`;
-      log(`spawn:auto-standby member=${args.name} task=${args.claim_task} reason=task_blocked`);
-    }
-  }
   if (!autoStandby && spawnIsQA && args.standby !== false) {
     const otherMembersCount = deps.db.query(
       "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
@@ -2502,8 +2483,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     autoStandbyReason = "hugo sdet default standby";
     log(`spawn:auto-standby member=${args.name} agent=${agent} reason=hugo_sdet_default`);
   }
-  let useStandby = (args.standby === true || autoStandby) && args.standby !== false;
-  let standbyReverted = false;
+  const useStandby = (args.standby === true || autoStandby) && args.standby !== false;
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`);
   let worktreeDir = null;
   let worktreeBranch = null;
@@ -2689,38 +2669,13 @@ async function executeTeamSpawn(deps, args, sessionId) {
   let claimedTaskContent = null;
   let claimWarning = null;
   if (args.claim_task && !isReadOnly) {
-    if (claimedTaskBlocked) {
-      const updateResult = deps.db.run(
-        "UPDATE team_task SET assignee = ?, time_updated = ? WHERE id = ? AND team_id = ? AND assignee IS NULL",
-        [args.name, Date.now(), args.claim_task, teamInfo.teamId]
-      );
-      if (updateResult.changes === 0) {
-        claimWarning = `Task "${args.claim_task}" is already claimed or missing`;
-        log(`spawn:claim-blocked:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`);
-        if (useStandby && claimedTaskBlocked && !spawnIsQA && !spawnIsSDET && args.standby !== true) {
-          useStandby = false;
-          standbyReverted = true;
-          deps.db.run(
-            "UPDATE team_member SET status = 'busy', execution_status = 'starting', time_updated = ? WHERE team_id = ? AND name = ?",
-            [Date.now(), teamInfo.teamId, args.name]
-          );
-          deps.progressTracker.recordBusyStart(childSessionId);
-          log(`spawn:claim-blocked:standby-reverted name=${args.name} task=${args.claim_task}`);
-        }
-      } else {
-        const taskRow = deps.db.query("SELECT content FROM team_task WHERE id = ? AND team_id = ?").get(args.claim_task, teamInfo.teamId);
-        claimedTaskContent = taskRow?.content ?? null;
-        log(`spawn:claim-blocked:ok name=${args.name} task=${args.claim_task}`);
-      }
-    } else {
-      try {
-        const claimResult = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name);
-        claimedTaskContent = claimResult.content;
-        log(`spawn:claim:ok name=${args.name} task=${args.claim_task}`);
-      } catch (err) {
-        claimWarning = err instanceof Error ? err.message : String(err);
-        log(`spawn:claim:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`);
-      }
+    try {
+      const claimResult = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name);
+      claimedTaskContent = claimResult.content;
+      log(`spawn:claim:ok name=${args.name} task=${args.claim_task}`);
+    } catch (err) {
+      claimWarning = err instanceof Error ? err.message : String(err);
+      log(`spawn:claim:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`);
     }
   }
   const context = [
@@ -2782,7 +2737,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
       "- team_message: send a message to the lead or another teammate",
       "- team_broadcast: send a message to all team members",
       "- team_tasks_list: view the shared team task board",
-      "- team_standby: yield execution and enter standby mode until unblocked or messaged",
+      "- team_standby: yield execution and enter standby mode until messaged",
       "- decision_lead: escalate an emergency decision to the team lead and pause until they deliberate"
     );
   } else {
@@ -2795,7 +2750,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
       "- team_tasks_add: add tasks to the shared board",
       "- team_tasks_complete: mark a task complete on the shared board",
       "- team_claim: claim a pending task from the shared board",
-      "- team_standby: yield execution and enter standby mode until unblocked or messaged",
+      "- team_standby: yield execution and enter standby mode until messaged",
       "- team_task_handover: hand an in_progress task you own to another teammate (intra-card baton pass) and enter standby",
       "- decision_lead: escalate an emergency decision to the team lead and pause until they deliberate"
     );
@@ -2964,7 +2919,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     });
   }
   const branchInfo = worktreeBranch ? ` (branch: ${worktreeBranch})` : "";
-  const standbyInfo = standbyReverted ? ` (standby reverted: claimed task ${args.claim_task} was already claimed \u2014 member started normally)` : autoStandby ? ` (auto-standby: ${claimedTaskBlocked ? `claimed task ${args.claim_task} is blocked` : autoStandbyReason})` : useStandby ? " [standby \u2014 no prompt sent; wakes on first team_message]" : "";
+  const standbyInfo = autoStandby ? ` (auto-standby: ${autoStandbyReason})` : useStandby ? " [standby \u2014 no prompt sent; wakes on first team_message]" : "";
   const planInfo = usePlanApproval ? " [plan mode \u2014 will send plan for approval]" : "";
   const claimInfo = claimedTaskContent ? ` (claimed task: ${args.claim_task})` : claimWarning ? ` (could not claim task: ${claimWarning})` : "";
   spawnFailures.delete(teamInfo.teamId);
@@ -2995,7 +2950,7 @@ async function executeTeamStandby(deps, args, sessionId) {
   }
   setMemberStandby(deps.db, teamInfo.teamId, memberName, args.reason);
   const reasonStr = args.reason ? ` (reason: ${args.reason})` : "";
-  return `Entered standby mode${reasonStr}. Execution suspended until dependencies are unblocked or a new message arrives.`;
+  return `Entered standby mode${reasonStr}. Execution suspended until a new message arrives.`;
 }
 
 // src/tools/decision-lead.ts
@@ -3362,32 +3317,13 @@ async function executeTeamTasksAdd(deps, args, sessionId) {
   const teamInfo = requireTeamMember(deps, sessionId);
   const ids = [];
   const now = Date.now();
-  const isSequential = args.sequential === true;
-  for (let i = 0; i < args.tasks.length; i++) {
-    const task = args.tasks[i];
+  for (const task of args.tasks) {
     if (!task) continue;
     const id = generateId("task");
     ids.push(id);
-    if (isSequential && i > 0) {
-      if (!task.depends_on) task.depends_on = [];
-      const prevId = ids[i - 1];
-      if (prevId && !task.depends_on.includes(prevId)) {
-        task.depends_on.push(prevId);
-      }
-    }
-    const depsJson = task.depends_on?.length ? JSON.stringify(task.depends_on) : null;
-    let status = "pending";
-    if (task.depends_on?.length) {
-      const resolved = task.depends_on.every((depId) => {
-        if (ids.includes(depId)) return false;
-        const dep = deps.db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?").get(depId, teamInfo.teamId);
-        return dep && (dep.status === "completed" || dep.status === "cancelled");
-      });
-      if (!resolved) status = "blocked";
-    }
     deps.db.run(
-      "INSERT INTO team_task (id, team_id, content, status, priority, depends_on, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [id, teamInfo.teamId, task.content, status, task.priority, depsJson, now, now]
+      "INSERT INTO team_task (id, team_id, content, status, priority, time_created, time_updated) VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+      [id, teamInfo.teamId, task.content, task.priority, now, now]
     );
   }
   return `Added ${ids.length} task${ids.length !== 1 ? "s" : ""}: ${ids.join(", ")}`;
@@ -3597,96 +3533,6 @@ function countPendingDevelopmentTasks(deps, teamInfo, excludeTaskId) {
     "SELECT assignee FROM team_task WHERE team_id = ? AND status IN ('pending', 'in_progress') AND id != ?"
   ).all(teamInfo.teamId, excludeTaskId);
   return rows.filter((r) => !isValidationProfileTask(deps, teamInfo, r)).length;
-}
-function unblockDependents(deps, teamInfo, triggerTaskId, now) {
-  const allTasks = deps.db.query("SELECT id, depends_on, status, assignee FROM team_task WHERE team_id = ?").all(teamInfo.teamId);
-  let unblocked = 0;
-  let wokeMembers = 0;
-  for (const t of allTasks) {
-    if (t.status !== "blocked" || !t.depends_on) continue;
-    const depIds = JSON.parse(t.depends_on);
-    if (!depIds.includes(triggerTaskId)) continue;
-    const downstreamIsValidation = isValidationProfileTask(deps, teamInfo, t);
-    const allResolved = depIds.every((depId) => {
-      const dep = allTasks.find((d) => d.id === depId);
-      if (!dep) return false;
-      if (dep.status === "completed" || dep.status === "cancelled") return true;
-      if (dep.status === "in_review" && downstreamIsValidation) return true;
-      return false;
-    });
-    if (allResolved) {
-      const nextStatus = t.assignee ? "in_progress" : "pending";
-      deps.db.run("UPDATE team_task SET status = ?, time_updated = ? WHERE id = ?", [nextStatus, now, t.id]);
-      unblocked++;
-      let wakeTarget = t.assignee;
-      if (!wakeTarget) {
-        const standbyCandidate = deps.db.query(`
-          SELECT name FROM team_member
-          WHERE team_id = ? AND execution_status = 'standby'
-          AND name NOT IN (
-            SELECT assignee FROM team_task
-            WHERE team_id = ? AND assignee IS NOT NULL AND status IN ('in_progress', 'in_review', 'blocked')
-          )
-          ORDER BY time_updated ASC LIMIT 1
-        `).get(teamInfo.teamId, teamInfo.teamId);
-        if (standbyCandidate) {
-          wakeTarget = standbyCandidate.name;
-        }
-      }
-      if (wakeTarget) {
-        const memberRow = deps.db.query("SELECT session_id, agent, execution_status FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, wakeTarget);
-        const memberSessionId = memberRow?.session_id;
-        if (memberSessionId) {
-          const baseText = `[System: Task "${t.id}" was unblocked and is ready for you to start]`;
-          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, wakeTarget, baseText);
-          if (wake.woke) {
-            const memberModel = getMemberModel(deps.db, teamInfo.teamId, wakeTarget);
-            deps.client.session.promptAsync({
-              sessionID: memberSessionId,
-              parts: [{ type: "text", text: wake.text }],
-              agent: wake.agent,
-              synthetic: true,
-              ...memberModel ? { model: memberModel } : {}
-            }).catch((err) => {
-              deps.db.run(
-                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
-                [Date.now(), teamInfo.teamId, wakeTarget]
-              );
-              log(`tasks-complete:wake-member:failed member=${wakeTarget} err=${String(err)}`);
-            });
-            log(`tasks-complete:wake-member:ok member=${wakeTarget} task=${t.id}`);
-            wokeMembers++;
-          } else if (wakeTarget === t.assignee) {
-            try {
-              const memberModel = getMemberModel(deps.db, teamInfo.teamId, wakeTarget);
-              const primaryModel = memberModel ? `${memberModel.providerID}/${memberModel.modelID}${memberModel.variant ? `#${memberModel.variant}` : ""}` : void 0;
-              promptModelAwareWake(deps.client, {
-                sessionID: memberSessionId,
-                text: baseText,
-                logTag: `tasks-complete:wake-member team=${teamInfo.teamId} member=${wakeTarget}`,
-                agent: memberRow.agent || void 0,
-                config: deps.config,
-                ...primaryModel ? { primaryModel } : {}
-              });
-              log(`tasks-complete:wake-member:ok member=${wakeTarget} task=${t.id} state=${memberRow.execution_status} unconditional=true`);
-              wokeMembers++;
-            } catch (err) {
-              log(`tasks-complete:wake-member:failed member=${wakeTarget} err=${err instanceof Error ? err.message : String(err)}`);
-            }
-          }
-        }
-      }
-    }
-  }
-  return { unblocked, wokeMembers };
-}
-function formatUnblockedSuffix(unblocked, wokeMembers) {
-  if (unblocked <= 0) return "";
-  let msg = ` (unblocked ${unblocked} task${unblocked !== 1 ? "s" : ""}`;
-  if (wokeMembers > 0) {
-    msg += `, woke ${wokeMembers} member${wokeMembers !== 1 ? "s" : ""}`;
-  }
-  return `${msg})`;
 }
 function normalizeDir(dir) {
   return dir.replace(/\/+$/, "");
@@ -3956,7 +3802,6 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
   if (isSubmitReview) {
     if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`);
     if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`);
-    if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`);
     if (task.status === "in_review") throw new Error(`Task "${args.task_id}" is already in review`);
     if (task.assignee && teamInfo.role !== "lead" && caller !== task.assignee) {
       throw new Error(`Task "${args.task_id}" is claimed by ${task.assignee}`);
@@ -3985,8 +3830,7 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
     }
     const notifiedLabel = sdetNotified && sdetMember ? ` (notified ${sdetMember.name} for deterministic tests)` : qaNotified && qaMember ? ` (notified ${qaMember.name} for review)` : "";
     const batchHeldLabel = sdetWakeHeld && sdetMember ? ` (SDET wake held until the functional batch is consolidated)` : "";
-    const submittedUnblock = unblockDependents(deps, teamInfo, args.task_id, now);
-    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${notifiedLabel}${batchHeldLabel}${formatUnblockedSuffix(submittedUnblock.unblocked, submittedUnblock.wokeMembers)}`;
+    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${notifiedLabel}${batchHeldLabel}`;
   }
   const isReject = args.action === "reject" || args.action === "reject_review" || task.status === "in_review" && (args.action === "in_progress" || args.status === "in_progress");
   if (isReject) {
@@ -4026,7 +3870,6 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
   }
   if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`);
   if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`);
-  if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`);
   if (qaMember && teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {
     if (task.status === "in_progress" || task.status === "pending") {
       throw new Error(`Task "${args.task_id}" cannot be completed directly by an implementer; only ${qaLabel} or the team lead can complete it after review submission via submit_review`);
@@ -4053,14 +3896,13 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
       throw new Error(`Task "${args.task_id}" was just completed by another teammate`);
     }
   }
-  const { unblocked, wokeMembers } = unblockDependents(deps, teamInfo, args.task_id, now);
   const counts = deps.db.query(
     "SELECT status, COUNT(*) as c FROM team_task WHERE team_id = ? GROUP BY status"
   ).all(teamInfo.teamId);
   const completed = counts.find((r) => r.status === "completed")?.c ?? 0;
   const total = counts.reduce((sum, r) => r.status === "cancelled" ? sum : sum + r.c, 0);
   const activeRemaining = counts.reduce(
-    (sum, r) => r.status === "pending" || r.status === "in_progress" || r.status === "in_review" || r.status === "blocked" ? sum + r.c : sum,
+    (sum, r) => r.status === "pending" || r.status === "in_progress" || r.status === "in_review" ? sum + r.c : sum,
     0
   );
   const who = teamInfo.memberName ?? "teammate";
@@ -4097,7 +3939,7 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
       }
     }
   }
-  return `Completed task: ${task.content}${formatUnblockedSuffix(unblocked, wokeMembers)}${commitSuffix}`;
+  return `Completed task: ${task.content}${commitSuffix}`;
 }
 async function executeTeamTasksReview(deps, args, sessionId) {
   return executeTeamTasksComplete(deps, { ...args, action: "submit_review" }, sessionId);
@@ -5102,7 +4944,7 @@ async function registerV2Tools(domain, deps) {
       },
       execute: run(executeTeamMessage, (sessionID, args) => {
         const to = args.to ?? "";
-        deps.progressTracker.recordMessage(sessionID);
+        deps.progressTracker.recordMessage(sessionID, to === "lead");
         if (to !== "lead") deps.progressTracker.recordPeerMessage(sessionID);
       })
     });
@@ -5142,18 +4984,12 @@ async function registerV2Tools(domain, deps) {
               type: "object",
               properties: {
                 content: str("Task description"),
-                priority: priority(),
-                depends_on: {
-                  type: "array",
-                  items: { type: "string" },
-                  description: "Task IDs this depends on"
-                }
+                priority: priority()
               },
               required: ["content"],
               additionalProperties: false
             }
-          },
-          sequential: bool("If true, tasks are added in sequence where each task depends on the previous one. Defaults to false (tasks are independent/parallel unless depends_on is explicitly specified).", false)
+          }
         },
         required: ["tasks"],
         additionalProperties: false
@@ -5165,10 +5001,8 @@ async function registerV2Tools(domain, deps) {
           {
             tasks: args.tasks.map((task) => ({
               content: task.content,
-              priority: normalizePriority(task.priority),
-              ...task.depends_on ? { depends_on: task.depends_on } : {}
-            })),
-            sequential: args.sequential
+              priority: normalizePriority(task.priority)
+            }))
           },
           context.sessionID
         );
@@ -5177,7 +5011,7 @@ async function registerV2Tools(domain, deps) {
     });
     editor.add({
       name: "team_tasks_complete",
-      description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
+      description: "Mark a task as completed on the shared board, or submit/reject a review.",
       input: {
         type: "object",
         properties: {
@@ -5199,7 +5033,7 @@ async function registerV2Tools(domain, deps) {
     });
     editor.add({
       name: "team_claim",
-      description: "Claim a pending task from the shared task list. Only unclaimed, unblocked tasks can be claimed.",
+      description: "Claim a pending task from the shared task list. Only unclaimed tasks can be claimed.",
       input: {
         type: "object",
         properties: { task_id: str("ID of the task to claim") },
@@ -5210,11 +5044,11 @@ async function registerV2Tools(domain, deps) {
     });
     editor.add({
       name: "team_standby",
-      description: "Suspend active execution and enter standby mode voluntarily until unblocked or awakened by new messages or task dependencies.",
+      description: "Suspend active execution and enter standby mode voluntarily until awakened by new messages or task activity.",
       input: {
         type: "object",
         properties: {
-          reason: str("Reason for entering standby (e.g. waiting for dependencies or reviews)")
+          reason: str("Reason for entering standby (e.g. waiting for peer messages or reviews)")
         },
         additionalProperties: false
       },
@@ -5398,19 +5232,34 @@ var ProgressTracker = class {
   isChattyReported(sessionId) {
     return this.chattyReported.has(sessionId);
   }
-  /** Clear chatty report (e.g., when agent sends result to lead). */
+  /**
+   * Clear chatty report for a session, re-arming chatty detection.
+   *
+   * HARNESS-38 (M10): the flag is a one-shot suppression, so without a reset a
+   * member flagged once would never be re-evaluated for the rest of its
+   * session (stale report). It is reset on the pertinent "progress" transitions:
+   * a message bound for the lead (a legitimate report) and a task completion.
+   * Full session teardown is handled by `remove()`.
+   */
   clearChattyReport(sessionId) {
     this.chattyReported.delete(sessionId);
   }
-  /** Record that this member sent a team_message. Clears stall report. */
-  recordMessage(sessionId) {
+  /**
+   * Record that this member sent a team_message. Clears the stall report, and —
+   * when the message is bound for the lead (`toLead`) — also clears the chatty
+   * report: reporting to the lead is the desired behaviour that ends the
+   * over-coordination window, so chatty detection starts fresh afterwards.
+   */
+  recordMessage(sessionId, toLead = false) {
     this.lastMessageAt.set(sessionId, Date.now());
     this.clearReport(sessionId);
+    if (toLead) this.clearChattyReport(sessionId);
   }
-  /** Record that this member completed a task. Clears stall report. */
+  /** Record that this member completed a task. Clears stall and chatty reports. */
   recordTaskComplete(sessionId) {
     this.lastTaskAt.set(sessionId, Date.now());
     this.clearReport(sessionId);
+    this.clearChattyReport(sessionId);
   }
   /** Token-based stall: last `minSteps` steps all produced < `threshold` output tokens. */
   isTokenStalled(sessionId, minSteps, threshold) {
@@ -5786,9 +5635,9 @@ function buildTeammateSystemPrompt(db, teamId, memberName, config) {
     `You are "${memberName}", a teammate in team "${team.name}". Use team_message to communicate. ${leadReportDirective(config)}`,
     "",
     "ANTI-POLLING & EVENT-DRIVEN CONTRACT:",
-    "Do NOT poll team_tasks_list or team_status in loops waiting for task unblocking or peer work.",
-    "Operate purely event-driven: claim tasks using team_claim. If a task is blocked, claiming it pre-assigns and locks it to you; then stop and enter standby via team_standby.",
-    "The runtime automatically wakes you with a synthetic system prompt when dependent tasks are unblocked or peer messages arrive.",
+    "Do NOT poll team_tasks_list or team_status in loops waiting for peer work.",
+    "Operate purely event-driven: every board task is independent and ready to claim with team_claim; there is no task-blocking or DAG sequencing.",
+    "The runtime automatically wakes you with a synthetic system prompt when peer messages arrive or a card is handed over to you.",
     "",
     "ANTI-DUMPING & CODE EXPLORATION CONTRACT:",
     "Do NOT use bash grep, find, or broad shell scans across codebases.",
@@ -6158,22 +6007,20 @@ function deriveHealth(t){
   return{w:mm.filter(m=>m.status==='busy').length,i:mm.filter(m=>m.status==='ready').length,e:mm.filter(m=>m.status==='error').length,d:mm.filter(m=>m.status==='shutdown'||m.status==='shutdown_requested').length,total:mm.length};
 }
 
-function coarseTeamStatus(t){const h=deriveHealth(t),blocked=(t.tasks||[]).filter(x=>x.status==='blocked').length;if(h.e)return{label:'error',color:'red',dot:'bg-red-500'};if(blocked)return{label:'blocked',color:'amber',dot:'bg-amber-500'};if(h.w)return{label:'working',color:'blue',dot:'bg-blue-500'};if(h.i)return{label:'idle',color:'muted',dot:'bg-txt-500'};return{label:t.status==='active'?'empty':t.status,color:'muted',dot:'bg-base-600'}}
-function projectStatus(p){const teams=p.teams||[],counts={working:0,blocked:0,error:0,idle:0,done:0};teams.forEach(t=>{const s=coarseTeamStatus(t).label;if(s==='working')counts.working++;else if(s==='blocked')counts.blocked++;else if(s==='error')counts.error++;else if(s==='idle'||s==='empty')counts.idle++;else counts.done++});if(counts.error)return{label:'error',color:'red',dot:'bg-red-500',counts};if(counts.blocked)return{label:'blocked',color:'amber',dot:'bg-amber-500',counts};if(counts.working)return{label:'working',color:'blue',dot:'bg-blue-500',counts};return{label:'idle',color:'muted',dot:'bg-txt-500',counts}}
-function statusTitleProject(p){const s=projectStatus(p),teams=p.teams||[];return projectLabel(p)+'\\nStatus: '+s.label+'\\nTeams: '+teams.length+'\\nWorking: '+s.counts.working+' \xB7 Blocked: '+s.counts.blocked+' \xB7 Error: '+s.counts.error+' \xB7 Idle: '+s.counts.idle}
-function statusTitleTeam(t){const h=deriveHealth(t),tasks=t.tasks||[],blocked=tasks.filter(x=>x.status==='blocked').length,active=tasks.filter(x=>x.status==='in_progress').length,review=tasks.filter(x=>x.status==='in_review').length,pending=tasks.filter(x=>x.status==='pending').length,done=tasks.filter(x=>x.status==='completed').length;return t.name+'\\nStatus: '+coarseTeamStatus(t).label+'\\nAgents: '+h.total+' total, '+h.w+' working, '+h.i+' idle, '+h.e+' error\\nTasks: '+active+' active, '+(review?review+' in review, ':'')+blocked+' blocked, '+pending+' pending, '+done+' done'}
+function coarseTeamStatus(t){const h=deriveHealth(t);if(h.e)return{label:'error',color:'red',dot:'bg-red-500'};if(h.w)return{label:'working',color:'blue',dot:'bg-blue-500'};if(h.i)return{label:'idle',color:'muted',dot:'bg-txt-500'};return{label:t.status==='active'?'empty':t.status,color:'muted',dot:'bg-base-600'}}
+function projectStatus(p){const teams=p.teams||[],counts={working:0,error:0,idle:0,done:0};teams.forEach(t=>{const s=coarseTeamStatus(t).label;if(s==='working')counts.working++;else if(s==='error')counts.error++;else if(s==='idle'||s==='empty')counts.idle++;else counts.done++});if(counts.error)return{label:'error',color:'red',dot:'bg-red-500',counts};if(counts.working)return{label:'working',color:'blue',dot:'bg-blue-500',counts};return{label:'idle',color:'muted',dot:'bg-txt-500',counts}}
+function statusTitleProject(p){const s=projectStatus(p),teams=p.teams||[];return projectLabel(p)+'\\nStatus: '+s.label+'\\nTeams: '+teams.length+'\\nWorking: '+s.counts.working+' \xB7 Error: '+s.counts.error+' \xB7 Idle: '+s.counts.idle}
+function statusTitleTeam(t){const h=deriveHealth(t),tasks=t.tasks||[],active=tasks.filter(x=>x.status==='in_progress').length,review=tasks.filter(x=>x.status==='in_review').length,pending=tasks.filter(x=>x.status==='pending').length,done=tasks.filter(x=>x.status==='completed').length;return t.name+'\\nStatus: '+coarseTeamStatus(t).label+'\\nAgents: '+h.total+' total, '+h.w+' working, '+h.i+' idle, '+h.e+' error\\nTasks: '+active+' active, '+(review?review+' in review, ':'')+pending+' pending, '+done+' done'}
 
 function lastMessageFor(name,msgs){return msgs.filter(m=>m.fromName===name||m.toName===name).sort((a,b)=>b.timeCreated-a.timeCreated)[0]||null}
-function activeTaskFor(name,tasks){return tasks.find(x=>x.assignee===name&&x.status==='in_progress')||tasks.find(x=>x.assignee===name&&x.status==='in_review')||tasks.find(x=>x.assignee===name&&x.status==='blocked')||null}
-function blockedTaskFor(name,tasks){return tasks.find(x=>x.assignee===name&&x.status==='blocked')||null}
+function activeTaskFor(name,tasks){return tasks.find(x=>x.assignee===name&&x.status==='in_progress')||tasks.find(x=>x.assignee===name&&x.status==='in_review')||null}
 
 function rankAgent(a,b,t){
   const tasks=t?.tasks||[],msgs=t?.messages||[];
   const score=m=>{
-    const lm=lastMessageFor(m.name,msgs),bt=blockedTaskFor(m.name,tasks);
+    const lm=lastMessageFor(m.name,msgs);
     let s=0;
     if(m.status==='error')s-=1000;
-    if(bt)s-=800;
     if(m.status==='shutdown_requested')s-=650;
     if(m.status==='busy')s-=500;
     if(m.status==='ready'&&activeTaskFor(m.name,tasks))s-=350;
@@ -6186,16 +6033,15 @@ function rankAgent(a,b,t){
 
 function deriveAttention(t){
   const tasks=t.tasks||[],msgs=t.messages||[];
-  const blocked=tasks.filter(x=>x.status==='blocked'),running=tasks.filter(x=>x.status==='in_progress'),review=tasks.filter(x=>x.status==='in_review');
+  const running=tasks.filter(x=>x.status==='in_progress'),review=tasks.filter(x=>x.status==='in_review');
   const errored=(t.members||[]).filter(m=>m.status==='error');
   const stopping=(t.members||[]).filter(m=>m.status==='shutdown_requested');
   const latest=msgs[0]||null;
   const items=[];
   errored.forEach(m=>items.push({kind:'Agent error',label:m.name,detail:m.executionStatus||m.status,color:'red'}));
   review.forEach(x=>items.push({kind:'In review',label:x.assignee||'unassigned',detail:x.content,color:'amber'}));
-  blocked.forEach(x=>items.push({kind:'Blocked task',label:x.assignee||'unassigned',detail:x.content,color:'amber'}));
   stopping.forEach(m=>items.push({kind:'Stopping',label:m.name,detail:'shutdown requested',color:'amber'}));
-  return{items,running,review,latest,blocked,errored};
+  return{items,running,review,latest,errored};
 }
 
 function deriveSparkline(name,msgs){
@@ -6523,7 +6369,7 @@ function rAttention(t){
   const el=document.getElementById('attention'),a=deriveAttention(t),h=deriveHealth(t),tk=t.tasks||[];
   const tone=a.items.length?'border-amber-500/30 bg-amber-500/[0.05]':'border-emerald-500/20 bg-emerald-500/[0.035]';
   const lead=a.items.length?'Needs attention':'No blockers detected';
-  const chips=[chip(h.w+' working','blue'),chip(a.running.length+' active tasks','green'),(a.review?.length?chip(a.review.length+' in review','amber'):''),chip(a.blocked.length+' blocked',a.blocked.length?'amber':'muted'),chip(tk.filter(x=>x.status==='pending').length+' pending','muted')].filter(Boolean);
+  const chips=[chip(h.w+' working','blue'),chip(a.running.length+' active tasks','green'),(a.review?.length?chip(a.review.length+' in review','amber'):''),chip(tk.filter(x=>x.status==='pending').length+' pending','muted')].filter(Boolean);
   let html='<div class="rounded-lg border '+tone+' px-3 py-2 flex flex-col md:flex-row md:items-center gap-2 md:gap-4">';
   html+='<div class="min-w-[180px]"><div class="text-[10px] uppercase tracking-[.16em] text-txt-500">Team attention</div><div class="text-[14px] font-semibold text-txt-100">'+lead+'</div></div>';
   html+='<div class="flex flex-wrap gap-1.5">'+chips.join('')+'</div>';
@@ -6538,7 +6384,7 @@ function rAgents(t){
   if(!mm.length){patch(el,'<div class="col-span-full text-center py-12"><div class="text-txt-400 text-sm mb-1">No agents yet</div><div class="text-txt-500 text-[11px]">Spawn teammates with <code class="px-1 py-0.5 bg-base-900 rounded font-mono text-[10px]">team_spawn</code></div></div>');return}
   const n=Date.now(),msgs=t.messages||[],sorted=[...mm].sort((a,b)=>rankAgent(a,b,t));
   const html=sorted.map((m,idx)=>{
-    const s=si(m.status,m.executionStatus),task=activeTaskFor(m.name,t.tasks||[]),msg=lastMessageFor(m.name,msgs),blocked=blockedTaskFor(m.name,t.tasks||[]),inReview=task&&task.status==='in_review';
+    const s=si(m.status,m.executionStatus),task=activeTaskFor(m.name,t.tasks||[]),msg=lastMessageFor(m.name,msgs),inReview=task&&task.status==='in_review';
     const d=D(n-m.timeUpdated),mi=msg?relT(msg.timeCreated):'\\u2014';
     const tt=task?.content,tr=tt&&tt.length>90?tt.slice(0,90)+'\\u2026':tt;
     const mp=msg?(msg.content.length>90?msg.content.slice(0,90)+'\\u2026':msg.content):'';
@@ -6553,7 +6399,7 @@ function rAgents(t){
         '<span class="text-[10px] text-txt-500 ml-auto shrink-0">'+E(m.agent)+'</span>'+
         (m.model?chip(E(m.model),'muted'):'')+
       '</div>'+
-      (tr?'<div class="mt-2 text-[13px] text-txt-200 leading-snug truncate">'+(blocked?'<span class="text-amber-400">Blocked: </span>':inReview?'<span class="text-amber-400">In review: </span>':'Current task: ')+E(tr)+'</div>':'<div class="mt-2 text-[13px] text-txt-500 leading-snug">No active task</div>')+
+      (tr?'<div class="mt-2 text-[13px] text-txt-200 leading-snug truncate">'+(inReview?'<span class="text-amber-400">In review: </span>':'Current task: ')+E(tr)+'</div>':'<div class="mt-2 text-[13px] text-txt-500 leading-snug">No active task</div>')+
       (mp?'<div class="mt-1 text-[12px] text-txt-400 truncate">Latest: '+E(mp)+'</div>':'')+
       '<div class="mt-2 flex items-center gap-1.5 flex-wrap">'+
         chip('status '+d,'muted')+chip('msg '+mi,'muted')+chip(E(m.executionStatus||m.status),sx(m))+
@@ -6739,18 +6585,14 @@ function rTasks(t){
   if(!tk.length){patch(el,'<div class="text-txt-500 text-sm py-6 text-center">No tasks yet</div>');return}
   const c=tk.filter(x=>x.status==='completed').length,pct=Math.max(Math.round(c/tk.length*100),tk.length>0?2:0);
   const allDone=c===tk.length&&tk.length>0;
-  const g={in_progress:[],in_review:[],pending:[],completed:[],blocked:[],cancelled:[]};for(const x of tk)(g[x.status]||(g[x.status]=[])).push(x);
+  const g={in_progress:[],in_review:[],pending:[],completed:[],cancelled:[]};for(const x of tk)(g[x.status]||(g[x.status]=[])).push(x);
   const ds=saveD(el);
-  const taskMap={};tk.forEach(x=>{taskMap[x.id]=x});
   function grp(label,items,dc,defOpen){
     if(!items.length)return'';
     const rows=items.map(x=>{
       const ic=x.status==='completed'?'\\u2713':x.status==='in_progress'?'\\u25CF':x.status==='in_review'?'\\u25C9':'\\u25CB';
       const icl=x.status==='completed'?'text-emerald-500':x.status==='in_progress'?'text-blue-400':x.status==='in_review'?'text-amber-400':'text-txt-500';
       const p=PR[x.priority]||PR.low,cn=x.content.length>55?x.content.slice(0,55)+'\\u2026':x.content;
-      let dep='';
-      const depIds=Array.isArray(x.dependsOn)?x.dependsOn:(x.dependsOn?[String(x.dependsOn)]:[]);
-      if(depIds.length){const labels=depIds.map(id=>{const parent=taskMap[id];return parent?parent.content.slice(0,42):id}).join(', ');dep='<div class="text-[10px] text-txt-500 mt-0.5">blocked by: '+E(labels)+'</div>'}
       const reviewBadge=x.status==='in_review'?chip('in review','amber'):'';
       const rejChip=(x.rejectionCount&&x.rejectionCount>0)?chip('rejections: '+x.rejectionCount,'red'):'';
       const notes=(x.reviewNotes)?'<div class="text-[10px] text-amber-400/80 italic mt-0.5">notes: '+E(x.reviewNotes)+'</div>':'';
@@ -6758,7 +6600,7 @@ function rTasks(t){
         '<span class="'+icl+' text-[11px] mt-[2px] shrink-0">'+ic+'</span>'+
         '<div class="flex-1 min-w-0"><div class="text-[13px] text-txt-200 truncate">'+E(cn)+'</div>'+
         '<div class="flex items-center gap-2 mt-1 text-[10px] flex-wrap"><span class="rounded px-1.5 py-[0px] '+p+'">'+E(x.priority)+'</span>'+
-        '<span class="text-txt-500">'+(E(x.assignee)||'unassigned')+'</span>'+reviewBadge+rejChip+'</div>'+dep+notes+'</div></div>';
+        '<span class="text-txt-500">'+(E(x.assignee)||'unassigned')+'</span>'+reviewBadge+rejChip+'</div>'+notes+'</div></div>';
     }).join('');
     return '<details '+(defOpen?'open':'')+'><summary class="flex items-center gap-2 text-[11px] text-txt-300 cursor-pointer py-1.5 hover:text-txt-200 transition-colors select-none">'+
       '<svg class="w-3 h-3 transition-transform [details[open]>summary>&]:rotate-90" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>'+
@@ -6771,7 +6613,7 @@ function rTasks(t){
     '<span class="text-[11px] text-txt-400 font-mono">'+c+'/'+tk.length+'</span>'+
     (allDone?'<span class="text-emerald-400 text-[10px] font-medium">All complete</span>':'')+
   '</div>'+
-  grp('In Progress',g.in_progress,'bg-blue-500',true)+grp('In Review',g.in_review||[],'bg-amber-500',true)+grp('Pending',g.pending,'bg-txt-500',true)+grp('Blocked',g.blocked||[],'bg-amber-500',true)+grp('Completed',g.completed,'bg-emerald-500',false);
+  grp('In Progress',g.in_progress,'bg-blue-500',true)+grp('In Review',g.in_review||[],'bg-amber-500',true)+grp('Pending',g.pending,'bg-txt-500',true)+grp('Completed',g.completed,'bg-emerald-500',false);
   restD(el,ds);
 }
 
@@ -6836,23 +6678,12 @@ function rTimeline(t){
 // src/dashboard.ts
 init_log();
 var DASHBOARD_HTML = DASHBOARD_HEAD + "\n<script>" + DASHBOARD_JS_CORE + DASHBOARD_JS_RENDER + DASHBOARD_JS_EVENTS + "</script>\n</body></html>";
-function parseDependsOn(value) {
-  if (!value) return [];
-  try {
-    const parsed = JSON.parse(value);
-    if (Array.isArray(parsed)) return parsed.filter((item) => typeof item === "string");
-    if (typeof parsed === "string") return [parsed];
-  } catch {
-    return [value];
-  }
-  return [];
-}
 var ENSEMBLE_STATE_VERSION = 1;
 function buildState(db) {
   const projects = db.query("SELECT id, name, path, status, time_created, time_updated FROM project ORDER BY time_updated DESC").all();
   const teams = db.query("SELECT id, name, project_id, lead_session_id, status, lead_agent, time_created, time_updated FROM team ORDER BY time_created DESC").all();
   const memberStmt = db.query("SELECT name, agent, status, execution_status, session_id, worktree_branch, prompt, model, plan_approval, time_created, time_updated, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message FROM team_member WHERE team_id = ?");
-  const taskStmt = db.query("SELECT id, content, status, priority, assignee, depends_on, time_created, time_updated, rejection_count, review_notes FROM team_task WHERE team_id = ?");
+  const taskStmt = db.query("SELECT id, content, status, priority, assignee, time_created, time_updated, rejection_count, review_notes FROM team_task WHERE team_id = ?");
   const msgStmt = db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC LIMIT 50");
   const mappedTeams = teams.map((t) => {
     const members = memberStmt.all(t.id).map((m) => ({
@@ -6893,7 +6724,6 @@ function buildState(db) {
         status: tk.status,
         priority: tk.priority,
         assignee: tk.assignee,
-        dependsOn: parseDependsOn(tk.depends_on),
         timeCreated: tk.time_created,
         timeUpdated: tk.time_updated,
         rejectionCount: tk.rejection_count ?? 0,
@@ -7616,7 +7446,7 @@ var Watchdog = class _Watchdog {
         continue;
       }
       const taskCountRow = this.db.query(
-        "SELECT COUNT(*) as count FROM team_task WHERE team_id = ? AND status IN ('pending', 'in_progress', 'in_review', 'blocked')"
+        "SELECT COUNT(*) as count FROM team_task WHERE team_id = ? AND status IN ('pending', 'in_progress', 'in_review')"
       ).get(team.id);
       const unfinishedCount = taskCountRow?.count ?? 0;
       if (unfinishedCount === 0) continue;
@@ -7743,7 +7573,12 @@ var Watchdog = class _Watchdog {
   /** Start the periodic check. Runs stale worktree GC regardless of TTL setting. */
   start() {
     if (!this.timer) {
-      this.timer = setInterval(() => this.check(), this.checkIntervalMs);
+      this.timer = setInterval(() => {
+        this.check().catch((err) => {
+          log(`watchdog:check:err err=${err instanceof Error ? err.message : String(err)}`);
+        });
+      }, this.checkIntervalMs);
+      this.timer?.unref?.();
     }
     if (!this.roomInactivityTimer && this.roomInactivityCheckMs > 0 && this.roomInactivityThresholdMs > 0) {
       this.roomInactivityTimer = setInterval(() => {
@@ -7751,10 +7586,16 @@ var Watchdog = class _Watchdog {
           log(`watchdog:room-inactivity:err err=${err instanceof Error ? err.message : String(err)}`);
         });
       }, this.roomInactivityCheckMs);
+      this.roomInactivityTimer?.unref?.();
     }
   }
-  /** Stop the periodic check. */
-  stop() {
+  /**
+   * HARNESS-38 (M9): idempotent teardown — clears every timer exactly once.
+   * Safe to call repeatedly and from any lifecycle path (plugin dispose, room
+   * shutdown, test harness). Kept as the canonical implementation; `stop()` is
+   * the legacy name and simply delegates here.
+   */
+  dispose() {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = void 0;
@@ -7763,6 +7604,10 @@ var Watchdog = class _Watchdog {
       clearInterval(this.roomInactivityTimer);
       this.roomInactivityTimer = void 0;
     }
+  }
+  /** Stop the periodic check (legacy alias of {@link dispose}). Idempotent. */
+  stop() {
+    this.dispose();
   }
   /** Whether the watchdog is currently running. */
   isRunning() {
@@ -7852,6 +7697,9 @@ async function setupEnsemble(ctx, options = {}) {
           });
         }
       }
+    }
+    if (transition && transition.to === "shutdown") {
+      nudgedMembers.delete(`${transition.teamId}:${transition.memberName}`);
     }
     if (transition && rpc) {
       await emitMemberEvent(rpc, transition).catch(() => {
@@ -8013,6 +7861,7 @@ async function setupEnsemble(ctx, options = {}) {
       controller.abort();
       watchdog?.stop();
       dashboard?.stop();
+      nudgedMembers.clear();
     }
   };
 }
@@ -8100,6 +7949,17 @@ var plugin = async (input) => {
   const tracker = new DescendantTracker();
   const purgeApprovals = new PendingPurgeApprovals();
   const nudgedMembers = /* @__PURE__ */ new Set();
+  const clearMemberNudges = (teamId, memberName) => {
+    nudgedMembers.delete(`${teamId}:${memberName}`);
+    nudgedMembers.delete(`fastidle:${teamId}:${memberName}`);
+  };
+  const clearTeamNudges = (teamId) => {
+    const idlePrefix = `${teamId}:`;
+    const fastIdlePrefix = `fastidle:${teamId}:`;
+    for (const key of nudgedMembers) {
+      if (key.startsWith(idlePrefix) || key.startsWith(fastIdlePrefix)) nudgedMembers.delete(key);
+    }
+  };
   const progressTracker = new ProgressTracker();
   const activityBuffer = new ActivityBuffer();
   const wakeLeadTimestamps = /* @__PURE__ */ new Map();
@@ -8181,6 +8041,7 @@ var plugin = async (input) => {
         if (transition) {
           if (transition.to === "shutdown") {
             notifyTeamEvent(client, "shutdown", { memberName: transition.memberName });
+            clearMemberNudges(transition.teamId, transition.memberName);
           } else if (transition.to === "ready" && transition.from === "busy") {
             notifyTeamEvent(client, "completed", { memberName: transition.memberName });
             const fastIdleKey = `fastidle:${transition.teamId}:${transition.memberName}`;
@@ -8489,7 +8350,7 @@ var plugin = async (input) => {
         },
         async execute(args, ctx) {
           const result = await executeTeamMessage(deps, args, ctx.sessionID);
-          progressTracker.recordMessage(ctx.sessionID);
+          progressTracker.recordMessage(ctx.sessionID, args.to === "lead");
           if (args.to !== "lead") progressTracker.recordPeerMessage(ctx.sessionID);
           ctx.metadata({ title: args.model ? `Set ${args.to} model \u2192 ${args.model}` : `Message \u2192 ${args.to}` });
           return result;
@@ -8519,14 +8380,12 @@ var plugin = async (input) => {
         }
       }),
       team_tasks_add: tool({
-        description: "Add tasks to the shared team task board so teammates can see what work is available and claim it.",
+        description: "Add tasks to the shared team task board so teammates can see what work is available and claim it. Every task is born ready to claim \u2014 the board is a flat, fully-parallel pool.",
         args: {
           tasks: tool.schema.array(tool.schema.object({
             content: tool.schema.string().describe("Task description"),
-            priority: tool.schema.enum(["high", "medium", "low"]).default("medium").describe("Task priority"),
-            depends_on: tool.schema.array(tool.schema.string()).optional().describe("Task IDs this depends on")
-          })).describe("Tasks to add"),
-          sequential: tool.schema.boolean().optional().describe("If true, tasks are added in sequence where each task depends on the previous one. Defaults to false (tasks are independent/parallel unless depends_on is explicitly specified).")
+            priority: tool.schema.enum(["high", "medium", "low"]).default("medium").describe("Task priority")
+          })).describe("Tasks to add")
         },
         async execute(args, ctx) {
           const result = await executeTeamTasksAdd(deps, args, ctx.sessionID);
@@ -8535,7 +8394,7 @@ var plugin = async (input) => {
         }
       }),
       team_tasks_complete: tool({
-        description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
+        description: "Mark a task as completed on the shared board, or submit/reject a review.",
         args: {
           task_id: tool.schema.string().describe("ID of the task to mark complete, submit for review, or reject"),
           action: tool.schema.enum(["complete", "submit_review", "reject", "sdet_pass"]).optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), 'reject' (in_review -> in_progress), or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate). Any other value is rejected with INVALID_ACTION."),
@@ -8549,7 +8408,7 @@ var plugin = async (input) => {
         }
       }),
       team_claim: tool({
-        description: "Claim a pending task from the shared task list. Only unclaimed, unblocked tasks can be claimed.",
+        description: "Claim a pending task from the shared task list. Only unclaimed tasks can be claimed.",
         args: {
           task_id: tool.schema.string().describe("ID of the task to claim")
         },
@@ -8560,7 +8419,7 @@ var plugin = async (input) => {
         }
       }),
       team_standby: tool({
-        description: "Suspend active execution and enter standby mode voluntarily until unblocked or awakened by new messages or task dependencies.",
+        description: "Suspend active execution and enter standby mode voluntarily until awakened by new messages or task activity.",
         args: {
           reason: tool.schema.string().optional().describe("Reason for entering standby")
         },
@@ -8605,8 +8464,8 @@ var plugin = async (input) => {
           confirm_token: tool.schema.string().optional().describe("Confirmation token from the purge preview. Valid only after the matching exact approval answer is selected in this session.")
         },
         async execute(args, ctx) {
-          const result = await executeTeamShutdown(deps, args, ctx.sessionID, void 0, void 0, void 0, void 0, void 0, config.mergeOnCleanup);
           const callerTeam = findTeamBySession(db, registry, ctx.sessionID);
+          const result = await executeTeamShutdown(deps, args, ctx.sessionID, void 0, void 0, void 0, void 0, void 0, config.mergeOnCleanup);
           if (callerTeam) {
             const memberArg = args.member?.trim();
             const wildcard2 = !memberArg || memberArg === "*" || memberArg.toLowerCase() === "all";
@@ -8616,6 +8475,7 @@ var plugin = async (input) => {
                 progressTracker.remove(s.session_id);
                 activityBuffer.remove(s.session_id);
               }
+              if (!result.includes("uncommitted")) clearTeamNudges(callerTeam.teamId);
             } else {
               const member = deps.db.query(
                 "SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status IN ('shutdown', 'shutdown_requested')"
@@ -8623,6 +8483,7 @@ var plugin = async (input) => {
               if (member) {
                 progressTracker.remove(member.session_id);
                 activityBuffer.remove(member.session_id);
+                clearMemberNudges(callerTeam.teamId, memberArg);
               }
             }
           }
@@ -8649,6 +8510,7 @@ var plugin = async (input) => {
           const result = await executeTeamShutdown(deps, { ...args, member: "*" }, ctx.sessionID, void 0, void 0, void 0, void 0, void 0, config.mergeOnCleanup);
           if (!result.includes("uncommitted") && !args.purge) {
             for (const sid of memberSessions) activityBuffer.remove(sid);
+            if (teamInfoForCleanup) clearTeamNudges(teamInfoForCleanup.teamId);
           }
           const blocked = result.includes("uncommitted");
           const title = args.purge ? result.startsWith("No archived teams") ? "No archived teams to purge" : result.startsWith("Purge") ? "Purge confirmation required" : "Archived teams purged" : blocked ? "Cleanup blocked \u2014 uncommitted changes" : "Team cleaned up";
@@ -8745,7 +8607,6 @@ export {
   handleRetryModelFailover,
   hasActivePeerDialogue,
   hasAwaitingLeadDecision,
-  hasBlockedAssignedTasks,
   hasInReviewAssignedTasks,
   hasOtherActiveMembers,
   hasPendingBoardTasks,

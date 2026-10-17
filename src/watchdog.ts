@@ -431,7 +431,7 @@ export class Watchdog {
 
       // Check unfinished tasks on the board
       const taskCountRow = this.db.query(
-        "SELECT COUNT(*) as count FROM team_task WHERE team_id = ? AND status IN ('pending', 'in_progress', 'in_review', 'blocked')"
+        "SELECT COUNT(*) as count FROM team_task WHERE team_id = ? AND status IN ('pending', 'in_progress', 'in_review')"
       ).get(team.id) as { count: number } | null
       const unfinishedCount = taskCountRow?.count ?? 0
       if (unfinishedCount === 0) continue
@@ -610,7 +610,20 @@ export class Watchdog {
   /** Start the periodic check. Runs stale worktree GC regardless of TTL setting. */
   start(): void {
     if (!this.timer) {
-      this.timer = setInterval(() => this.check(), this.checkIntervalMs)
+      // HARNESS-38 (M9): the tick body is async — an unhandled rejection inside
+      // check() would otherwise escape the interval callback and crash the
+      // process (Node's unhandledRejection). Swallow-and-log keeps the sweep
+      // alive for the next tick, exactly like the room-inactivity timer below.
+      this.timer = setInterval(() => {
+        this.check().catch((err) => {
+          log(`watchdog:check:err err=${err instanceof Error ? err.message : String(err)}`)
+        })
+      }, this.checkIntervalMs)
+      // HARNESS-38 (M9): do not hold the event loop open. A periodic watchdog
+      // must never be the reason the host process refuses to exit on shutdown;
+      // unref() lets Node/Bun terminate while the timer stays armed for as long
+      // as the process lives. Optional call keeps browser-like shims safe.
+      this.timer?.unref?.()
     }
     if (!this.roomInactivityTimer && this.roomInactivityCheckMs > 0 && this.roomInactivityThresholdMs > 0) {
       this.roomInactivityTimer = setInterval(() => {
@@ -618,11 +631,17 @@ export class Watchdog {
           log(`watchdog:room-inactivity:err err=${err instanceof Error ? err.message : String(err)}`)
         })
       }, this.roomInactivityCheckMs)
+      this.roomInactivityTimer?.unref?.()
     }
   }
 
-  /** Stop the periodic check. */
-  stop(): void {
+  /**
+   * HARNESS-38 (M9): idempotent teardown — clears every timer exactly once.
+   * Safe to call repeatedly and from any lifecycle path (plugin dispose, room
+   * shutdown, test harness). Kept as the canonical implementation; `stop()` is
+   * the legacy name and simply delegates here.
+   */
+  dispose(): void {
     if (this.timer) {
       clearInterval(this.timer)
       this.timer = undefined
@@ -631,6 +650,11 @@ export class Watchdog {
       clearInterval(this.roomInactivityTimer)
       this.roomInactivityTimer = undefined
     }
+  }
+
+  /** Stop the periodic check (legacy alias of {@link dispose}). Idempotent. */
+  stop(): void {
+    this.dispose()
   }
 
   /** Whether the watchdog is currently running. */

@@ -327,10 +327,12 @@ async function runBehavior(label, mods) {
        VALUES (?,?,?,?,?,?,?,?)`,
       [teamId, name, sessionId, "build", "ready", "idle", now, now],
     );
-  const insertTask = (id, teamId, status, assignee, dependsOn) =>
+  // TICKET-HARNESS-51: the board is a flat, fully-parallel pool — no depends_on
+  // column exists anymore, so the legacy 5th argument is accepted and ignored.
+  const insertTask = (id, teamId, status, assignee, _dependsOn) =>
     db.run(
-      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, depends_on, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?,?)",
-      [id, teamId, `task ${id}`, status, "medium", assignee, dependsOn, now, now],
+      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?)",
+      [id, teamId, `task ${id}`, status, "medium", assignee, now, now],
     );
   const leadRows = (teamId) =>
     db.query("SELECT from_name, to_name, content, delivered FROM team_message WHERE team_id = ? AND to_name = 'lead' ORDER BY time_created ASC").all(teamId);
@@ -509,7 +511,8 @@ async function runBehavior(label, mods) {
   check(`[${label}] D5 re-completar é rejeitado (guarda de acurácia do board)`, threwAgain);
   check(`[${label}] D5b re-completar NÃO dispara wake duplicado`, calls.promptAsync.length === base, `delta=${calls.promptAsync.length - base}`);
 
-  // D6: fluxo com dependência — wake SÓ na última tarefa.
+  // D6: pool plano (TICKET-HARNESS-51) — tarefas independentes: concluir tA
+  // NÃO altera tB nem acorda ninguém; só a última conclusão acorda o lead.
   {
     const T6 = "team_dep";
     const L6 = "ses_lead_dep";
@@ -518,16 +521,14 @@ async function runBehavior(label, mods) {
     insertTeam(T6, "dep-team", L6);
     insertMember(T6, M6, S6);
     registry.register(T6, M6, S6);
-    insertTask("tA", T6, "pending", M6, null);
-    insertTask("tB", T6, "blocked", M6, JSON.stringify(["tA"]));
+    insertTask("tA", T6, "pending", M6);
+    insertTask("tB", T6, "pending", M6);
 
     base = calls.promptAsync.length;
     await executeTeamTasksComplete(deps(DEFAULT_CONFIG), { task_id: "tA" }, S6);
-    const unblocked = db.query("SELECT status FROM team_task WHERE id = 'tB'").get()?.status;
-    check(`[${label}] D6a concluir tA desbloqueia tB`, unblocked === "in_progress" || unblocked === "pending", String(unblocked));
-    // D6b (realinhado p/ HARNESS-16): concluir tA desbloqueia tB e ACORDA o
-    // assignee pré-atribuído (M6) incondicionalmente → delta=1, mas o LEAD
-    // (L6) NÃO pode ser acordado enquanto o board está incompleto (1/2).
+    const tBAfter = db.query("SELECT status FROM team_task WHERE id = 'tB'").get()?.status;
+    check(`[${label}] D6a concluir tA não altera tB (pool plano)`, tBAfter === "pending", String(tBAfter));
+    // D6b: board ainda incompleto (1/2): o LEAD (L6) NÃO pode ser acordado.
     // Filtramos pela sessão do lead, espelhando o D6c.
     const leadWakesD6b = calls.promptAsync.slice(base).filter(c => c.sessionID === L6).length;
     check(`[${label}] D6b board ainda incompleto (1/2): sem wake do LEAD`, leadWakesD6b === 0, `leadWakes=${leadWakesD6b} total=${calls.promptAsync.length - base}`);

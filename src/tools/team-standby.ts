@@ -50,5 +50,5 @@ export async function executeTeamStandby(
   setMemberStandby(deps.db, teamInfo.teamId, memberName, args.reason)
 
   const reasonStr = args.reason ? ` (reason: ${args.reason})` : ""
-  return `Entered standby mode${reasonStr}. Execution suspended until dependencies are unblocked or a new message arrives.`
+  return `Entered standby mode${reasonStr}. Execution suspended until a new message arrives.`
 }

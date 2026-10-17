@@ -115,22 +115,20 @@ function deriveHealth(t){
   return{w:mm.filter(m=>m.status==='busy').length,i:mm.filter(m=>m.status==='ready').length,e:mm.filter(m=>m.status==='error').length,d:mm.filter(m=>m.status==='shutdown'||m.status==='shutdown_requested').length,total:mm.length};
 }
 
-function coarseTeamStatus(t){const h=deriveHealth(t),blocked=(t.tasks||[]).filter(x=>x.status==='blocked').length;if(h.e)return{label:'error',color:'red',dot:'bg-red-500'};if(blocked)return{label:'blocked',color:'amber',dot:'bg-amber-500'};if(h.w)return{label:'working',color:'blue',dot:'bg-blue-500'};if(h.i)return{label:'idle',color:'muted',dot:'bg-txt-500'};return{label:t.status==='active'?'empty':t.status,color:'muted',dot:'bg-base-600'}}
-function projectStatus(p){const teams=p.teams||[],counts={working:0,blocked:0,error:0,idle:0,done:0};teams.forEach(t=>{const s=coarseTeamStatus(t).label;if(s==='working')counts.working++;else if(s==='blocked')counts.blocked++;else if(s==='error')counts.error++;else if(s==='idle'||s==='empty')counts.idle++;else counts.done++});if(counts.error)return{label:'error',color:'red',dot:'bg-red-500',counts};if(counts.blocked)return{label:'blocked',color:'amber',dot:'bg-amber-500',counts};if(counts.working)return{label:'working',color:'blue',dot:'bg-blue-500',counts};return{label:'idle',color:'muted',dot:'bg-txt-500',counts}}
-function statusTitleProject(p){const s=projectStatus(p),teams=p.teams||[];return projectLabel(p)+'\\nStatus: '+s.label+'\\nTeams: '+teams.length+'\\nWorking: '+s.counts.working+' · Blocked: '+s.counts.blocked+' · Error: '+s.counts.error+' · Idle: '+s.counts.idle}
-function statusTitleTeam(t){const h=deriveHealth(t),tasks=t.tasks||[],blocked=tasks.filter(x=>x.status==='blocked').length,active=tasks.filter(x=>x.status==='in_progress').length,review=tasks.filter(x=>x.status==='in_review').length,pending=tasks.filter(x=>x.status==='pending').length,done=tasks.filter(x=>x.status==='completed').length;return t.name+'\\nStatus: '+coarseTeamStatus(t).label+'\\nAgents: '+h.total+' total, '+h.w+' working, '+h.i+' idle, '+h.e+' error\\nTasks: '+active+' active, '+(review?review+' in review, ':'')+blocked+' blocked, '+pending+' pending, '+done+' done'}
+function coarseTeamStatus(t){const h=deriveHealth(t);if(h.e)return{label:'error',color:'red',dot:'bg-red-500'};if(h.w)return{label:'working',color:'blue',dot:'bg-blue-500'};if(h.i)return{label:'idle',color:'muted',dot:'bg-txt-500'};return{label:t.status==='active'?'empty':t.status,color:'muted',dot:'bg-base-600'}}
+function projectStatus(p){const teams=p.teams||[],counts={working:0,error:0,idle:0,done:0};teams.forEach(t=>{const s=coarseTeamStatus(t).label;if(s==='working')counts.working++;else if(s==='error')counts.error++;else if(s==='idle'||s==='empty')counts.idle++;else counts.done++});if(counts.error)return{label:'error',color:'red',dot:'bg-red-500',counts};if(counts.working)return{label:'working',color:'blue',dot:'bg-blue-500',counts};return{label:'idle',color:'muted',dot:'bg-txt-500',counts}}
+function statusTitleProject(p){const s=projectStatus(p),teams=p.teams||[];return projectLabel(p)+'\\nStatus: '+s.label+'\\nTeams: '+teams.length+'\\nWorking: '+s.counts.working+' · Error: '+s.counts.error+' · Idle: '+s.counts.idle}
+function statusTitleTeam(t){const h=deriveHealth(t),tasks=t.tasks||[],active=tasks.filter(x=>x.status==='in_progress').length,review=tasks.filter(x=>x.status==='in_review').length,pending=tasks.filter(x=>x.status==='pending').length,done=tasks.filter(x=>x.status==='completed').length;return t.name+'\\nStatus: '+coarseTeamStatus(t).label+'\\nAgents: '+h.total+' total, '+h.w+' working, '+h.i+' idle, '+h.e+' error\\nTasks: '+active+' active, '+(review?review+' in review, ':'')+pending+' pending, '+done+' done'}
 
 function lastMessageFor(name,msgs){return msgs.filter(m=>m.fromName===name||m.toName===name).sort((a,b)=>b.timeCreated-a.timeCreated)[0]||null}
-function activeTaskFor(name,tasks){return tasks.find(x=>x.assignee===name&&x.status==='in_progress')||tasks.find(x=>x.assignee===name&&x.status==='in_review')||tasks.find(x=>x.assignee===name&&x.status==='blocked')||null}
-function blockedTaskFor(name,tasks){return tasks.find(x=>x.assignee===name&&x.status==='blocked')||null}
+function activeTaskFor(name,tasks){return tasks.find(x=>x.assignee===name&&x.status==='in_progress')||tasks.find(x=>x.assignee===name&&x.status==='in_review')||null}
 
 function rankAgent(a,b,t){
   const tasks=t?.tasks||[],msgs=t?.messages||[];
   const score=m=>{
-    const lm=lastMessageFor(m.name,msgs),bt=blockedTaskFor(m.name,tasks);
+    const lm=lastMessageFor(m.name,msgs);
     let s=0;
     if(m.status==='error')s-=1000;
-    if(bt)s-=800;
     if(m.status==='shutdown_requested')s-=650;
     if(m.status==='busy')s-=500;
     if(m.status==='ready'&&activeTaskFor(m.name,tasks))s-=350;
@@ -143,16 +141,15 @@ function rankAgent(a,b,t){
 
 function deriveAttention(t){
   const tasks=t.tasks||[],msgs=t.messages||[];
-  const blocked=tasks.filter(x=>x.status==='blocked'),running=tasks.filter(x=>x.status==='in_progress'),review=tasks.filter(x=>x.status==='in_review');
+  const running=tasks.filter(x=>x.status==='in_progress'),review=tasks.filter(x=>x.status==='in_review');
   const errored=(t.members||[]).filter(m=>m.status==='error');
   const stopping=(t.members||[]).filter(m=>m.status==='shutdown_requested');
   const latest=msgs[0]||null;
   const items=[];
   errored.forEach(m=>items.push({kind:'Agent error',label:m.name,detail:m.executionStatus||m.status,color:'red'}));
   review.forEach(x=>items.push({kind:'In review',label:x.assignee||'unassigned',detail:x.content,color:'amber'}));
-  blocked.forEach(x=>items.push({kind:'Blocked task',label:x.assignee||'unassigned',detail:x.content,color:'amber'}));
   stopping.forEach(m=>items.push({kind:'Stopping',label:m.name,detail:'shutdown requested',color:'amber'}));
-  return{items,running,review,latest,blocked,errored};
+  return{items,running,review,latest,errored};
 }
 
 function deriveSparkline(name,msgs){

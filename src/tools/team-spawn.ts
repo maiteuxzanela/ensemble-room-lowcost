@@ -223,20 +223,11 @@ export async function executeTeamSpawn(
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory)
   const usePlanApproval = args.plan_approval === true
 
-  // Auto-standby check: if claim_task is provided and the task is blocked
+  // Auto-standby check: the board is a flat, fully-parallel pool — there is no
+  // 'blocked' task state, so a claimed task never forces standby by itself.
+  // (TICKET-HARNESS-51)
   let autoStandby = false
   let autoStandbyReason = ""
-  let claimedTaskBlocked = false
-  if (args.claim_task) {
-    const task = deps.db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?")
-      .get(args.claim_task, teamInfo.teamId) as { status: string } | null
-    if (task && task.status === "blocked") {
-      autoStandby = true
-      claimedTaskBlocked = true
-      autoStandbyReason = `claimed task ${args.claim_task} is blocked`
-      log(`spawn:auto-standby member=${args.name} task=${args.claim_task} reason=task_blocked`)
-    }
-  }
 
   // Semantic Auto-Standby for Quality Gate Guardian:
   // If this spawn carries the QA role (explicit role/is_qa or clara retrocompat)
@@ -276,13 +267,7 @@ export async function executeTeamSpawn(
   // Standby mode: the member is registered and its session is created, but no
   // prompt is sent at birth (zero tokens). The full init prompt is persisted in
   // spawn_context and prepended by the first team_message/team_broadcast.
-  // `let` — TICKET-HARNESS-36 (P5) may revert a task-blocked auto-standby when
-  // the pre-claim of the blocked task loses the race (see below).
-  let useStandby = (args.standby === true || autoStandby) && args.standby !== false
-  // TICKET-HARNESS-36 (P5): set when a task-blocked auto-standby is reverted
-  // because the pre-claim failed — the member runs normally instead of sleeping
-  // forever in standby without any assigned work.
-  let standbyReverted = false
+  const useStandby = (args.standby === true || autoStandby) && args.standby !== false
 
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`)
 
@@ -508,47 +493,13 @@ export async function executeTeamSpawn(
   let claimedTaskContent: string | null = null
   let claimWarning: string | null = null
   if (args.claim_task && !isReadOnly) {
-    if (claimedTaskBlocked) {
-      // Pre-assign the blocked task atomically
-      const updateResult = deps.db.run(
-        "UPDATE team_task SET assignee = ?, time_updated = ? WHERE id = ? AND team_id = ? AND assignee IS NULL",
-        [args.name, Date.now(), args.claim_task, teamInfo.teamId]
-      )
-      if (updateResult.changes === 0) {
-        claimWarning = `Task "${args.claim_task}" is already claimed or missing`
-        log(`spawn:claim-blocked:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`)
-        // TICKET-HARNESS-36 (P5): the blocked pre-claim lost the race. The
-        // standby was caused ONLY by the blocked task (not by the QA/SDET
-        // semantic standby nor an explicit args.standby), so leaving the member
-        // in standby would strand it forever — no task is assigned and no
-        // dependency will ever wake it. Revert to the normal path: back to
-        // busy/starting, record the progress baseline, and let the standard
-        // promptAsync below run so the member starts with its spawn context.
-        if (useStandby && claimedTaskBlocked && !spawnIsQA && !spawnIsSDET && args.standby !== true) {
-          useStandby = false
-          standbyReverted = true
-          deps.db.run(
-            "UPDATE team_member SET status = 'busy', execution_status = 'starting', time_updated = ? WHERE team_id = ? AND name = ?",
-            [Date.now(), teamInfo.teamId, args.name],
-          )
-          deps.progressTracker.recordBusyStart(childSessionId)
-          log(`spawn:claim-blocked:standby-reverted name=${args.name} task=${args.claim_task}`)
-        }
-      } else {
-        const taskRow = deps.db.query("SELECT content FROM team_task WHERE id = ? AND team_id = ?")
-          .get(args.claim_task, teamInfo.teamId) as { content: string } | null
-        claimedTaskContent = taskRow?.content ?? null
-        log(`spawn:claim-blocked:ok name=${args.name} task=${args.claim_task}`)
-      }
-    } else {
-      try {
-        const claimResult = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name)
-        claimedTaskContent = claimResult.content
-        log(`spawn:claim:ok name=${args.name} task=${args.claim_task}`)
-      } catch (err) {
-        claimWarning = err instanceof Error ? err.message : String(err)
-        log(`spawn:claim:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`)
-      }
+    try {
+      const claimResult = claimTask(deps.db, teamInfo.teamId, args.claim_task, args.name)
+      claimedTaskContent = claimResult.content
+      log(`spawn:claim:ok name=${args.name} task=${args.claim_task}`)
+    } catch (err) {
+      claimWarning = err instanceof Error ? err.message : String(err)
+      log(`spawn:claim:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`)
     }
   }
 
@@ -624,7 +575,7 @@ export async function executeTeamSpawn(
       "- team_message: send a message to the lead or another teammate",
       "- team_broadcast: send a message to all team members",
       "- team_tasks_list: view the shared team task board",
-      "- team_standby: yield execution and enter standby mode until unblocked or messaged",
+      "- team_standby: yield execution and enter standby mode until messaged",
       "- decision_lead: escalate an emergency decision to the team lead and pause until they deliberate",
     )
   } else {
@@ -636,7 +587,7 @@ export async function executeTeamSpawn(
       "- team_tasks_add: add tasks to the shared board",
       "- team_tasks_complete: mark a task complete on the shared board",
       "- team_claim: claim a pending task from the shared board",
-      "- team_standby: yield execution and enter standby mode until unblocked or messaged",
+      "- team_standby: yield execution and enter standby mode until messaged",
       "- team_task_handover: hand an in_progress task you own to another teammate (intra-card baton pass) and enter standby",
       "- decision_lead: escalate an emergency decision to the team lead and pause until they deliberate",
     )
@@ -852,11 +803,9 @@ export async function executeTeamSpawn(
   }
 
   const branchInfo = worktreeBranch ? ` (branch: ${worktreeBranch})` : ""
-  const standbyInfo = standbyReverted
-    ? ` (standby reverted: claimed task ${args.claim_task} was already claimed — member started normally)`
-    : autoStandby
-      ? ` (auto-standby: ${claimedTaskBlocked ? `claimed task ${args.claim_task} is blocked` : autoStandbyReason})`
-      : useStandby ? " [standby — no prompt sent; wakes on first team_message]" : ""
+  const standbyInfo = autoStandby
+    ? ` (auto-standby: ${autoStandbyReason})`
+    : useStandby ? " [standby — no prompt sent; wakes on first team_message]" : ""
   const planInfo = usePlanApproval ? " [plan mode — will send plan for approval]" : ""
   const claimInfo = claimedTaskContent
     ? ` (claimed task: ${args.claim_task})`

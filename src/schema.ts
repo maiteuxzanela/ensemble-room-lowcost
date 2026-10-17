@@ -345,6 +345,41 @@ export const MIGRATIONS: string[] = [
   // (same non-negotiable as Migrations 9-11/14/15/16/17): nullable TEXT, no
   // CHECK constraint, no table rebuild.
   `ALTER TABLE team ADD COLUMN awaiting_decision_members TEXT;`,
+  // Migration 19 (TICKET-HARNESS-51): definitive purge of the dependency/DAG
+  // mechanism from the task board. SQLite cannot drop a column nor ALTER a
+  // CHECK constraint in place, so this rebuilds team_task exactly like
+  // Migrations 8/12/13 (rename → create → copy → drop):
+  //   - drops the `depends_on` column entirely;
+  //   - removes 'blocked' from the status CHECK constraint;
+  //   - maps any legacy 'blocked' row to 'pending' (assignee preserved) so a
+  //     pre-existing database never violates the new constraint and the
+  //     migration transaction never rolls back.
+  // Recreates the three indexes that die with the old table. The board is now a
+  // flat, fully-parallel pool: every task is born 'pending' and claimable.
+  `ALTER TABLE team_task RENAME TO team_task_old_m19;
+   CREATE TABLE IF NOT EXISTS team_task (
+     id              TEXT PRIMARY KEY,
+     team_id         TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     content         TEXT NOT NULL,
+     status          TEXT NOT NULL DEFAULT 'pending'
+                       CHECK(status IN ('pending', 'in_progress', 'in_review', 'completed', 'cancelled')),
+     priority        TEXT NOT NULL DEFAULT 'medium'
+                       CHECK(priority IN ('high', 'medium', 'low')),
+     assignee        TEXT,
+     time_created    INTEGER NOT NULL,
+     time_updated    INTEGER NOT NULL,
+     rejection_count INTEGER NOT NULL DEFAULT 0,
+     review_notes    TEXT
+   );
+   INSERT INTO team_task (id, team_id, content, status, priority, assignee, time_created, time_updated, rejection_count, review_notes)
+     SELECT id, team_id, content,
+            CASE WHEN status = 'blocked' THEN 'pending' ELSE status END,
+            priority, assignee, time_created, time_updated, rejection_count, review_notes
+     FROM team_task_old_m19;
+   DROP TABLE team_task_old_m19;
+   CREATE INDEX IF NOT EXISTS team_task_team_idx ON team_task(team_id);
+   CREATE INDEX IF NOT EXISTS team_task_assignee_idx ON team_task(assignee);
+   CREATE INDEX IF NOT EXISTS team_task_status_idx ON team_task(team_id, status);`,
 ]
 
 /**

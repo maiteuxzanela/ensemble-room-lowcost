@@ -112,9 +112,9 @@ export async function setupEnsemble(
 
   /** Send the idle-without-report nudge once per member. */
   // shouldNudgeIdleMember() (src/hooks.ts) is the single suppression point: it
-  // returns false for execution_status 'standby' members and for members holding
-  // tasks blocked on unresolved dependencies, so neither this transition path nor
-  // the startup sweep below can fire a false "You completed your work..." nudge.
+  // returns false for execution_status 'standby' members, so neither this
+  // transition path nor the startup sweep below can fire a false
+  // "You completed your work..." nudge.
   const nudgeMember = (teamId: string, memberName: string, sessionId: string): void => {
     const nudgeKey = `${teamId}:${memberName}`
     if (nudgedMembers.has(nudgeKey)) return
@@ -202,6 +202,11 @@ export async function setupEnsemble(
           })
         }
       }
+    }
+    // HARNESS-38 (M11): prune this member's nudge suppression on shutdown so a
+    // later re-spawn under the same name is not silently suppressed.
+    if (transition && transition.to === "shutdown") {
+      nudgedMembers.delete(`${transition.teamId}:${transition.memberName}`)
     }
     if (transition && rpc) {
       await emitMemberEvent(rpc, transition).catch(() => {
@@ -424,6 +429,9 @@ export async function setupEnsemble(
       controller.abort()
       watchdog?.stop()
       dashboard?.stop()
+      // HARNESS-38 (M11): release the per-lifetime nudge suppression set on
+      // teardown so a hot-reload/re-setup never inherits stale entries.
+      nudgedMembers.clear()
     },
   }
 }

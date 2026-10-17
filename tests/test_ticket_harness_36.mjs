@@ -11,10 +11,10 @@
  *                         stop() no dispose()
  *   P3  src/recovery.ts + src/index.ts (wake-peer) — resolveStandbyWake prepende
  *       spawn_context (membro em standby acorda SEM amnésia)
- *   P4  src/tasks.ts    — releaseMemberTasks: in_progress/in_review → pending, assignee NULL;
- *                         blocked → assignee NULL mantendo status
- *   P5  src/tools/team-spawn.ts — falha de pre-claim em tarefa blocked reverte standby e
- *                         despacha o prompt inicial
+ *   P4  src/tasks.ts    — releaseMemberTasks: in_progress/in_review → pending, assignee NULL
+ *                         (TICKET-HARNESS-51: sem branch 'blocked')
+ *   P5  src/tools/team-spawn.ts — claim_task de uma tarefa pending: claim atômico, sem
+ *                         auto-standby por dependência (mecanismo expurgado)
  *   P6  src/member-model.ts — resolveAgentForSession só resolve times status='active'
  *   P7  src/tools/team-spawn.ts — decision_lead documentada no spawn_context (regular E read-only)
  *
@@ -24,11 +24,11 @@
  *     o watchdog do V2 (nenhum sweep pós-dispose).
  *   - (P3) recovery + wake-peer V1: o texto entregue prepende spawn_context e o membro é
  *     promovido standby→starting com o agent preservado.
- *   - (P4) tabela real de tarefas: libera in_progress e in_review, desassina blocked.
- *   - (P5) spawn real com tarefa blocked já tomada: standby revertido, prompt despachado.
+ *   - (P4) tabela real de tarefas: libera in_progress e in_review.
+ *   - (P5) spawn real com claim_task pending: claim atômico, prompt despachado, sem standby.
  *   - (P6) time arquivado ignorado (membro e lead).
  *   - (P7) spawn_context de membro regular e read-only cita decision_lead.
- *   - (mutação) 9 mutantes no bundle dist, cada um detectado por sentinelas cirúrgicas.
+ *   - (mutação) mutantes no bundle dist, cada um detectado por sentinelas cirúrgicas.
  *   - (paridade) literais das frentes presentes em src/ E dist/ + anti-mock.
  *
  * Seams: (1) cliente SDK do OpenCode (fronteira externa) reduzido a recorder determinístico
@@ -191,20 +191,18 @@ function scnTasks(mod) {
     const t0 = NOW() - 10000;
     insertTask(db, { id: "ip", teamId: "T", status: "in_progress", assignee: "m", updated: t0 });
     insertTask(db, { id: "rev", teamId: "T", status: "in_review", assignee: "m", updated: t0 });
-    insertTask(db, { id: "blk", teamId: "T", status: "blocked", assignee: "m", updated: t0 });
     insertTask(db, { id: "done", teamId: "T", status: "completed", assignee: "m", updated: t0 });
     insertTask(db, { id: "other", teamId: "T", status: "in_progress", assignee: "other", updated: t0 });
 
     const n = mod.releaseMemberTasks(db, "T", "m");
     const row = (id) => db.query("SELECT status, assignee, time_updated FROM team_task WHERE id = ?").get(id);
 
-    R("release.returns-total", n === 3, `n=${n} (esperado 3)`);
+    R("release.returns-total", n === 2, `n=${n} (esperado 2)`);
     R("release.in-progress-released", row("ip").status === "pending" && row("ip").assignee === null, JSON.stringify(row("ip")));
     R("release.in-review-released", row("rev").status === "pending" && row("rev").assignee === null, JSON.stringify(row("rev")));
-    R("release.blocked-status-preserved", row("blk").status === "blocked" && row("blk").assignee === null, JSON.stringify(row("blk")));
     R("release.completed-untouched", row("done").status === "completed" && row("done").assignee === "m", JSON.stringify(row("done")));
     R("release.other-assignee-untouched", row("other").status === "in_progress" && row("other").assignee === "other", JSON.stringify(row("other")));
-    R("release.time-updated-bumped", row("ip").time_updated > t0 && row("blk").time_updated > t0, `ip=${row("ip").time_updated} blk=${row("blk").time_updated}`);
+    R("release.time-updated-bumped", row("ip").time_updated > t0 && row("rev").time_updated > t0, `ip=${row("ip").time_updated} rev=${row("rev").time_updated}`);
   } finally {
     cleanup(base, db);
   }
@@ -347,30 +345,22 @@ async function scnSpawn(mod) {
     await mod.executeTeamCreate(deps, { name: "h36spawn" }, lead);
     const teamId = db.query("SELECT id FROM team WHERE name='h36spawn'").get().id;
 
-    // Tarefa blocked já tomada por outro membro → pre-claim do spawn falha (changes === 0).
-    insertTask(db, { id: "blk_taken", teamId, status: "blocked", assignee: "ghost" });
-    // Tarefa blocked livre → pre-claim bem-sucedido (controle).
-    insertTask(db, { id: "blk_free", teamId, status: "blocked", assignee: null });
+    // TICKET-HARNESS-51: não há mais tarefa 'blocked' nem auto-standby por
+    // dependência. Uma tarefa pending é reivindicada normalmente pelo spawn.
+    insertTask(db, { id: "p5_task", teamId, status: "pending", assignee: null });
 
     const memberRow = (name) => db.query("SELECT status, execution_status, spawn_context FROM team_member WHERE team_id=? AND name=?").get(teamId, name);
 
-    // ---- P5: revert ----
-    const resRevert = await mod.executeTeamSpawn(deps, { name: "p5a", agent: "build", prompt: "P5 work", worktree: false, claim_task: "blk_taken" }, lead);
+    // ---- claim_task de uma tarefa pending: claim atômico, membro NÃO vai a standby ----
+    const resClaim = await mod.executeTeamSpawn(deps, { name: "p5a", agent: "build", prompt: "P5 work", worktree: false, claim_task: "p5_task" }, lead);
     const p5 = memberRow("p5a");
     const p5session = db.query("SELECT session_id FROM team_member WHERE name='p5a'").get().session_id;
     const p5prompt = prompts.find((p) => p.sessionID === p5session);
-    R("spawn.revert-status-busy", p5?.status === "busy" && p5?.execution_status === "starting", JSON.stringify(p5));
-    R("spawn.revert-no-spawn-context", p5?.spawn_context === null, String(p5?.spawn_context));
-    R("spawn.revert-prompt-dispatched", !!p5prompt && String(p5prompt.parts?.[0]?.text).includes("P5 work"), p5prompt ? "ok" : "sem prompt");
-    R("spawn.revert-return-text", typeof resRevert === "string" && resRevert.includes("standby reverted"), resRevert?.slice(0, 160));
-
-    // ---- Controle: pre-claim bem-sucedido mantém standby ----
-    await mod.executeTeamSpawn(deps, { name: "p5b", agent: "build", prompt: "P5 control", worktree: false, claim_task: "blk_free" }, lead);
-    const p5b = memberRow("p5b");
-    const p5bsession = db.query("SELECT session_id FROM team_member WHERE name='p5b'").get().session_id;
-    R("spawn.control-stays-standby", p5b?.status === "ready" && p5b?.execution_status === "standby", `${p5b?.status}/${p5b?.execution_status}`);
-    R("spawn.control-spawn-context-saved", typeof p5b?.spawn_context === "string" && p5b.spawn_context.includes("P5 control"), String(p5b?.spawn_context?.length));
-    R("spawn.control-no-prompt", !prompts.some((p) => p.sessionID === p5bsession));
+    R("spawn.claim-no-standby", p5?.execution_status !== "standby", JSON.stringify(p5));
+    R("spawn.claim-prompt-dispatched", !!p5prompt && String(p5prompt.parts?.[0]?.text).includes("P5 work"), p5prompt ? "ok" : "sem prompt");
+    R("spawn.claim-return-text", typeof resClaim === "string" && resClaim.includes("claimed task: p5_task"), resClaim?.slice(0, 160));
+    const p5taskRow = db.query("SELECT assignee, status FROM team_task WHERE id='p5_task'").get();
+    R("spawn.claim-task-assigned", p5taskRow.assignee === "p5a" && p5taskRow.status === "in_progress", JSON.stringify(p5taskRow));
 
     // ---- P7: decision_lead nos contextos (regular e read-only) ----
     await mod.executeTeamSpawn(deps, { name: "nm", agent: "build", prompt: "N work", worktree: false }, lead);
@@ -383,7 +373,7 @@ async function scnSpawn(mod) {
     const roSession = db.query("SELECT session_id FROM team_member WHERE name='ro'").get().session_id;
     const roText = String(prompts.find((p) => p.sessionID === roSession)?.parts?.[0]?.text ?? "");
     R("spawn.p7-readonly-decision-lead", roText.includes("- decision_lead: escalate an emergency decision to the team lead"), "");
-    R("spawn.p7-readonly-no-claim-tools", roText.includes("- team_standby: yield execution and enter standby mode until unblocked or messaged") && !roText.includes("- team_tasks_add: add tasks to the shared board"), "");
+    R("spawn.p7-readonly-no-claim-tools", roText.includes("- team_standby: yield execution and enter standby mode until messaged") && !roText.includes("- team_tasks_add: add tasks to the shared board"), "");
   } finally {
     cleanup(base, db);
   }
@@ -680,9 +670,9 @@ check(
     srcRecovery.includes("const wake = resolveStandbyWake(") && distRaw.includes("const wake = resolveStandbyWake("),
 );
 check(
-  "paridade P4: releaseMemberTasks libera in_progress+in_review e desassina blocked",
+  "paridade P4: releaseMemberTasks libera in_progress+in_review (sem branch 'blocked')",
   srcTasks.includes("status IN ('in_progress', 'in_review')") && distRaw.includes("status IN ('in_progress', 'in_review')") &&
-    srcTasks.includes("status = 'blocked'") && distRaw.includes("SET assignee = NULL, time_updated = ? WHERE team_id = ? AND assignee = ? AND status = 'blocked'"),
+    !srcTasks.includes("status = 'blocked'") && !distRaw.includes("AND status = 'blocked'"),
 );
 check(
   "paridade P6: resolveAgentForSession filtra times active (membro e lead, src E dist)",
@@ -691,10 +681,9 @@ check(
     distRaw.includes("JOIN team t ON tm.team_id = t.id") && distRaw.includes("WHERE lead_session_id = ? AND status = 'active'"),
 );
 check(
-  "paridade P5: revert do standby no spawn + marcador de log (src E dist)",
-  srcSpawn.includes("if (useStandby && claimedTaskBlocked && !spawnIsQA && !spawnIsSDET && args.standby !== true) {") &&
-    distRaw.includes("if (useStandby && claimedTaskBlocked && !spawnIsQA && !spawnIsSDET && args.standby !== true) {") &&
-    srcSpawn.includes("spawn:claim-blocked:standby-reverted") && distRaw.includes("spawn:claim-blocked:standby-reverted"),
+  "paridade P5: sem auto-standby/revert por tarefa 'blocked' no spawn (expurgado)",
+  !srcSpawn.includes("claimedTaskBlocked") && !distRaw.includes("claimedTaskBlocked") &&
+    !srcSpawn.includes("standby-reverted") && !distRaw.includes("standby-reverted"),
 );
 check(
   "paridade P7: decision_lead documentada nos dois contextos (regular e read-only, src E dist)",
@@ -729,16 +718,7 @@ const MUTATIONS = [
     to: "SET status = 'pending', assignee = NULL, time_updated = ? WHERE team_id = ? AND assignee = ? AND status IN ('in_progress')",
     scenarios: ["tasks"],
     detect: ["release.in-review-released", "release.returns-total"],
-    unaffected: ["release.in-progress-released", "release.blocked-status-preserved", "release.completed-untouched", "release.other-assignee-untouched"],
-  },
-  {
-    id: "M2",
-    desc: "releaseMemberTasks promove tarefas blocked a pending (perde o status)",
-    from: "\"UPDATE team_task SET assignee = NULL, time_updated = ? WHERE team_id = ? AND assignee = ? AND status = 'blocked'\"",
-    to: "\"UPDATE team_task SET status = 'pending', assignee = NULL, time_updated = ? WHERE team_id = ? AND assignee = ? AND status = 'blocked'\"",
-    scenarios: ["tasks"],
-    detect: ["release.blocked-status-preserved"],
-    unaffected: ["release.in-progress-released", "release.in-review-released", "release.completed-untouched", "release.returns-total"],
+    unaffected: ["release.in-progress-released", "release.completed-untouched", "release.other-assignee-untouched"],
   },
   {
     id: "M3",
@@ -766,15 +746,6 @@ const MUTATIONS = [
     scenarios: ["recovery", "standby"],
     detect: ["recovery.standby-prepend", "recovery.standby-flipped-starting", "recovery.standby-agent", "sbw.ctx-prepended"],
     unaffected: ["recovery.non-standby-no-prepend", "recovery.standby-model", "sbw.passthrough-non-standby", "sbw.unknown-member-passthrough"],
-  },
-  {
-    id: "M6",
-    desc: "revert do standby desabilitado no spawn (membro fica preso em standby)",
-    from: "if (useStandby && claimedTaskBlocked && !spawnIsQA && !spawnIsSDET && args.standby !== true) {",
-    to: "if (false) {",
-    scenarios: ["spawn"],
-    detect: ["spawn.revert-status-busy", "spawn.revert-prompt-dispatched", "spawn.revert-return-text"],
-    unaffected: ["spawn.control-stays-standby", "spawn.p7-regular-decision-lead", "spawn.p7-readonly-decision-lead"],
   },
   {
     id: "M7",

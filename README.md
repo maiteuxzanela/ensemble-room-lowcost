@@ -1,173 +1,191 @@
 # @maiteuxzanela/ensemble-room-lowcost
 
-**OpenCode Ensemble Hardened — Low-cost multi-agent runtime with native standby, silent lead, and deterministic board wake.**
+**OpenCode Ensemble Hardened — a low-cost multi-agent runtime with native standby, silent lead, and deterministic board wake.**
 
-Runtime de times multi-agente para o [OpenCode](https://opencode.ai) derivado do `@hueyexe/opencode-ensemble@0.18.0`, endurecido (`0.18.1`) para operação de baixo custo em tokens: colegas nascem em **standby** (zero tokens ao nascer), o **lead permanece em repouso passivo absoluto** e só acorda por um único evento determinístico — o **fechamento total do board** (`completed === total`).
+A multi-agent team runtime for [OpenCode](https://opencode.ai), derived from `@hueyexe/opencode-ensemble@0.18.0` and hardened (`0.18.1`) for **token-efficient** operation: teammates are born in **standby** (zero tokens at spawn time), the **lead stays in absolute passive rest** and only wakes on a single deterministic event — **total board closure** (`completed === total`).
 
 | | |
 |---|---|
-| Pacote | `@maiteuxzanela/ensemble-room-lowcost` |
-| Versão | `0.18.1` (base upstream: `@hueyexe/opencode-ensemble@0.18.0`) |
-| Entrypoint runtime | `dist/index.js` (bundle autocontido) |
-| Entrypoint fonte | `src/index.ts` (`exports["."]`) |
-| Remote | `git@github.com:maiteuxzanela/ensemble-room-lowcost.git` (branch `main`) |
-| Licença | MIT |
-| Suítes | `node tests/run_all.mjs` → **326 checks determinísticos, sem mocks** |
+| Package | `@maiteuxzanela/ensemble-room-lowcost` |
+| Version | `0.18.1` (upstream base: `@hueyexe/opencode-ensemble@0.18.0`) |
+| Runtime entrypoint | `dist/index.js` (self-contained bundle) |
+| Source entrypoint | `src/index.ts` (`exports["."]`) |
+| Repository | `github.com/maiteuxzanela/ensemble-room-lowcost` (branch `main`) |
+| License | MIT |
+| Suites | `node tests/run_all.mjs` → **39 deterministic suites, ~2.7k checks, zero mocks** |
 
 ---
 
-## 1. Arquitetura
+## 1. Architecture
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
-│ OpenCode (host) — carrega dist/index.js via opencode.json "plugin"   │
+│ OpenCode (host) — loads dist/index.js via opencode.json "plugin"     │
 └───────────────────────────────┬──────────────────────────────────────┘
                                 │  plugin hooks (tool.execute / chat.message …)
 ┌───────────────────────────────▼──────────────────────────────────────┐
-│ src/index.ts  — orquestração V1/V2, wiring de tools, hooks e timers  │
-│   ├── src/tools/*          15 tools team_* (create/spawn/message/    │
-│   │                        broadcast/claim/tasks/view/results/…)     │
+│ src/index.ts  — V1/V2 orchestration, tool wiring, hooks and timers   │
+│   ├── src/tools/*          team_* tools (create/spawn/message/       │
+│   │                        broadcast/claim/tasks/view/results/       │
+│   │                        standby/handover/shutdown/…)              │
 │   ├── src/hooks.ts         shouldNudgeIdleMember,                    │
 │   │                        shouldAlarmFastIdle,                      │
 │   │                        hasBlockedAssignedTasks                   │
 │   ├── src/system-prompt.ts buildLeadSystemPrompt /                   │
 │   │                        buildTeammateSystemPrompt +               │
-│   │                        leadReportDirective (coerção condicional) │
-│   ├── src/watchdog.ts      Watchdog.check + isSessionCompacting       │
-│   ├── src/progress.ts      ProgressTracker (heartbeat de progresso)  │
-│   ├── src/schema.ts        createDb + MIGRATIONS (12 migrações)      │
-│   ├── src/messaging.ts     fila team_message (delivered 0/1)         │
-│   ├── src/config.ts        ensemble.json (silentLead, stall*, dash)  │
-│   ├── src/recovery.ts      reidratação pós-restart / mensagens não   │
-│   │                        entregues / worktrees órfãos              │
-│   └── src/dashboard*.ts    dashboard HTTP em :4747                   │
+│   │                        leadReportDirective (conditional coercion)│
+│   ├── src/watchdog.ts      Watchdog.check + isSessionCompacting      │
+│   ├── src/progress.ts      ProgressTracker (progress heartbeat)      │
+│   ├── src/schema.ts        createDb + MIGRATIONS                     │
+│   ├── src/messaging.ts     team_message queue (delivered 0/1)        │
+│   ├── src/config.ts        ensemble.json (silentLead, stall*, …)     │
+│   ├── src/recovery.ts      post-restart rehydration / undelivered    │
+│   │                        messages / orphan worktrees               │
+│   └── src/dashboard*.ts    HTTP dashboard on :4747                   │
 └───────────────────────────────┬──────────────────────────────────────┘
-                                │ SQLite real (node:sqlite)
+                                │ real SQLite (node:sqlite)
 ┌───────────────────────────────▼──────────────────────────────────────┐
 │ ensemble.db — team, team_member (execution_status), team_task,       │
 │               team_message (delivered), team_member_message …        │
-│ ~/.local/share/opencode/opencode.db — store de sessões (read-only,   │
-│               fonte do schema `session` e de session.time_compacting)│
+│ Host session store (opencode.db) — read-only source of the `session` │
+│               schema and of session.time_compacting                  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**Princípios de transporte**
+**Transport principles**
 
-1. **Um único canal de wakeup por papel.** Para colegas, `promptAsync` é o transporte; para o lead com `silentLead: true`, a **linha SQLite é a entrega** e o system prompt é o renderizador (`buildLeadSystemPrompt` marca `delivered = 1`).
-2. **Estado é schema, não convenção.** Ciclo de vida (`idle → standby → starting → running → …`) vive no `CHECK` de `team_member.execution_status`; transições são `UPDATE` guardados (`WHERE execution_status = …`), garantindo um único consumidor.
-3. **Nada de polling.** Wake do lead é exclusivamente event-driven (fechamento de board); watchdog é um tick único com TTL, não um loop de varredura.
+1. **One wakeup channel per role.** For teammates, `promptAsync` is the transport; for the lead under `silentLead: true`, the **SQLite row is the delivery** and the system prompt is the renderer (`buildLeadSystemPrompt` marks `delivered = 1`).
+2. **State is schema, not convention.** The lifecycle (`idle → standby → starting → running → …`) lives in the `CHECK` constraint of `team_member.execution_status`; transitions are guarded `UPDATE`s (`WHERE execution_status = …`), guaranteeing a single consumer.
+3. **No polling.** The lead wake is strictly event-driven (board closure); the watchdog is a single TTL-guarded tick, not a scan loop.
 
 ---
 
-## 2. As 5 grandes melhorias sobre o pacote original
+## 2. Features
 
-### 2.1 Spawn em Standby — zero tokens ao nascer, guarda idempotente de despertar
+### 2.1 Native Standby — zero tokens at spawn, idempotent wake guard
 
-**Problema.** Em `team_spawn`, o prompt de init era enviado na criação da sessão: cada colega nascia queimando tokens antes de qualquer trabalho real — impeditivo para mesas de baixo custo.
+**Problem.** In `team_spawn`, the init prompt used to be sent when the session was created: every teammate burned tokens the moment it was born, before any real work — a non-starter for low-cost setups.
 
-**Solução** (`src/tools/team-spawn.ts`, `src/tools/team-message.ts`, `src/tools/team-broadcast.ts`):
+**Solution** (`src/tools/team-spawn.ts`, `src/tools/team-message.ts`, `src/tools/team-broadcast.ts`):
 
-- `standby: true` registra o membro **sem** enviar prompt. A sessão nasce em `execution_status = 'standby'` e o prompt completo é persistido em `team_member.spawn_context` (**Migration 11**).
-- O **primeiro** `team_message`/`team_broadcast` destinado ao membro é o acordador: o texto de entrega recebe o `spawn_context` **prependado** e a transição `standby → starting` acontece via `UPDATE … WHERE execution_status = 'standby'` — **guarda idempotente de um-só-consumidor**: duas mensagens simultâneas não duplicam o init.
-- **Fail-safe**: se o `promptAsync` do wake falhar, o hook devolve a janela (`execution_status` volta a `'standby'`) para que uma retentativa ou a passada de recuperação de mensagens não entregues replayer o `spawn_context` em vez de um prompt vazio.
-- Nenhuma mensagem perdida: mensagens que chegam antes do wake ficam na fila e entram no mesmo turno.
+- `standby: true` registers the member **without** sending a prompt. The session is born with `execution_status = 'standby'` and the full prompt is persisted in `team_member.spawn_context` (Migration 11).
+- The **first** `team_message`/`team_broadcast` addressed to the member is the waker: the delivery text has `spawn_context` **prepended** and the transition `standby → starting` happens via `UPDATE … WHERE execution_status = 'standby'` — an **idempotent one-consumer guard**: two simultaneous messages never duplicate the init.
+- **Fail-safe**: if the wake `promptAsync` fails, the hook restores the window (`execution_status` back to `'standby'`) so a retry or the undelivered-message recovery pass replays the `spawn_context` instead of an empty prompt.
+- No lost messages: messages arriving before the wake stay queued and join the same turn.
 
-**Garantia:** `tests/test_standby_lifecycle.mjs` (122 checks) — nascer em standby sem prompt, wake exatamente 1×, revert em falha de transporte, retentativas `retry_until` concluindo `standby → starting`.
+**Guarantee:** `tests/test_standby_lifecycle.mjs` (130 checks) — born in standby without a prompt, wake exactly once, revert on transport failure, `retry_until` attempts completing `standby → starting`.
 
-### 2.2 Migration 12 — `standby` formal no CHECK constraint via rebuild seguro
+### 2.2 Silent Lead — absolute passive rest, SQLite delivery, single board wake
 
-**Problema.** `team_member.execution_status` é um `CHECK` com literais fixos. SQLite **não permite `ALTER` de CHECK**: um banco montado do zero rejeitaria o `INSERT` em standby com erro de constraint (o banco vivo só funcionava porque carregava o literal fora de banda).
+**Problem.** Every `team_message` addressed to the lead used to trigger `promptAsync` on the lead session: the orchestrator woke dozens of times per turn, multiplying tokens and breaking the "no polling / silent lead" rule.
 
-**Solução** (`src/schema.ts`, Migration 12):
+**Solution** (`src/tools/team-message.ts`, `src/tools/team-tasks-complete.ts`, `src/system-prompt.ts`, `src/config.ts`):
 
-- Rebuild no padrão já consolidado pela Migration 8: `RENAME → CREATE → copiar → DROP`, carregando **todas** as colunas adicionadas pelas Migrations 3–11 (`worktree_*`, `plan_approval`, `workspace_id`, `reported_to_lead`, `last_nudged_at`, `retry_*`, `spawn_context`) e **recriando os dois índices** que morrem junto com a tabela antiga.
-- O novo `CHECK` passa a aceitar `'standby'` entre os literais (`idle, starting, running, cancel_requested, cancelling, cancelled, completing, completed, failed, timed_out, standby`).
-- Executa em transação única no fluxo de `createDb`, portanto é **idempotente e atômica**: upgrade de banco legado e bootstrap limpo convergem para o mesmo schema.
-
-**Garantia:** as três suítes aplicam o `MIGRATIONS` real num SQLite real (fresh e upgrade de banco de produção) e verificam contagem/paridade `src ↔ dist`.
-
-### 2.3 Blindagem de Hooks — fim dos falsos nudges e do alarme fast-idle em standby/bloqueio
-
-**Problema.** Dois gatilhos não sabiam nada do standby e do trabalho bloqueado:
-
-1. o nudge de idle mandava prompt para colega recém-criado que **não deveria ter recebido prompt algum** (queimando tokens e poluindo a sessão);
-2. o alarme `fast-idle` gritava "agente caiu" para quem estava legitimamente parado (standby ou com task bloqueada por dependência).
-
-**Solução** (`src/hooks.ts`, exportada por `src/index.ts`):
-
-- `shouldNudgeIdleMember(db, teamId, member)` → `false` quando `execution_status === 'standby'` (e demais estados de bloqueio já cobertos), além da janela clássica de `last_nudged_at`.
-- `shouldAlarmFastIdle(...)` → `false` para `standby`, preservando o alarme apenas para idle genuíno. A lógica foi **extraída do bloco inline do bundle** para seam testável sem tocar em decisão.
-- `hasBlockedAssignedTasks(...)` mantém o bloqueio legítimo visível para o nudge de equipe, sem alarme falso.
-
-**Garantia:** `test_standby_lifecycle.mjs` conta **zero alarmes fast-idle falsos** ao longo da suíte inteira (check `D12`) e exercita nudge em paralelo com wake.
-
-### 2.4 Watchdog Heartbeat & Compaction Immunity — sem timeout indevido durante compactação
-
-**Problema.** O watchdog derruba sessões por TTL (`stallThresholdMs`, default 300 s). Sessões em **compactação** (contexto longo) não progridem em `time_updated` e eram abortadas como "stale" — timeout indevido, perda de contexto e retrabalho caro.
-
-**Solução** (`src/watchdog.ts`, `src/progress.ts`):
-
-- **Heartbeat ativo:** na checagem, membro stale cuja sessão mostra progresso real (`ProgressTracker`) tem `time_updated` **renovado** — continua "busy" sem abortar (`watchdog:heartbeat:renewed`).
-- **Imunidade a compaction:** `isSessionCompacting(sessionId)` lê `session.time_compacting` do store do OpenCode **read-only**; se `> 0`, a sessão não é abortada neste tick e é reavaliada no próximo (`watchdog:heartbeat:compacting`).
-- Compaction com valor `0` **não** goza da imunidade (corrida decidida corretamente); sessões genuinamente idle continuam transicionando para `error/timed_out` com aviso ao lead, toast e limpeza de worktree.
-- `ttlMs = 0` desliga o TTL mantendo o GC de worktrees; resiliência a store ausente/corrompido retorna `false` sem exceção.
-
-**Garantia:** `tests/test_watchdog_heartbeat.mjs` (53 checks) — 4 cenários (active, compacting, idle, compaction=0) rodados **tanto contra `dist` quanto contra `src`**, com store `session` real extraído do `opencode.db` de produção.
-
-### 2.5 Silent Lead & Despertador Sistemático por Board — repouso passivo absoluto do lead
-
-**Problema.** Cada `team_message` destinada ao lead disparava `promptAsync` na sessão do lead: o orquestrador acordava dezenas de vezes por turno, multiplicando tokens e quebrando a regra de "polling proibido / lead mudo".
-
-**Solução** (`src/tools/team-message.ts`, `src/tools/team-tasks-complete.ts`, `src/system-prompt.ts`, `src/config.ts`):
-
-- **`silentLead` (default `true`)**: mensagens ao lead são **persistidas** (`delivered = 0`) e **nenhum** `promptAsync` é disparado. O canal de entrega real passa a ser `buildLeadSystemPrompt`, que injeta o acúmulo na **próxima** chamada legítima do lead e marca `delivered = 1`. Resultado: tokens de wake = **zero** enquanto o lead está em repouso.
-- **`silentLead: false` (legado)**: comportamento original byte-a-byte — um único `promptAsync` com `[System: New team message from <remetente>]` e `synthetic: true`.
-- **Coerção condicional no system prompt**: com `silentLead` ativo a directiva agressiva
-  `"You MUST send your results to the lead via team_message before stopping."` é substituída por
+- **`silentLead` (default `true`)**: messages to the lead are **persisted** (`delivered = 0`) and **no** `promptAsync` is fired. The real delivery channel becomes `buildLeadSystemPrompt`, which injects the backlog on the lead's **next** legitimate call and marks `delivered = 1`. Result: wake tokens = **zero** while the lead rests.
+- **`silentLead: false` (legacy)**: original byte-for-byte behavior — a single `promptAsync` with `[System: New team message from <sender>]` and `synthetic: true`.
+- **Conditional coercion in the system prompt**: with `silentLead` active, the aggressive directive
+  `"You MUST send your results to the lead via team_message before stopping."` is replaced by
   `"Collaborate with teammates using team_message and complete assigned tasks on the board."`
-  (`leadReportDirective`); no legado, o texto é preservado integralmente.
-- **Despertador sistemático por board** (`team_tasks_complete`): quando `total > 0 && completed === total`, o lead recebe **exatamente 1×** `[System: All team tasks completed on board by <who>]` com `synthetic: true`. Esse é o **único** evento de wake automático do lead — ou seja, o despertar é 100 % sistemático, nunca por conteúdo textual.
-- Fail-safe: falha de transporte no wake é absorvida por `.catch` (zero `unhandledRejection`), e task sem `assignee` é atribuída atomicamente ao autor para o board não mentir.
+  (`leadReportDirective`); in legacy mode the text is preserved verbatim.
+- **Systematic board waker** (`team_tasks_complete`): when `total > 0 && completed === total`, the lead receives **exactly 1×** `[System: All team tasks completed on board by <who>]` with `synthetic: true`. This is the **only** automatic lead-wake event — i.e., waking is 100% systematic, never driven by message content.
+- Fail-safe: a wake transport failure is absorbed by `.catch` (zero `unhandledRejection`), and a task without an `assignee` is atomically assigned to its author so the board never lies.
 
-**Garantia:** `tests/test_silent_lead_board_wake.mjs` (151 checks) — fila `delivered=0` sem wake, wake único no fechamento do board, coerção condicional, legado byte-a-byte, regressão zero das suítes 1 e 2.
+**Guarantee:** `tests/test_silent_lead_board_wake.mjs` (151 checks) — `delivered=0` queue without wake, single wake at board closure, conditional coercion, byte-for-byte legacy, zero regressions against the other suites.
+
+### 2.3 Resilient Watchdog — context-compaction immunity
+
+**Problem.** The watchdog tears sessions down on a TTL (`stallThresholdMs`, default 300 s). Sessions in **context compaction** (long context) do not advance `time_updated` and were aborted as "stale" — an undue timeout causing context loss and costly rework.
+
+**Solution** (`src/watchdog.ts`, `src/progress.ts`):
+
+- **Active heartbeat:** on each check, a stale member whose session shows real progress (`ProgressTracker`) gets `time_updated` **renewed** — it stays "busy" without aborting (`watchdog:heartbeat:renewed`).
+- **Compaction immunity:** `isSessionCompacting(sessionId)` reads `session.time_compacting` from the host session store **read-only**; if `> 0`, the session is not aborted on this tick and is re-evaluated on the next (`watchdog:heartbeat:compacting`).
+- A compaction value of `0` does **not** enjoy immunity (the race is decided correctly); genuinely idle sessions still transition to `error/timed_out` with a lead warning, a toast, and worktree cleanup.
+- `ttlMs = 0` disables the TTL while keeping worktree GC; resilience to a missing/corrupted store returns `false` without throwing.
+- `start()` wraps `check()` in a logged `.catch` and `unref()`s both timers; `dispose()` is idempotent (clears both timers) and `stop()` remains a legacy alias.
+
+**Guarantee:** `tests/test_watchdog_heartbeat.mjs` (53 checks) — 4 scenarios (active, compacting, idle, compaction=0) run **against both `dist` and `src`**, using the real `session` store schema.
+
+### 2.4 Reactive, dynamic model fallback on 429 / retry
+
+**Problem.** A provider rate limit (HTTP 429) or a retry storm would otherwise stall the room: every request kept hitting the same exhausted model.
+
+**Solution** (`src/config.ts`, `src/hooks.ts`, `src/rate-limit.ts`):
+
+- **Configurable chain** via `ensemble.json`:
+  - `fallbackModels: string[]` — ordered selectors `"provider/model"` or `"provider/model#variant"` (e.g. `"provider-a/model-x#low"`); malformed entries are discarded and duplicates removed.
+  - `fallbackModelsByAgent: Record<string, string[]>` — per-agent override, resolved with base-persona symmetry.
+  - **Precedence:** `fallbackModelsByAgent[agent]` → `fallbackModelsByAgent[basePersona]` → `fallbackModels` → legacy `modelFallback` → built-in default. A fallback entry is never equal to the primary model (failover cannot be to itself).
+- **Reactive switching on rate limit:** the failover hook selects the next chain entry and arms **subsequent deliveries** (`team_message`/wake/watchdog) — every delivery path reads `team_member.model`, so the switch takes effect immediately.
+- **Burst de-duplication:** a 10-minute cooldown per `teamId:memberName` collapses the repeated attempts of a single 429 burst (advancing the chain once per retry would burn the whole chain in seconds).
+- **Zero-noise policy:** a "switched"/"suppressed" failover only logs and updates `team_member.model`; the **only** authorized lead notification is chain **exhaustion**, and it fires exactly once.
+- **`#default` sentinel normalization:** the server reports `model.variant === "default"` to mean "no variant"; the parser normalizes it away so round-tripping never produces an unmatchable key like `"p/m#default"` and the failover never loops on itself.
+
+**Guarantee:** `tests/test_fallback_models.mjs`, `test_rate_limit_failover.mjs`, `test_per_agent_fallback.mjs`, `test_fallback_hardening.mjs`, `test_failover_integration.mjs`, `test_retry_failover_active.mjs`, `test_force_model_abort.mjs` — chain precedence, per-agent resolution, cooldown de-duplication, abort + re-prompt, and variant forwarding on the V2 switch path.
+
+### 2.5 Task board — cooperation and intra-card handover
+
+**Problem.** When several specialties must work on the **same card** (or the same files), parallel writes collide, and forcing a single teammate to grind through work outside its domain pressures its context window.
+
+**Solution** (`src/tools/team-task-handover.ts`, `src/tasks.ts`, `src/tools/team-tasks-complete.ts`):
+
+- A single, event-driven cyclical **task board** with a strict lifecycle:
+  `pending → in_progress` (claim) `→ in_review` (submit for review) `→ completed` (reviewer verdict)`; `reject` returns the card to `in_progress`.
+- **Cooperative development:** teammates iterate and exchange files **only via `team_message`**; `submit_review` is reserved for the final consolidation, never for partial steps.
+- **Intra-card handover (`team_task_handover(task_id, to, notes?)`)** — a *sequential bench partnership*: the current assignee hands the baton of an `in_progress` card to a complementary specialist. The runtime **atomically reassigns** the `assignee`, wakes the receiver with the handover notes (and the receiver's `spawn_context` when it was in standby), and puts the sender into standby with a clean context window. Only the current assignee (or the lead) may pass the baton, and the card must be `in_progress`.
+- **Dependency unlocking:** when a card is submitted/completed, downstream cards of **validation profiles** (`sdet`/`qa`) transition to `in_progress` and their assignee is woken with a deterministic system prompt; regular downstream cards are simply unblocked.
+- **Role separation is enforced by the schema, not by convention:** the SDET runs the deterministic suite but **cannot approve**; only the Quality Gate reviewer (or the lead) can `complete` a card. Auto-review is forbidden.
+
+**Guarantee:** dedicated suites cover the handover, the SDET review flow, dependency unlocking, cyclic dependency graphs, guardian reviews and runtime auto-standby — atomic reassignment, wake with persona/spawn_context, transmitter standby, fail-fast without side effects, V1↔V2 parity, and mutation testing proving the assertions are sensitive.
+
+### 2.6 Deterministic tests — no mocks
+
+The whole runtime is covered by an offline-capable, fixture-free suite that runs the **real** code:
+
+- **Zero mocks / stubs / fake fixtures.** The only seam is the **output transport** (`session.create`, `promptAsync`, `session.abort`, `showToast`), recorded into an array so assertions prove *what was called*. No decision logic is replaced.
+- Code under test is the **real** artifact of this repository: `dist/index.js` (bundle) and the `.ts` sources of `src/` copied out of `node_modules` (Node's type-stripping refuses imports from `node_modules`) with mechanical import-extension resolution only — logic intact.
+- **Real SQLite databases** (`node:sqlite`) created in isolation under `.test-scratch/` (gitignored, recreated on every run).
+- The watchdog suite reads the host `session` schema **read-only** from the OpenCode session store — a documented **environment prerequisite** (fails explicitly and visibly if absent; no stub is used instead).
+- `ENSEMBLE_PKG=/path/to/another/checkout node tests/…` points the suites at another tree without editing any file (handy for auditing a published package).
 
 ---
 
-## 3. Suítes determinísticas (anti-mock, fail-fast)
-
-| Suíte | Escopo | Checks |
-|---|---|---|
-| `tests/test_watchdog_heartbeat.mjs` | Heartbeat + imunidade a compaction (dist e src) | 53 |
-| `tests/test_standby_lifecycle.mjs` | Standby lifecycle + blindagem de nudge/fast-idle (dist e src) + regressão watchdog | 122 |
-| `tests/test_silent_lead_board_wake.mjs` | Silent lead + board wake + regressão das duas suítes acima | 151 |
-| **Total (somatório top-level)** | **`node tests/run_all.mjs`** | **326** |
+## 3. Deterministic suites (anti-mock, fail-fast)
 
 ```bash
-node --check dist/index.js     # ou: npm run check   → exit 0
-node tests/run_all.mjs         # ou: npm test        → exit 0 / RESULT_ALL: ALL SUITES PASSED
+node --check dist/index.js     # or: npm run check   → exit 0
+node tests/run_all.mjs         # or: npm test        → exit 0 / RESULT_ALL: ALL SUITES PASSED
 ```
 
-Relatório consolidado do runner:
+The runner executes **39 suites in strict sequence** (fail-report, no early abort) and only exits `0` when every suite returns exit `0` and no `FAIL` line was emitted. Representative coverage:
+
+| Area | Suites | Checks |
+|---|---|---|
+| Watchdog heartbeat & compaction immunity | 1 | 53 |
+| Standby lifecycle & hook shielding | 1 | 130 |
+| Silent lead & board wake | 1 | 151 |
+| Model fallback & rate-limit failover | 7 | 220 |
+| Task board, dependencies & intra-card handover | 8 | 454 |
+| Governance roles (SDET / Quality Gate) | 4 | 283 |
+| Local auto-commit on approval | 2 | 345 |
+| Dashboard chat | 1 | 15 |
+| Discovery, lifecycle & messaging regressions | 14 | 1090 |
+| **Total** | **39** | **2741** |
+
+Consolidated runner report (shape):
 
 ```text
-PASS | test_watchdog_heartbeat.mjs        | exit=0 |   377 ms | RESULT: 53/53 checks passed
-PASS | test_standby_lifecycle.mjs         | exit=0 |  1012 ms | RESULT: 122/122 checks passed
-PASS | test_silent_lead_board_wake.mjs    | exit=0 |  2169 ms | RESULT: 151/151 checks passed
-SUÍTES: 3/3 passaram
+PASS | test_watchdog_heartbeat.mjs        | exit=0 |   … ms | RESULT: 53/53 checks passed
+PASS | test_standby_lifecycle.mjs         | exit=0 |   … ms | RESULT: 130/130 checks passed
+PASS | test_silent_lead_board_wake.mjs    | exit=0 |   … ms | RESULT: 151/151 checks passed
+…
+SUÍTES: 39/39 passaram
 RESULT_ALL: ALL SUITES PASSED
 ```
 
-**Regras das suítes**
-
-- **Zero mocks / stubs / fixtures falsas.** O único ponto de emenda é o **transporte de saída** (`session.create`, `promptAsync`, `session.abort`, `showToast`), gravado num array para que a asserção prove *o que foi chamado*. Nenhuma lógica de decisão é substituída.
-- Código sob teste é o **real** deste repositório: `dist/index.js` (bundle) e os `.ts` de `src/` copiados para fora de `node_modules` (o *type-stripping* do Node recusa imports a partir de `node_modules`) apenas com resolução mecânica de extensão de import — lógica intacta.
-- Bancos **SQLite reais** (`node:sqlite`) criados isoladamente em `.test-scratch/` (gitignore, recriado a cada execução).
-- `test_watchdog_heartbeat.mjs` usa o schema da tabela `session` extraído **read-only** de `~/.local/share/opencode/opencode.db` — **pré-requisito de ambiente** (falha explícita e visível se ausente; nenhum stub é usado no lugar).
-- `ENSEMBLE_PKG=/caminho/para/outro/checkout node tests/…` aponta as suítes para outra árvore sem editar arquivo (útil para auditar o pacote publicado em `~/.cache/opencode/packages/`).
-
 ---
 
-## 4. Instalação e configuração
+## 4. Installation and configuration
 
 ```bash
 git clone git@github.com:maiteuxzanela/ensemble-room-lowcost.git
@@ -175,44 +193,67 @@ cd ensemble-room-lowcost
 npm run check && npm test
 ```
 
-Referência no `~/.config/opencode/opencode.json`:
+Reference it from your OpenCode config:
 
 ```jsonc
 {
-  "plugin": ["/mnt/94CCB337CCB3130A/ensemble-room-lowcost/dist/index.js"]
+  "plugin": ["@maiteuxzanela/ensemble-room-lowcost"]
 }
 ```
 
-Flags relevantes em `~/.config/opencode/ensemble.json` (`src/config.ts`):
+### `ensemble.json` flags (`src/config.ts`)
 
-| Flag | Default | Efeito |
+| Flag | Default | Effect |
 |---|---|---|
-| `silentLead` | `true` | Lead em repouso: entregas via SQLite/system prompt, sem `promptAsync`; wake só no fechamento do board |
-| `stallThresholdMs` | `300000` | TTL do watchdog; `0` desliga o TTL (GC de worktree continua) |
-| `stallMinSteps` | `5` | Mínimo de passos antes de considerar stall |
-| `dashboardPort` | `4747` | Dashboard HTTP (`0` desliga) |
+| `silentLead` | `true` | Lead at rest: delivery via SQLite/system prompt, no `promptAsync`; wake only on board closure |
+| `stallThresholdMs` | `300000` | Watchdog TTL; `0` disables the TTL (worktree GC continues) |
+| `stallMinSteps` | `5` | Minimum number of steps before a stall is considered |
+| `stallTokenThreshold` | `200` | Token-progress threshold used by the stall heuristic |
+| `dashboardPort` | `4747` | HTTP dashboard (`0` disables) |
+| `fallbackModels` | `[]` | Ordered fallback chain; empty falls back to the built-in cheap default |
+| `fallbackModelsByAgent` | `{}` | Per-agent override of the fallback chain (base-persona symmetry) |
+| `modelFallback` | — | Legacy single-entry fallback (`{ model, variant? }`) |
 
-Spawn em standby:
+Example — a two-step fallback chain:
+
+```jsonc
+{
+  "silentLead": true,
+  "fallbackModels": ["provider-a/model-x#low", "provider-b/model-y#low"],
+  "fallbackModelsByAgent": {
+    "reviewer": ["provider-c/model-z#low"]
+  }
+}
+```
+
+Spawn a teammate in standby (no init prompt, zero tokens):
 
 ```text
-team_spawn({ name: "clara", agent: "build", prompt: "…", claim_task: "<id>", standby: true })
+team_spawn({ name: "worker-a", agent: "build", prompt: "…", claim_task: "<id>", standby: true })
+```
+
+Hand over an in-progress card to a complementary specialist (sequential bench partnership):
+
+```text
+team_task_handover({ task_id: "<id>", to: "specialist-b", notes: "frontend done; backend left" })
 ```
 
 ---
 
-## 5. Notas de proveniência
+## 5. Provenance
 
-- Fonte base: `~/.cache/opencode/packages/@hueyexe/opencode-ensemble@0.18.0/node_modules/@hueyexe/opencode-ensemble/` (`src/`, `dist/`, `package.json`, `LICENSE`, `social-preview.png`), já com as 5 melhorias homologadas.
-- O tarball npm publicado **não** continha `tsconfig.json`; o arquivo versionado aqui foi recuperado do repositório upstream `github.com/hueyexe/opencode-ensemble` (`tsconfig.json`, sem alterações de compilador).
-- `package.json` foi reescrito apenas em `name`, `version`, `description`, `repository`, `keywords`, `files` e `scripts` (`test`, `check`, `typecheck`, `build`); dependências e `exports` permanecem equivalentes ao upstream.
-- Dívida conhecida: `engines.node >= 24` foi herdado do upstream e as suítes são executadas neste ambiente com Node `v22.23.2` (type-stripping nativo) — sem impacto sobre o runtime do plugin, que é o bundle `dist/index.js`.
+- Base source: the upstream `@hueyexe/opencode-ensemble@0.18.0` package (`src/`, `dist/`, `package.json`, `LICENSE`, `social-preview.png`), already carrying the hardened improvements.
+- The published npm tarball did **not** include `tsconfig.json`; the file versioned here was recovered from the upstream repository `github.com/hueyexe/opencode-ensemble` (unchanged compiler settings).
+- `package.json` was rewritten only in `name`, `version`, `description`, `repository`, `keywords`, `files` and `scripts` (`test`, `check`, `typecheck`, `build`); dependencies and `exports` remain equivalent to upstream.
+- Known debt: `engines.node >= 24` was inherited from upstream, while the suites run with the host Node (native type-stripping) — no impact on the plugin runtime, which is the `dist/index.js` bundle.
 
 ---
 
-## 6. Governança
+## 6. Governance
 
-- **Proibição estrita de mocks** em produção e testes (fail-fast): dependência indisponível vira bloqueio reportado, nunca stub.
-- **Sem polling**: wake do lead é exclusivamente event-driven (board closure); monitoramento passivo via dashboard/task board.
-- **Homologação**: toda entrega passa por `node --check dist/index.js` + `node tests/run_all.mjs` antes de qualquer commit.
+- **Strict prohibition of mocks** in production and tests (fail-fast): an unavailable dependency becomes a reported blocker, never a stub.
+- **No polling**: the lead wake is strictly event-driven (board closure); monitoring is passive via the dashboard and task board.
+- **Homologation**: every delivery passes through `node --check dist/index.js` + `node tests/run_all.mjs` before any commit.
+- **Local commits only**: commits are created locally and atomically by the runtime on a reviewer/admin verdict; pushing to the remote is a separate, deliberately gated step.
 
-MIT © [maiteuxzanela](https://github.com/maiteuxzanela) — derivado de `@hueyexe/opencode-ensemble` (MIT).
+MIT © [maiteuxzanela](https://github.com/maiteuxzanela) — derived from `@hueyexe/opencode-ensemble` (MIT).

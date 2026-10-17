@@ -231,49 +231,6 @@ export function checkToolIsolation(
 }
 
 /**
- * True when the member holds at least one assigned task that is still waiting
- * on dependencies — i.e. the task itself is `blocked`, or any id inside its
- * `depends_on` JSON array points at a task that is not `completed`.
- *
- * A member in this state is in *legitimate wait*: they cannot make progress
- * until someone else finishes, so silence on the board is expected and must
- * never be reported as "You completed your work...". Shared by every nudge
- * path (idle-nudge in `shouldNudgeIdleMember`, fast-idle alarm in
- * `shouldAlarmFastIdle`) so the rule lives in exactly one place.
- *
- * Fail-closed by design: malformed `depends_on` JSON, non-array payloads,
- * missing dependency rows and non-completed dependencies all count as
- * unresolved (suppress), because a false nudge is worse than a missed one.
- */
-export function hasBlockedAssignedTasks(db: Database, teamId: string, memberName: string): boolean {
-  const tasks = db.query(
-    "SELECT status, depends_on FROM team_task WHERE team_id = ? AND assignee = ?"
-  ).all(teamId, memberName) as Array<{ status: string; depends_on: string | null }>
-
-  for (const task of tasks) {
-    if (task.status === "blocked") return true
-    if (!task.depends_on) continue
-
-    let depIds: unknown
-    try {
-      depIds = JSON.parse(task.depends_on)
-    } catch {
-      return true // corrupted dependency pointer → treat as unresolved
-    }
-    if (!Array.isArray(depIds)) return true
-
-    for (const depId of depIds) {
-      if (typeof depId !== "string") return true
-      const dep = db.query("SELECT status FROM team_task WHERE id = ? AND team_id = ?")
-        .get(depId, teamId) as { status: string } | null
-      // Dependency deleted or not completed yet → the assignee is still waiting.
-      if (!dep || dep.status !== "completed") return true
-    }
-  }
-  return false
-}
-
-/**
  * True when the member holds at least one assigned task in status 'in_review'.
  * A member waiting on review feedback from Clara/reviewer is in legitimate wait.
  */
@@ -297,7 +254,7 @@ export function hasActivePeerDialogue(db: Database, teamId: string, memberName: 
 
 /**
  * True when the team has any uncompleted tasks remaining on the board
- * (status is pending, in_progress, blocked, or in_review).
+ * (status is pending, in_progress, or in_review).
  */
 export function hasPendingBoardTasks(db: Database, teamId: string): boolean {
   const row = db.query(
@@ -325,7 +282,6 @@ export function hasOtherActiveMembers(db: Database, teamId: string, memberName: 
  *   are completely suppressed to conserve tokens and prevent unnecessary wakes;
  * - `execution_status === 'standby'` — spawned paused, woken only by the first
  *   inbound `team_message` (standby spawn lifecycle);
- * - the member owns tasks blocked on unresolved `depends_on` entries;
  * - the member owns tasks in status 'in_review' (waiting on reviewer feedback);
  * - the member is in active peer dialogue (collaborating with teammates).
  *
@@ -348,9 +304,6 @@ export function shouldNudgeIdleMember(
   // Standby: silence until wake is by design, never a missed report.
   if (member.execution_status === "standby") return false
 
-  // Waiting on the task board: silence is legitimate too.
-  if (hasBlockedAssignedTasks(db, teamId, memberName)) return false
-
   // Member has tasks under review — waiting on reviewer/Clara is legitimate.
   if (hasInReviewAssignedTasks(db, teamId, memberName)) return false
 
@@ -370,7 +323,6 @@ export function shouldNudgeIdleMember(
  * warning, so it must stay silent for members whose early idle is expected:
  * - `execution_status === 'standby'` (spawned paused — prompt is suppressed
  *   until the wake path delivers `spawn_context`);
- * - members with assigned tasks blocked on unresolved dependencies;
  * - members with assigned tasks in review;
  * - teams with pending tasks remaining on the board or other active members;
  * - members older than 15s, or that already produced at least one message.
@@ -389,9 +341,8 @@ export function shouldAlarmFastIdle(
     .get(teamId, memberName) as { time_created: number; execution_status: string } | null
   if (!member) return false
 
-  // Standby, dependency-blocked or review-waiting members idle immediately on purpose.
+  // Standby or review-waiting members idle immediately on purpose.
   if (member.execution_status === "standby") return false
-  if (hasBlockedAssignedTasks(db, teamId, memberName)) return false
   if (hasInReviewAssignedTasks(db, teamId, memberName)) return false
 
   // Suppress alarm if there are pending tasks on the board or other active members in the team.

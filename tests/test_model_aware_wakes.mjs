@@ -415,10 +415,12 @@ async function runBehavior(label, mods) {
        VALUES (?,?,?,?,?,?,?,?)`,
       [team, name, sess, agent, status, exec, time, time],
     );
-  const seedTask = (db, id, team, status, assignee, dependsOn = null) =>
+  // TICKET-HARNESS-51: no depends_on column anymore — the legacy 6th argument
+  // is accepted and ignored; the board is a flat, fully-parallel pool.
+  const seedTask = (db, id, team, status, assignee, _dependsOn = null) =>
     db.run(
-      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, depends_on, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?,?)",
-      [id, team, `task ${id}`, status, "medium", assignee, dependsOn, Date.now(), Date.now()],
+      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?)",
+      [id, team, `task ${id}`, status, "medium", assignee, Date.now(), Date.now()],
     );
   const expectWake = (who) => `[System: All team tasks completed on board by ${who}]`;
 

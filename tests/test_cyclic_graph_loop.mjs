@@ -7,7 +7,7 @@
  *
  * Sob teste:
  *   - Migration 13 & schema team_task (status in_review, rejection_count, review_notes)
- *   - executeTeamTasksAdd -> src/tools/team-tasks-add.ts (DAG paralelo desarmado por padrão)
+ *   - executeTeamTasksAdd -> src/tools/team-tasks-add.ts (pool plano: toda tarefa nasce pending; sem DAG)
  *   - executeTeamTasksComplete -> src/tools/team-tasks-complete.ts (ciclo submit_review/reject/complete e trava de Clara)
  *   - executeTeamMessage -> src/tools/team-message.ts (reativação peer-to-peer e reset de reported_to_lead)
  *   - hooks -> src/hooks.ts (shouldNudgeIdleMember, shouldAlarmFastIdle, hasInReviewAssignedTasks, hasActivePeerDialogue)
@@ -205,10 +205,11 @@ async function runCyclicGraphSuite() {
   check("Tarefa Paralela 1 inicia como pending", parallelTasks[0].status === "pending");
   check("Tarefa Paralela 2 inicia como pending (não bloqueada)", parallelTasks[1].status === "pending");
   check("Tarefa Paralela 3 inicia como pending (não bloqueada)", parallelTasks[2].status === "pending");
-  check("Tarefa Paralela 2 não possui depends_on forçado", parallelTasks[1].depends_on === null);
-  check("Tarefa Paralela 3 não possui depends_on forçado", parallelTasks[2].depends_on === null);
+  check("Tarefa Paralela 2 não possui depends_on (coluna expurgada)", parallelTasks[1].depends_on === undefined);
+  check("Tarefa Paralela 3 não possui depends_on (coluna expurgada)", parallelTasks[2].depends_on === undefined);
 
-  // CONTROLE: Criação com sequential: true (deve manter o encadeamento DAG)
+  // CONTROLE (TICKET-HARNESS-51): a flag legada `sequential` não tem mais efeito —
+  // o board é um pool plano, então ambas nascem pending.
   await executeTeamTasksAdd(
     deps,
     {
@@ -224,8 +225,8 @@ async function runCyclicGraphSuite() {
     "SELECT * FROM team_task WHERE content LIKE 'Seq %' ORDER BY time_created ASC",
   ).all();
   check("Seq 1 inicia como pending", seqTasks[0].status === "pending");
-  check("Seq 2 inicia como blocked", seqTasks[1].status === "blocked");
-  check("Seq 2 depende de Seq 1", seqTasks[1].depends_on.includes(seqTasks[0].id));
+  check("Seq 2 inicia como pending (flag sequential ignorada)", seqTasks[1].status === "pending");
+  check("Seq 2 não possui depends_on (coluna expurgada)", seqTasks[1].depends_on === undefined);
 
   // Limpar tarefas de teste de paralelismo para isolar os próximos testes
   db.run("DELETE FROM team_task WHERE team_id = ?", TEAM_ID);

@@ -226,25 +226,18 @@ function notifyRejectedImplementer(
   return true
 }
 
-/** Minimal team context the unblock pass needs (structural subset of requireTeamMember). */
+/** Minimal team context (structural subset of requireTeamMember). */
 type TeamCtx = { teamId: string }
 
 /**
- * True when a downstream task belongs to the room's validation profile: its
- * assignee is the SDET (Hugo — qa-role.ts `isSDETMEmber`) or the Quality Gate
- * reviewer (Clara — `isQAMember`).
+ * True when a task belongs to the room's validation profile: its assignee is
+ * the SDET (Hugo — qa-role.ts `isSDETMEmber`) or the Quality Gate reviewer
+ * (Clara — `isQAMember`).
  *
- * Validation tasks are the ONLY downstream tasks allowed to treat an upstream
- * dependency in status `in_review` as resolved: the deterministic suite and
- * the adversarial audit ARE the review of that delivery, so they must start
- * the moment the delivery is submitted (HARNESS-24 — SDET handover). Every
- * other downstream task keeps the strict contract and waits for
- * `completed` / `cancelled`, so a rejected upstream never leaks rework into
- * regular work.
- *
- * Unassigned downstream tasks are deliberately NOT relaxed: without an
- * assignee there is no validation profile to verify, so they keep the strict
- * contract and unblock on `completed` (or on the first claim after that).
+ * Used by the HARNESS-25 consolidated-batch guard (see
+ * countPendingDevelopmentTasks) to tell a functional development task apart
+ * from a validation task. It is a pure identity check on the assignee and
+ * carries no dependency/DAG semantics (TICKET-HARNESS-51).
  */
 function isValidationProfileTask(
   deps: ToolDeps,
@@ -277,164 +270,6 @@ function countPendingDevelopmentTasks(
     "SELECT assignee FROM team_task WHERE team_id = ? AND status IN ('pending', 'in_progress') AND id != ?",
   ).all(teamInfo.teamId, excludeTaskId) as Array<{ assignee: string | null }>
   return rows.filter((r) => !isValidationProfileTask(deps, teamInfo, r)).length
-}
-
-/**
- * Unblock every `blocked` task whose `depends_on` points at `triggerTaskId`
- * once ALL of its dependencies are resolved, transitioning
- * `blocked → in_progress` (pre-assigned) or `blocked → pending` and firing the
- * member wake via resolveStandbyWake (standby consume) or the HARNESS-16
- * unconditional wake for pre-assigned owners.
- *
- * Shared by BOTH flows of executeTeamTasksComplete:
- *   - Flow 1 (submit_review): the trigger is now `in_review`. Validation
- *     downstream tasks (SDET/QA assignee) unblock IMMEDIATELY so the SDET can
- *     run the deterministic suite while the Quality Gate sleeps — without
- *     this pass, team_claim on the SDET test task bounced back to the
- *     yield/standby directive because the task never left `blocked`
- *     (HARNESS-24). Non-validation downstream tasks stay `blocked`.
- *   - Flow 3 (complete): the trigger is `completed`; a sibling dependency
- *     still `in_review` relaxes ONLY for validation downstream, so the final
- *     audit can close a delivery's chain without orphaning tasks that wait on
- *     an in_review sibling of the same delivery.
- *
- * Dependency evaluation is status-driven (no trigger short-circuit): the
- * trigger row is re-read AFTER the caller's UPDATE, so `in_review` relaxes
- * exactly and only for validation downstream.
- *
- * Returns the unblock/wake counters for the caller's result message.
- */
-function unblockDependents(
-  deps: ToolDeps,
-  teamInfo: TeamCtx,
-  triggerTaskId: string,
-  now: number,
-): { unblocked: number; wokeMembers: number } {
-  const allTasks = deps.db.query("SELECT id, depends_on, status, assignee FROM team_task WHERE team_id = ?")
-    .all(teamInfo.teamId) as Array<{ id: string; depends_on: string | null; status: string; assignee: string | null }>
-
-  let unblocked = 0
-  let wokeMembers = 0
-  for (const t of allTasks) {
-    if (t.status !== "blocked" || !t.depends_on) continue
-    const depIds: string[] = JSON.parse(t.depends_on)
-    if (!depIds.includes(triggerTaskId)) continue
-
-    const downstreamIsValidation = isValidationProfileTask(deps, teamInfo, t)
-    const allResolved = depIds.every(depId => {
-      const dep = allTasks.find(d => d.id === depId)
-      if (!dep) return false
-      if (dep.status === "completed" || dep.status === "cancelled") return true
-      // HARNESS-24: an upstream still under review satisfies ONLY validation
-      // downstream (SDET/QA assignee); regular dependents keep waiting for
-      // final approval before starting.
-      if (dep.status === "in_review" && downstreamIsValidation) return true
-      return false
-    })
-
-    if (allResolved) {
-      const nextStatus = t.assignee ? "in_progress" : "pending"
-      deps.db.run("UPDATE team_task SET status = ?, time_updated = ? WHERE id = ?", [nextStatus, now, t.id])
-      unblocked++
-
-      // Wake target: the pre-assigned assignee or an unassigned standby teammate
-      let wakeTarget = t.assignee
-      if (!wakeTarget) {
-        const standbyCandidate = deps.db.query(`
-          SELECT name FROM team_member
-          WHERE team_id = ? AND execution_status = 'standby'
-          AND name NOT IN (
-            SELECT assignee FROM team_task
-            WHERE team_id = ? AND assignee IS NOT NULL AND status IN ('in_progress', 'in_review', 'blocked')
-          )
-          ORDER BY time_updated ASC LIMIT 1
-        `).get(teamInfo.teamId, teamInfo.teamId) as { name: string } | null
-        if (standbyCandidate) {
-          wakeTarget = standbyCandidate.name
-        }
-      }
-
-      if (wakeTarget) {
-        // HARNESS-16: one snapshot BEFORE resolveStandbyWake — session delivery
-        // target, explicit agent for non-standby wakes, and the pre-consumption
-        // execution_status for observability (agent is immutable per member).
-        const memberRow = deps.db.query("SELECT session_id, agent, execution_status FROM team_member WHERE team_id = ? AND name = ?")
-          .get(teamInfo.teamId, wakeTarget) as { session_id: string; agent: string; execution_status: string } | null
-        const memberSessionId = memberRow?.session_id
-
-        if (memberSessionId) {
-          const baseText = `[System: Task "${t.id}" was unblocked and is ready for you to start]`
-          const wake = resolveStandbyWake(deps.db, teamInfo.teamId, wakeTarget, baseText)
-
-          if (wake.woke) {
-            // Standby consumed: spawn_context prepend + standby → starting
-            // transition (existing path, byte-compatible payload).
-            const memberModel = getMemberModel(deps.db, teamInfo.teamId, wakeTarget)
-            deps.client.session.promptAsync({
-              sessionID: memberSessionId,
-              parts: [{ type: "text", text: wake.text }],
-              agent: wake.agent,
-              synthetic: true,
-              ...(memberModel ? { model: memberModel } : {})
-            }).catch(err => {
-              deps.db.run(
-                "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
-                [Date.now(), teamInfo.teamId, wakeTarget]
-              )
-              log(`tasks-complete:wake-member:failed member=${wakeTarget} err=${String(err)}`)
-            })
-            log(`tasks-complete:wake-member:ok member=${wakeTarget} task=${t.id}`)
-            wokeMembers++
-          } else if (wakeTarget === t.assignee) {
-            // HARNESS-16 UNCONDITIONAL: the board advanced (blocked → in_progress)
-            // but a PRE-ASSIGNED owner that is ready/idle/busy was never woken —
-            // resolveStandbyWake only reports woke for the standby consume, so
-            // the owner slept while its status flipped → silent deadlock (T8).
-            // Wake ALWAYS: explicit agent + member model first rung on the T6
-            // model-aware ladder (step-down on rejection), synthetic system
-            // prompt. No standby revert here: this branch never consumed the
-            // standby window (a lost race means another delivery is already
-            // in flight with the spawn_context prepend).
-            try {
-              const memberModel = getMemberModel(deps.db, teamInfo.teamId, wakeTarget)
-              const primaryModel = memberModel
-                ? `${memberModel.providerID}/${memberModel.modelID}${memberModel.variant ? `#${memberModel.variant}` : ""}`
-                : undefined
-              promptModelAwareWake(deps.client, {
-                sessionID: memberSessionId,
-                text: baseText,
-                logTag: `tasks-complete:wake-member team=${teamInfo.teamId} member=${wakeTarget}`,
-                agent: memberRow.agent || undefined,
-                config: deps.config,
-                ...(primaryModel ? { primaryModel } : {}),
-              })
-              log(`tasks-complete:wake-member:ok member=${wakeTarget} task=${t.id} state=${memberRow.execution_status} unconditional=true`)
-              wokeMembers++
-            } catch (err) {
-              log(`tasks-complete:wake-member:failed member=${wakeTarget} err=${err instanceof Error ? err.message : String(err)}`)
-            }
-          }
-          // else: standby-candidate fallback WITHOUT pre-assignment keeps the
-          // legacy gate — silent unless resolveStandbyWake consumed the window.
-        }
-      }
-    }
-  }
-  return { unblocked, wokeMembers }
-}
-
-/**
- * Result suffix shared by Flow 1 (submit_review) and Flow 3 (complete):
- * ` (unblocked N task(s)[, woke M member(s)])` — byte-identical format on both
- * paths so deterministic suites can assert one single string shape.
- */
-function formatUnblockedSuffix(unblocked: number, wokeMembers: number): string {
-  if (unblocked <= 0) return ""
-  let msg = ` (unblocked ${unblocked} task${unblocked !== 1 ? "s" : ""}`
-  if (wokeMembers > 0) {
-    msg += `, woke ${wokeMembers} member${wokeMembers !== 1 ? "s" : ""}`
-  }
-  return `${msg})`
 }
 
 /** Normalize a directory path for comparison (strip trailing separators). */
@@ -811,27 +646,25 @@ async function autoCommitApprovedTask(deps: ToolDeps, teamId: string, taskConten
 }
 
 /**
- * Execute the team_tasks_complete tool. Marks a task as completed
- * and unblocks any dependent tasks.
+ * Execute the team_tasks_complete tool. Marks a task as completed.
+ *
+ * TICKET-HARNESS-51 — the board is a flat, fully-parallel pool: every task is
+ * independent and there is no `depends_on`/`blocked` unblock pass. Coordination
+ * between fronts happens through `team_message` (disjoint fronts) or
+ * `team_task_handover` (sequential baton pass on the SAME card).
  *
  * Supports cyclic review transitions:
  * - action='submit_review' (or status='in_review'): in_progress -> in_review
- *   * Also runs the dependent-unblock pass: downstream VALIDATION tasks
- *     (assignee is the SDET or the Quality Gate reviewer) whose depends_on
- *     points at the submitted task leave 'blocked' immediately —
- *     blocked -> in_progress (pre-assigned) / pending, with the owner woken
- *     (HARNESS-24 / SDET handover). Regular downstream tasks keep waiting
- *     for 'completed'.
+ *   * Wakes the SDET first when the room has one (HARNESS-23/24 handover);
+ *     otherwise wakes the Quality Gate reviewer.
  * - action='reject' (or status='in_progress' when in_review): in_review -> in_progress (QA reviewer/lead only)
  * - action='complete' (default): completed
  *   * If task is 'in_review', ONLY the Quality Gate reviewer (qa-role.ts) or 'lead' can complete it
  *     — this is what lets the final audit close upstream tasks of the same
  *     delivery that are still 'in_review' without orphaning the board.
- *   * Runs the same dependent-unblock pass against the now-'completed' trigger.
  *
  * Enforces task-board accuracy:
  * - Rejects completing an already-completed or cancelled task.
- * - Rejects completing a blocked task (dependencies must resolve first).
  * - Only the assignee (or the lead) may complete a claimed task.
  * - Completing an unclaimed task attributes it to the caller atomically.
  */
@@ -915,7 +748,6 @@ export async function executeTeamTasksComplete(
   if (isSubmitReview) {
     if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`)
     if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`)
-    if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`)
     if (task.status === "in_review") throw new Error(`Task "${args.task_id}" is already in review`)
     if (task.assignee && teamInfo.role !== "lead" && caller !== task.assignee) {
       throw new Error(`Task "${args.task_id}" is claimed by ${task.assignee}`)
@@ -972,15 +804,7 @@ export async function executeTeamTasksComplete(
       ? ` (SDET wake held until the functional batch is consolidated)`
       : ""
 
-    // HARNESS-24 (TASK-01): Flow 1 historically returned HERE without ever
-    // evaluating `depends_on`, so downstream validation tasks stayed 'blocked'
-    // until FULL approval and team_claim on the SDET test task bounced back to
-    // the yield/standby directive. The shared pass unblocks them the moment
-    // the upstream delivery enters 'in_review' (validation profile only —
-    // see unblockDependents/isValidationProfileTask).
-    const submittedUnblock = unblockDependents(deps, teamInfo, args.task_id, now)
-
-    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${notifiedLabel}${batchHeldLabel}${formatUnblockedSuffix(submittedUnblock.unblocked, submittedUnblock.wokeMembers)}`
+    return `Submitted task for review: ${task.content}${notes ? ` (notes: ${notes})` : ""}${notifiedLabel}${batchHeldLabel}`
   }
 
   // Flow 2: Reject review (in_review -> in_progress)
@@ -1029,7 +853,6 @@ export async function executeTeamTasksComplete(
   // Flow 3: Complete task (-> completed)
   if (task.status === "completed") throw new Error(`Task "${args.task_id}" is already completed`)
   if (task.status === "cancelled") throw new Error(`Task "${args.task_id}" was cancelled`)
-  if (task.status === "blocked") throw new Error(`Task "${args.task_id}" is blocked by unresolved dependencies`)
 
   // TICKET-HARNESS-34 (A6) — Quality Gate anti-bypass lock. When the room has
   // an active Quality Gate reviewer, an implementer must NEVER close a card by
@@ -1074,13 +897,6 @@ export async function executeTeamTasksComplete(
     }
   }
 
-  // Unblock dependent tasks — SHARED pass (extracted from this flow so
-  // Flow 1/submit_review runs the exact same evaluation). The trigger is now
-  // 'completed'; the validation-profile rule also relaxes sibling deps still
-  // in 'in_review', so a delivery's audit chain closes without orphaning the
-  // board (see unblockDependents).
-  const { unblocked, wokeMembers } = unblockDependents(deps, teamInfo, args.task_id, now)
-
   // Fire progress toast so the lead has visibility
   const counts = deps.db.query(
     "SELECT status, COUNT(*) as c FROM team_task WHERE team_id = ? GROUP BY status"
@@ -1090,11 +906,11 @@ export async function executeTeamTasksComplete(
   // Com `cancelled` dentro do denominador, `completed === total` fica inalcançável
   // e o lead nunca é acordado — o board trava em silêncio permanente.
   const total = counts.reduce((sum, r) => (r.status === "cancelled" ? sum : sum + r.c), 0)
-  // Tarefas ainda ativas = pending | in_progress | in_review | blocked. Com o total acima
+  // Tarefas ainda ativas = pending | in_progress | in_review. Com o total acima
   // restrito a esses mesmos status + completed, `activeRemaining === 0` é
   // equivalente a `completed === total` (defesa em profundidade explícita).
   const activeRemaining = counts.reduce(
-    (sum, r) => (r.status === "pending" || r.status === "in_progress" || r.status === "in_review" || r.status === "blocked" ? sum + r.c : sum),
+    (sum, r) => (r.status === "pending" || r.status === "in_progress" || r.status === "in_review" ? sum + r.c : sum),
     0,
   )
   const who = teamInfo.memberName ?? "teammate"
@@ -1130,7 +946,7 @@ export async function executeTeamTasksComplete(
   // While silentLead is active the lead receives no text-message prompts, so
   // board closure is the one event that must reach them.
   // DEF-2: cancelled tasks no longer block this — `total` excludes them and
-  // `activeRemaining === 0` guarantees no pending/in_progress/blocked work is left.
+  // `activeRemaining === 0` guarantees no pending/in_progress/in_review work is left.
   if (total > 0 && completed === total && activeRemaining === 0) {
     // NOTE: team_member has no `role` column (see schema.ts) — the lead's
     // session id lives on team.lead_session_id, the same canonical source
@@ -1157,7 +973,7 @@ export async function executeTeamTasksComplete(
     }
   }
 
-  return `Completed task: ${task.content}${formatUnblockedSuffix(unblocked, wokeMembers)}${commitSuffix}`
+  return `Completed task: ${task.content}${commitSuffix}`
 }
 
 export async function executeTeamTasksReview(
