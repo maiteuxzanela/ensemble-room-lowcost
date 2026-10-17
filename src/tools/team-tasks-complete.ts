@@ -10,6 +10,19 @@ import { log } from "../log"
 import path from "node:path"
 import { existsSync, readdirSync, statSync } from "node:fs"
 
+/**
+ * TICKET-HARNESS-33 (C2) — canonical `team_tasks_complete` actions.
+ *
+ * The V1 (Zod, src/index.ts) and V2 (JSON Schema, src/v2-tools.ts) tool schemas
+ * declare exactly these four values, and `executeTeamTasksComplete` re-validates
+ * them at runtime as the single source of truth: any other string must fail
+ * fast BEFORE any board transition. Without this guard an unknown action (e.g.
+ * 'approve', 'review', 'submit', 'rejected') silently fell through to the
+ * Flow 3 'complete' branch, closing the card by accident and firing the
+ * Portão 1 auto-commit whenever the caller was the Quality Gate or the lead.
+ */
+export const TEAM_TASK_ACTIONS = ["complete", "submit_review", "reject", "sdet_pass"] as const
+
 export interface TeamTasksCompleteArgs {
   task_id: string
   action?: "complete" | "submit_review" | "reject" | "sdet_pass" | string
@@ -810,6 +823,18 @@ export async function executeTeamTasksComplete(
   args: TeamTasksCompleteArgs,
   sessionId: string,
 ): Promise<string> {
+  // TICKET-HARNESS-33 (C2) — strict action validation, fail-fast, ZERO side
+  // effects. An unknown action must never reach the status transitions below:
+  // before this guard any non-canonical string (e.g. 'approve', 'review',
+  // 'submit', 'rejected') fell through to the Flow 3 'complete' branch, closing
+  // the card accidentally and firing the Portão 1 auto-commit when the caller
+  // was the Quality Gate or the lead. Throwing here guarantees no task row is
+  // updated, no dependent is unblocked and no git hook runs.
+  const action = args.action
+  if (action !== undefined && action !== null && !(TEAM_TASK_ACTIONS as readonly string[]).includes(action)) {
+    throw new Error(`INVALID_ACTION: Unknown action "${action}". Allowed actions: complete, submit_review, reject, sdet_pass.`)
+  }
+
   const teamInfo = requireTeamMember(deps, sessionId)
   const caller = teamInfo.role === "lead" ? "lead" : (teamInfo.memberName ?? "unknown")
 

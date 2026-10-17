@@ -3339,6 +3339,7 @@ function modifiedFilesUnderRepo(ledger, repoRoot) {
 init_log();
 import path5 from "node:path";
 import { existsSync as existsSync2, readdirSync, statSync } from "node:fs";
+var TEAM_TASK_ACTIONS = ["complete", "submit_review", "reject", "sdet_pass"];
 function wakeReviewTarget(deps, teamId, taskId, caller, target, notes, kind) {
   if (!target.sessionId) return false;
   const now = Date.now();
@@ -3772,6 +3773,10 @@ async function autoCommitApprovedTask(deps, teamId, taskContent) {
   }
 }
 async function executeTeamTasksComplete(deps, args, sessionId) {
+  const action = args.action;
+  if (action !== void 0 && action !== null && !TEAM_TASK_ACTIONS.includes(action)) {
+    throw new Error(`INVALID_ACTION: Unknown action "${action}". Allowed actions: complete, submit_review, reject, sdet_pass.`);
+  }
   const teamInfo = requireTeamMember(deps, sessionId);
   const caller = teamInfo.role === "lead" ? "lead" : teamInfo.memberName ?? "unknown";
   const task = deps.db.query("SELECT id, content, status, assignee, rejection_count, review_notes, time_created FROM team_task WHERE id = ? AND team_id = ?").get(args.task_id, teamInfo.teamId);
@@ -4868,7 +4873,11 @@ async function registerV2Tools(domain, deps) {
         type: "object",
         properties: {
           task_id: str("ID of the task to mark complete, submit for review, or reject"),
-          action: str("Action: 'complete' (default), 'submit_review', 'reject', or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate)"),
+          action: {
+            type: "string",
+            description: "Action: 'complete' (default), 'submit_review', 'reject', or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate). Any other value is rejected with INVALID_ACTION.",
+            enum: ["complete", "submit_review", "reject", "sdet_pass"]
+          },
           notes: str("Review notes or rejection reason")
         },
         required: ["task_id"],
@@ -8068,7 +8077,7 @@ var plugin = async (input) => {
         description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
         args: {
           task_id: tool.schema.string().describe("ID of the task to mark complete, submit for review, or reject"),
-          action: tool.schema.string().optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), 'reject' (in_review -> in_progress), or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate)"),
+          action: tool.schema.enum(["complete", "submit_review", "reject", "sdet_pass"]).optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), 'reject' (in_review -> in_progress), or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate). Any other value is rejected with INVALID_ACTION."),
           notes: tool.schema.string().optional().describe("Review notes or rejection reason")
         },
         async execute(args, ctx) {

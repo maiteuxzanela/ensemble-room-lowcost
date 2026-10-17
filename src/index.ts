@@ -674,7 +674,7 @@ const plugin: Plugin = async (input) => {
         description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
         args: {
           task_id: tool.schema.string().describe("ID of the task to mark complete, submit for review, or reject"),
-          action: tool.schema.string().optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), 'reject' (in_review -> in_progress), or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate)"),
+          action: tool.schema.enum(["complete", "submit_review", "reject", "sdet_pass"]).optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), 'reject' (in_review -> in_progress), or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate). Any other value is rejected with INVALID_ACTION."),
           notes: tool.schema.string().optional().describe("Review notes or rejection reason"),
         },
         async execute(args, ctx) {

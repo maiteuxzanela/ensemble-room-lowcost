@@ -18,6 +18,21 @@ export interface BroadcastMessageInput {
   content: string
 }
 
+/** Input for a recipient-fanned-out broadcast (TICKET-HARNESS-33B). */
+export interface BroadcastFanoutInput {
+  teamId: string
+  from: string
+  content: string
+  /** Recipient names — member names plus the literal "lead". */
+  recipients: string[]
+}
+
+/** A persisted per-recipient broadcast row. */
+export interface BroadcastFanoutRow {
+  recipient: string
+  id: string
+}
+
 /** A message row from the database. */
 export interface MessageRow {
   id: string
@@ -59,6 +74,36 @@ export function broadcastMessage(db: Database, input: BroadcastMessageInput): st
     [id, input.teamId, input.from, input.content, Date.now()]
   )
   return id
+}
+
+/**
+ * Persist a broadcast as ONE row per recipient (fan-out) instead of a single
+ * shared `to_name = NULL` row (TICKET-HARNESS-33B).
+ *
+ * A single shared row cannot track delivery per recipient: `delivered` is a
+ * per-row flag, so stamping it after the first successful `promptAsync` marks
+ * the whole broadcast delivered and silently loses it for every recipient whose
+ * transport failed afterwards (no retry, no system-prompt injection). Fanning
+ * out gives each delivery its own `delivered` flag, so a partial failure leaves
+ * only the failed recipient's row pending — recoverable by the recovery sweep
+ * (for members) or the system-prompt injection (for the silent lead).
+ *
+ * Returns the persisted rows aligned with `input.recipients`. Throws if content
+ * exceeds 10KB (validated once, before any insert).
+ */
+export function broadcastMessageFanout(db: Database, input: BroadcastFanoutInput): BroadcastFanoutRow[] {
+  if (new TextEncoder().encode(input.content).length > MAX_CONTENT_BYTES) {
+    throw new Error("Message content exceeds 10KB limit")
+  }
+  const now = Date.now()
+  return input.recipients.map((recipient) => {
+    const id = generateId("msg")
+    db.run(
+      "INSERT INTO team_message (id, team_id, from_name, to_name, content, delivered, time_created) VALUES (?, ?, ?, ?, ?, 0, ?)",
+      [id, input.teamId, input.from, recipient, input.content, now]
+    )
+    return { recipient, id }
+  })
 }
 
 /**
