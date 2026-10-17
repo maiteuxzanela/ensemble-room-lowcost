@@ -147,10 +147,12 @@ async function runFlow(mod) {
     );
     registry.register(teamId, name, ses);
   };
-  const task = (id, teamId, assignee, status = "in_progress", content = null, dependsOn = null) => {
+  // TICKET-HARNESS-51: no depends_on column anymore — the legacy 6th argument
+  // is accepted and ignored; the board is a flat, fully-parallel pool.
+  const task = (id, teamId, assignee, status = "in_progress", content = null, _dependsOn = null) => {
     db.run(
-      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, depends_on, rejection_count, time_created, time_updated) VALUES (?,?,?,?,'high',?,?,0,?,?)",
-      [id, teamId, content ?? `Task ${id}`, status, assignee, dependsOn, now, now],
+      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, rejection_count, time_created, time_updated) VALUES (?,?,?,?,'high',?,0,?,?)",
+      [id, teamId, content ?? `Task ${id}`, status, assignee, now, now],
     );
   };
   const doComplete = async (ses, args) => {
@@ -174,7 +176,7 @@ async function runFlow(mod) {
   member("q1", "hugo", "ses_hugo_q1", "hugo");
   member("q1", "clara", "ses_clara_q1", "clara", { isQa: 1, role: "qa" });
   task("a1", "q1", "tulio", "in_progress");
-  task("a1dep", "q1", "hugo", "blocked", "Downstream validation", '["a1"]');
+  task("a1dep", "q1", "hugo", "in_review", "Downstream validation");
   task("a2", "q1", null, "pending");
   task("a3", "q1", "tulio", "in_progress");
   task("a9", "q1", null, "pending"); // sentinela: mantém o board aberto
@@ -186,7 +188,7 @@ async function runFlow(mod) {
   const r1 = await doComplete("ses_tulio_q1", { task_id: "a1", action: "complete" });
   R("A6.1 implementer-blocked-in-progress", r1.err === A6_MSG("a1", "clara"), r1.err ?? r1.res);
   R("A6.2 in-progress-status-unchanged", statusOf("a1") === "in_progress", statusOf("a1"));
-  R("A6.3 dependent-stays-blocked", statusOf("a1dep") === "blocked", statusOf("a1dep"));
+  R("A6.3 sibling-stays-in_review", statusOf("a1dep") === "in_review", statusOf("a1dep"));
   R("A6.4 zero-wake-on-blocked-complete", calls.length === 0, `wakes=${calls.length}`);
   R(
     "A6.5 not-legacy-in-review-message",
@@ -631,8 +633,11 @@ const MUTATIONS = [
     desc: "trava anti-bypass do QA desabilitada (implementador fecha in_progress/pending)",
     from: 'if (qaMember && teamInfo.role !== "lead" && !isQAMember(deps.db, teamInfo.teamId, caller)) {',
     to: "if (false) {",
-    detect: ["A6.1 implementer-blocked-in-progress", "A6.2 in-progress-status-unchanged", "A6.3 dependent-stays-blocked", "A6.6 implementer-blocked-pending", "A6.8 sdet-not-exempt-in-progress", "A6.13 qa-retrocompat-persona-label", "A6.14 qa-retrocompat-agent-label"],
-    unaffected: ["A6.12 no-qa-room-legacy-complete", "A6.15 lead-exempt-completes-in-progress", "LC.1 submit-review-wakes-sdet", "LC.3 implementer-cannot-close-in-review", "LC.5 qa-completes-in-review", "A1.1 silent-suppresses-wake-persists-row", "A2.10 genuine-error-persists-row"],
+    detect: ["A6.1 implementer-blocked-in-progress", "A6.2 in-progress-status-unchanged", "A6.6 implementer-blocked-pending", "A6.8 sdet-not-exempt-in-progress", "A6.13 qa-retrocompat-persona-label", "A6.14 qa-retrocompat-agent-label"],
+    // A6.3 (sibling-stays-in_review) is a FLAT-POOL invariant: completing one
+    // card never mutates a sibling, so it stays GREEN under M1 and is asserted
+    // as a surgical (unaffected) sentinel — not a sensitivity probe.
+    unaffected: ["A6.3 sibling-stays-in_review", "A6.12 no-qa-room-legacy-complete", "A6.15 lead-exempt-completes-in-progress", "LC.1 submit-review-wakes-sdet", "LC.3 implementer-cannot-close-in-review", "LC.5 qa-completes-in-review", "A1.1 silent-suppresses-wake-persists-row", "A2.10 genuine-error-persists-row"],
   },
   {
     id: "M2",
@@ -640,7 +645,7 @@ const MUTATIONS = [
     from: "cannot be completed directly by an implementer; only ",
     to: "cannot be completed directly; only ",
     detect: ["A6.1 implementer-blocked-in-progress", "A6.6 implementer-blocked-pending", "A6.8 sdet-not-exempt-in-progress", "A6.13 qa-retrocompat-persona-label", "A6.14 qa-retrocompat-agent-label"],
-    unaffected: ["A6.2 in-progress-status-unchanged", "A6.3 dependent-stays-blocked", "A6.5 not-legacy-in-review-message", "A6.12 no-qa-room-legacy-complete", "LC.5 qa-completes-in-review", "A1.1 silent-suppresses-wake-persists-row", "A2.7 abort-event-persists-nothing"],
+    unaffected: ["A6.2 in-progress-status-unchanged", "A6.3 sibling-stays-in_review", "A6.5 not-legacy-in-review-message", "A6.12 no-qa-room-legacy-complete", "LC.5 qa-completes-in-review", "A1.1 silent-suppresses-wake-persists-row", "A2.7 abort-event-persists-nothing"],
   },
   {
     id: "M3",

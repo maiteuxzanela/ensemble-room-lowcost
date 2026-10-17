@@ -1,44 +1,37 @@
 #!/usr/bin/env node
 /**
- * QUALITY GATE DETERMINÍSTICO — Desrepresamento de Dependências no submit_review
- * (TICKET-HARNESS-24 / TASK-02) — @maiteuxzanela/ensemble-room-lowcost
+ * QUALITY GATE DETERMINÍSTICO — Roteamento SDET/QA no Pool Plano
+ * (TICKET-HARNESS-51) — @maiteuxzanela/ensemble-room-lowcost
  *
  * Engenheiro de Testes (SDET): Hugo. Guardiã do Quality Gate: Clara.
  *
+ * TICKET-HARNESS-51 — o board é um pool plano, totalmente paralelo. O mecanismo
+ * legado de DAG (`depends_on`/`blocked`/`unblockDependents` do HARNESS-24) foi
+ * DEFINITIVAMENTE expurgado: nenhuma tarefa bloqueia outra, nenhum submit_review
+ * "desbloqueia" dependentes, e toda tarefa nasce 'pending' e reivindicável.
+ *
  * Sob teste (src/ e dist/ REAIS, SQLite real via node:sqlite — SEM MOCKS):
- *   - executeTeamTasksAdd      -> src/tools/team-tasks-add.ts  (criação real com depends_on)
- *   - executeTeamClaim         -> src/tools/team-claim.ts      (pré-atribuição em blocked)
+ *   - executeTeamTasksAdd      -> src/tools/team-tasks-add.ts  (toda tarefa pending)
+ *   - executeTeamClaim         -> src/tools/team-claim.ts      (claim direto no pool)
  *   - executeTeamTasksComplete -> src/tools/team-tasks-complete.ts
- *       Flow 1 (submit_review) + helper unblockDependents / isValidationProfileTask /
- *       formatUnblockedSuffix (HARNESS-24)
+ *       submit_review (roteamento SDET-first / QA), sdet_pass, guarda de lote
  *
- * Cobertura (card TASK-02):
- *   (a) TASK-01 (implementador) -> TASK-02 (SDET/Hugo) em 'blocked' com assignee:
- *       ao executar team_tasks_complete(action='submit_review') na TASK-01, a
- *       TASK-02 sai de 'blocked' para 'in_progress' (pré-atribuída) e o
- *       team_claim do Hugo responde "already in progress and assigned to you"
- *       (não mais o diretivo blocked/standby). Inclui sentinelas de contrato
- *       estrito: dependentes SEM assignee ou com assignee regular permanecem
- *       'blocked' no submit_review (relaxamento exclusivo do perfil de validação).
- *   (b) TASK-02 (SDET) -> TASK-03 (Clara/QA) em 'blocked' com assignee:
- *       ao SDET executar submit_review na TASK-02, a TASK-03 desbloqueia para o
- *       Quality Gate (via isQAMember) e o claim da Clara responde sucesso.
- *   (c) PROVA DE MUTAÇÃO: 2 mutantes gerados por patch determinístico no bundle
- *       dist — M1 anula a chamada de unblockDependents NO Flow 1 (a TASK-02
- *       permanece 'blocked' e o claim do SDET cai no diretivo blocked) e M2
- *       força a transição 'pending' (anula o pré-atribuído 'in_progress').
- *       Cada mutante FALHA nas sentinelas-alvo e PERMANECER VERDE nos fluxos
- *       intactos (cirurgia) — inclusive no Flow 3 (complete), intocado por M1.
- *   (d) A suíte inteira roda no npm test (tests/run_all.mjs) — verdes, sem mocks.
- *
- * Extras: variante standby (wake do desrepresamento consome a janela com
- *         prepend de spawn_context), paridade src↔dist dos literais do helper,
- *         anti-mock estático em src/ e na própria suíte.
+ * Cobertura:
+ *   (a) Implementador submete: o SDET é acordado (handover), a QA fica dormindo,
+ *       e NENHUM irmão do board é movido (pool plano — sem dependências).
+ *   (b) SDET submete a própria entrega: a QA é acordada (legado), o SDET não
+ *       se auto-acorda, e o irmão permanece intocado.
+ *   (c) sdet_pass: o veredito verde fica no card 'in_review' e acorda a QA.
+ *   (s3) Guarda de lote consolidado: um irmão funcional pendente segura o wake
+ *       do SDET — provando que o submit NÃO move nem acorda o irmão.
+ *   (s2b) Variante standby: o wake da QA consome a janela com prepend de
+ *       spawn_context.
+ *   (c-mut) PROVA DE MUTAÇÃO: 2 mutantes por patch determinístico no bundle dist
+ *       — M1 desliga o roteamento SDET-first; M2 adultera o texto do handover.
  *
  * Único seam: cliente SDK do OpenCode (fronteira externa), reduzido a um
- * recorder determinístico de promptAsync — mesmo padrão das demais suítes.
- * Nenhum componente de produção é substituído: SQLite, bundle dist, DDL das
- * migrações e as tools reais (add/claim/complete) rodam autênticos.
+ * recorder determinístico de promptAsync. Nenhum componente de produção é
+ * substituído: SQLite, bundle dist, DDL das migrações e as tools reais rodam.
  *
  * Uso: node tests/test_sdet_dependency_unblock.mjs
  * Exit: 0 = todos os checks PASS; 1 = há FAIL.
@@ -70,6 +63,7 @@ const REQUIRED_SYMBOLS = [
   "createDb", "executeTeamTasksComplete", "executeTeamTasksAdd", "executeTeamClaim",
   "DEFAULT_CONFIG", "MemberRegistry", "ProgressTracker",
   "getTeamSDETMember", "isSDETMEmber", "getTeamQAMember", "isQAMember", "resolveStandbyWake",
+  "MIGRATIONS",
 ];
 const distRaw = readFileSync(DIST, "utf8");
 
@@ -96,7 +90,7 @@ const buildHarnessCode = (raw) => {
 const REAL = await import(path.join(TMP, "_sdet_unblock_harness.mjs"));
 
 // ---------------------------------------------------------------------------
-// 1. RunFlow: cenários (a)/(b)/(c) contra um módulo harness dado.
+// 1. RunFlow: cenários contra um módulo harness dado.
 //    Cada execução cria um SQLite NOVO em scratch isolado e o remove ao final.
 //    Retorna Map<checkName, {ok, detail}> — a fase real promove cada entrada a
 //    check global; a fase de mutação só promove as meta-checks de detecção.
@@ -105,14 +99,14 @@ let flowSeq = 0;
 async function runFlow(mod) {
   const {
     createDb, executeTeamTasksComplete, executeTeamTasksAdd, executeTeamClaim,
-    DEFAULT_CONFIG, MemberRegistry, ProgressTracker, isSDETMEmber, isQAMember,
+    DEFAULT_CONFIG, MemberRegistry, ProgressTracker, isSDETMEmber, isQAMember, MIGRATIONS,
   } = mod;
 
   const dir = path.join(TMP, `sdet_unblock_${process.pid}_${flowSeq++}`);
   mkdirSync(dir, { recursive: true });
   const db = createDb(path.join(dir, "ensemble.db"));
   const registry = new MemberRegistry();
-  const progressTracker = new ProgressTracker(db);
+  const progressTracker = new ProgressTracker();
 
   // Recorder da fronteira de transporte (único seam desta suíte).
   const calls = [];
@@ -146,10 +140,9 @@ async function runFlow(mod) {
   };
 
   // Ferramentas REAIS do board (add/claim/complete/submit) — nada de inserts
-  // manuais nos cenários principais: o ciclo add -> claim -> submit reproduz
-  // exatamente o board da sala HARNESS-24. Os wrappers capturam exceções como
-  // marcador '<<THREW>>' para que a fase de mutação registre TODAS as sentinelas
-  // mesmo quando um mutante derruba um passo no meio do fluxo.
+  // manuais nos cenários principais. Os wrappers capturam exceções como marcador
+  // '<<THREW>>' para que a fase de mutação registre TODAS as sentinelas mesmo
+  // quando um mutante derruba um passo no meio do fluxo.
   const addTask = async (sessionId, tasks) => {
     try {
       const res = await executeTeamTasksAdd(deps, { tasks }, sessionId);
@@ -176,10 +169,10 @@ async function runFlow(mod) {
       return `<<THREW>> ${String(e)}`;
     }
   };
-  const complete = async (sessionId, taskId) => {
+  const sdetPass = async (sessionId, taskId, notes) => {
     calls.length = 0;
     try {
-      return await executeTeamTasksComplete(deps, { task_id: taskId, action: "complete" }, sessionId);
+      return await executeTeamTasksComplete(deps, { task_id: taskId, action: "sdet_pass", notes }, sessionId);
     } catch (e) {
       return `<<THREW>> ${String(e)}`;
     }
@@ -188,13 +181,19 @@ async function runFlow(mod) {
   const textOf = (c) => c?.parts?.[0]?.text ?? "";
   const taskRow = (id) => {
     if (id == null) return {};
-    return db.query("SELECT status, assignee, depends_on, review_notes FROM team_task WHERE id = ?").get(id) ?? {};
+    return db.query("SELECT status, assignee, review_notes FROM team_task WHERE id = ?").get(id) ?? {};
   };
   const execOf = (teamId, name) =>
     db.query("SELECT execution_status FROM team_member WHERE team_id = ? AND name = ?").get(teamId, name)?.execution_status;
 
   // ================= SETUP (board real, pré-condições) ======================
-  seedTeam("s1", "squad-harness24", "ses_lead_s1");
+  // Flat pool (TICKET-HARNESS-51): a coluna depends_on foi expurgada na
+  // Migration 19 e 'blocked' saiu do CHECK constraint.
+  const cols = db.query("PRAGMA table_info(team_task)").all().map((c) => c.name);
+  R("Pre.schema-no-depends_on", !cols.includes("depends_on"), cols.join(","));
+  R("Pre.migration-19-flat-pool", MIGRATIONS.length >= 19, `len=${MIGRATIONS.length}`);
+
+  seedTeam("s1", "squad-harness51", "ses_lead_s1");
   member("s1", "tulio", "ses_tulio_s1", "build");
   member("s1", "hugo", "ses_hugo_s1", "hugo");
   member("s1", "clara", "ses_clara_s1", "clara", 1);
@@ -204,41 +203,20 @@ async function runFlow(mod) {
   R("Pre.profile-qa-clara", isQAMember(db, "s1", "clara") === true && isSDETMEmber(db, "s1", "clara") === false);
   R("Pre.profile-regular-tulio", isSDETMEmber(db, "s1", "tulio") === false && isQAMember(db, "s1", "tulio") === false);
 
-  // TASK-01 (implementador): pending -> claimed in_progress.
-  const t1 = (await addTask("ses_tulio_s1", [{ content: "TASK-01 implementador", priority: "high" }])).ids[0];
-  R("Pre.t1-created", !!t1 && taskRow(t1).status === "pending", `id=${t1} status=${taskRow(t1).status}`);
-  const c1 = await claim("ses_tulio_s1", t1);
-  R("Pre.t1-claimed-in-progress", c1.includes("Claimed task:") && taskRow(t1).status === "in_progress" && taskRow(t1).assignee === "tulio", c1);
-
-  // TASK-02 (SDET/Hugo): dependente de TASK-01 nasce 'blocked'; Hugo faz o
-  // pre-claim (pré-atribui mas mantém 'blocked') — exatamente o estado do board
-  // real antes do wake de handover.
-  const t2 = (await addTask("ses_tulio_s1", [{ content: "TASK-02 suíte SDET", priority: "high", depends_on: [t1] }])).ids[0];
-  R("Pre.t2-created-blocked", taskRow(t2).status === "blocked" && taskRow(t2).depends_on === JSON.stringify([t1]), JSON.stringify(taskRow(t2)));
-  const c2 = await claim("ses_hugo_s1", t2);
+  // Três tarefas INDEPENDENTES (pool plano): todas nascem pending.
+  const t1 = (await addTask("ses_lead_s1", [{ content: "TASK-01 implementador", priority: "high" }])).ids[0];
+  const t2 = (await addTask("ses_lead_s1", [{ content: "TASK-02 suíte SDET", priority: "high" }])).ids[0];
+  const t3 = (await addTask("ses_lead_s1", [{ content: "TASK-03 auditoria QA", priority: "high" }])).ids[0];
   R(
-    "Pre.t2-preclaim-directive",
-    c2.includes(`Pre-claimed blocked task "${t2}"`) && c2.includes("enter standby (yield) via team_standby"),
-    c2,
+    "Pre.all-tasks-born-pending",
+    [t1, t2, t3].every((id) => taskRow(id).status === "pending") && [t1, t2, t3].every((id) => !!id),
+    JSON.stringify([taskRow(t1).status, taskRow(t2).status, taskRow(t3).status]),
   );
-  R("Pre.t2-preclaim-assignee-hugo", taskRow(t2).status === "blocked" && taskRow(t2).assignee === "hugo", JSON.stringify(taskRow(t2)));
 
-  // TASK-03 (Clara/QA): dependente de TASK-02 nasce 'blocked' + pre-claim da Clara.
-  const t3 = (await addTask("ses_tulio_s1", [{ content: "TASK-03 auditoria QA", priority: "high", depends_on: [t2] }])).ids[0];
-  R("Pre.t3-created-blocked", taskRow(t3).status === "blocked", `status=${taskRow(t3).status}`);
-  await claim("ses_clara_s1", t3);
-  R("Pre.t3-preclaim-assignee-clara", taskRow(t3).status === "blocked" && taskRow(t3).assignee === "clara", JSON.stringify(taskRow(t3)));
-
-  // Sentinelas de contrato ESTRITO (relaxamento exclusivo do perfil de validação):
-  // dependentes da TASK-01 sem assignee e com assignee regular.
-  const tRegU = (await addTask("ses_tulio_s1", [{ content: "downstream regular sem assignee", priority: "medium", depends_on: [t1] }])).ids[0];
-  const tRegC = (await addTask("ses_tulio_s1", [{ content: "downstream regular tulio", priority: "medium", depends_on: [t1] }])).ids[0];
-  await claim("ses_tulio_s1", tRegC);
-  R(
-    "Pre.strict-pair-blocked",
-    taskRow(tRegU).status === "blocked" && !taskRow(tRegU).assignee && taskRow(tRegC).status === "blocked" && taskRow(tRegC).assignee === "tulio",
-    JSON.stringify([taskRow(tRegU), taskRow(tRegC)]),
-  );
+  // Cada card é reivindicado diretamente no pool (sem pré-atribuição bloqueada).
+  R("Pre.t1-claimed-tulio", (await claim("ses_tulio_s1", t1)).includes("Claimed task:") && taskRow(t1).status === "in_progress");
+  R("Pre.t2-claimed-hugo", (await claim("ses_hugo_s1", t2)).includes("Claimed task:") && taskRow(t2).assignee === "hugo");
+  R("Pre.t3-claimed-clara", (await claim("ses_clara_s1", t3)).includes("Claimed task:") && taskRow(t3).assignee === "clara");
 
   // ==================== (a) submit_review do implementador ==================
   const res1 = await submit("ses_tulio_s1", t1, "PR pronto");
@@ -246,23 +224,14 @@ async function runFlow(mod) {
   const clara1 = wakes("ses_clara_s1");
   const row1 = taskRow(t1);
   const row2 = taskRow(t2);
+  const row3 = taskRow(t3);
   R("A.submit-t1-notifies-sdet", res1.includes("(notified hugo for deterministic tests)"), res1);
-  R("A.submit-t1-unblock-suffix", res1.includes("(unblocked 1 task, woke 1 member)"), res1);
+  R("A.submit-t1-no-unblock", !res1.includes("unblocked") && !res1.includes("woke"), res1);
   R("A.t1-in-review-with-notes", row1.status === "in_review" && row1.review_notes === "PR pronto", JSON.stringify(row1));
-  R("A.t2-in-progress-after-submit", row2.status === "in_progress", `status=${row2.status}`);
-  R("A.t2-assignee-preserved", row2.assignee === "hugo", `assignee=${row2.assignee}`);
-  const c2b = await claim("ses_hugo_s1", t2);
-  R(
-    "A.t2-claim-already-in-progress",
-    c2b.includes(`Task "${t2}" is already in progress and assigned to you`),
-    c2b,
-  );
-  R("A.t-reg-unassigned-stays-blocked", taskRow(tRegU).status === "blocked", `status=${taskRow(tRegU).status}`);
-  R("A.t-reg-claimed-stays-blocked", taskRow(tRegC).status === "blocked", `status=${taskRow(tRegC).status}`);
-  R("A.t3-not-triggered-stays-blocked", taskRow(t3).status === "blocked", `status=${taskRow(t3).status}`);
+  R("A.t2-unchanged-flat-pool", row2.status === "in_progress" && row2.assignee === "hugo", JSON.stringify(row2));
+  R("A.t3-unchanged-flat-pool", row3.status === "in_progress" && row3.assignee === "clara", JSON.stringify(row3));
   const handover1 = hugo1.filter((c) => textOf(c).includes("SDET handover"));
-  const unblock1 = hugo1.filter((c) => textOf(c).includes("was unblocked and is ready for you to start"));
-  R("A.hugo-total-2-wakes", hugo1.length === 2, `count=${hugo1.length}`);
+  R("A.hugo-one-wake", hugo1.length === 1, `count=${hugo1.length}`);
   R(
     "A.hugo-handover-wake-exact",
     handover1.length === 1 &&
@@ -270,125 +239,105 @@ async function runFlow(mod) {
         `[System: Task "${t1}" was submitted for review by tulio (notes: PR pronto) — SDET handover: run the deterministic test suite for this delivery before the Quality Gate audits.]`,
     handover1.map(textOf).join(" || "),
   );
-  R(
-    "A.hugo-unblock-wake-exact",
-    unblock1.length === 1 && textOf(unblock1[0]) === `[System: Task "${t2}" was unblocked and is ready for you to start]`,
-    unblock1.map(textOf).join(" || ") || "(nenhum)",
-  );
-  R("A.hugo-unblock-wake-synthetic", unblock1[0]?.synthetic === true, `synthetic=${unblock1[0]?.synthetic}`);
+  R("A.hugo-handover-wake-synthetic", handover1[0]?.synthetic === true, `synthetic=${handover1[0]?.synthetic}`);
   R("A.clara-suppressed", clara1.length === 0, `count=${clara1.length}`);
-
-  // ============ Variante standby: wake consome a janela com prepend =========
-  seedTeam("s2b", "squad-standby-unblock", "ses_lead_s2b");
-  member("s2b", "tulio", "ses_tulio_s2b", "build");
-  member("s2b", "hugo", "ses_hugo_s2b", "hugo");
-  member("s2b", "xena", "ses_xena_s2b", "build", 1, null, "standby", "CTX_QA_BIRTH");
-  const t1x = (await addTask("ses_tulio_s2b", [{ content: "TASK-01X", priority: "high" }])).ids[0];
-  await claim("ses_tulio_s2b", t1x);
-  const t2x = (await addTask("ses_tulio_s2b", [{ content: "TASK-02X QA standby", priority: "high", depends_on: [t1x] }])).ids[0];
-  await claim("ses_xena_s2b", t2x);
-  R("SB.t2x-preclaim-blocked", taskRow(t2x).status === "blocked" && taskRow(t2x).assignee === "xena", JSON.stringify(taskRow(t2x)));
-  const resx = await submit("ses_tulio_s2b", t1x, "standby");
-  const hugox = wakes("ses_hugo_s2b");
-  const xenax = wakes("ses_xena_s2b");
-  R("SB.submit-unblock-suffix", resx.includes("(unblocked 1 task, woke 1 member)"), resx);
-  R("SB.t2x-in-progress", taskRow(t2x).status === "in_progress", `status=${taskRow(t2x).status}`);
-  R("SB.xena-exec-starting", execOf("s2b", "xena") === "starting", `exec=${execOf("s2b", "xena")}`);
-  R("SB.hugo-handover-only", hugox.length === 1 && textOf(hugox[0]).includes("SDET handover"), `count=${hugox.length}`);
-  R(
-    "SB.unblock-wake-standby-consume",
-    xenax.length === 1 &&
-      textOf(xenax[0]) === `CTX_QA_BIRTH\n\n[System: Task "${t2x}" was unblocked and is ready for you to start]`,
-    xenax.map(textOf).join(" || ") || "(nenhum)",
-  );
 
   // ==================== (b) submit_review do SDET ===========================
   const res2 = await submit("ses_hugo_s1", t2, "suite verde");
   const clara2 = wakes("ses_clara_s1");
   const hugo2 = wakes("ses_hugo_s1");
-  const row3 = taskRow(t3);
   R("B.submit-t2-notifies-clara", res2.includes("(notified clara for review)"), res2);
-  R("B.submit-t2-unblock-suffix", res2.includes("(unblocked 1 task, woke 1 member)"), res2);
+  R("B.submit-t2-no-unblock", !res2.includes("unblocked") && !res2.includes("woke"), res2);
   R("B.t2-in-review", taskRow(t2).status === "in_review", `status=${taskRow(t2).status}`);
-  R("B.t3-in-progress-after-sdet-submit", row3.status === "in_progress", `status=${row3.status}`);
-  R("B.t3-assignee-clara", row3.assignee === "clara", `assignee=${row3.assignee}`);
-  const c3b = await claim("ses_clara_s1", t3);
-  R(
-    "B.t3-claim-already-in-progress",
-    c3b.includes(`Task "${t3}" is already in progress and assigned to you`),
-    c3b,
-  );
+  R("B.t3-unchanged-flat-pool", taskRow(t3).status === "in_progress" && taskRow(t3).assignee === "clara", JSON.stringify(taskRow(t3)));
   const legacy2 = clara2.filter((c) => textOf(c).includes("was submitted for review by"));
-  const unblock2 = clara2.filter((c) => textOf(c).includes("was unblocked and is ready for you to start"));
-  R("B.clara-total-2-wakes", clara2.length === 2, `count=${clara2.length}`);
+  R("B.clara-one-wake", clara2.length === 1, `count=${clara2.length}`);
   R(
     "B.clara-legacy-wake-exact",
     legacy2.length === 1 && textOf(legacy2[0]) === `[System: Task "${t2}" was submitted for review by hugo (notes: suite verde)]`,
     legacy2.map(textOf).join(" || ") || "(nenhum)",
   );
-  R(
-    "B.clara-unblock-wake-exact",
-    unblock2.length === 1 && textOf(unblock2[0]) === `[System: Task "${t3}" was unblocked and is ready for you to start]`,
-    unblock2.map(textOf).join(" || ") || "(nenhum)",
-  );
   R("B.hugo-zero-self-wake", hugo2.length === 0, `count=${hugo2.length}`);
 
-  // ============ (c) regressão do Flow 3 (complete) — cirurgia do M1 =========
-  seedTeam("s2", "squad-flow3", "ses_lead_s2");
-  member("s2", "tulio", "ses_tulio_s2", "build");
-  const t9 = (await addTask("ses_tulio_s2", [{ content: "TASK-09 upstream", priority: "high" }])).ids[0];
-  await claim("ses_tulio_s2", t9);
-  const t10 = (await addTask("ses_tulio_s2", [{ content: "TASK-10 downstream regular", priority: "high", depends_on: [t9] }])).ids[0];
-  R("C.t10-created-blocked", taskRow(t10).status === "blocked", `status=${taskRow(t10).status}`);
-  const c10 = await claim("ses_tulio_s2", t10);
-  R("C.t10-preclaim-directive", c10.includes("Pre-claimed blocked task"), c10);
-  const res3 = await complete("ses_tulio_s2", t9);
-  const tulio3 = wakes("ses_tulio_s2");
-  const lead3 = wakes("ses_lead_s2");
-  R("C.complete-t9-unblock-suffix", res3.includes("Completed task:") && res3.includes("(unblocked 1 task, woke 1 member)"), res3);
-  R("C.t10-in-progress-after-complete", taskRow(t10).status === "in_progress", `status=${taskRow(t10).status}`);
+  // ==================== (c) sdet_pass -> handover à QA ======================
+  const res3 = await sdetPass("ses_hugo_s1", t1, "suite verde");
+  const clara3 = wakes("ses_clara_s1");
+  R("C.sdet-pass-recorded", res3.includes("SDET verification recorded") && res3.includes("notified"), res3);
+  R("C.t1-stays-in-review", taskRow(t1).status === "in_review", `status=${taskRow(t1).status}`);
+  R("C.clara-woken-one", clara3.length === 1, `count=${clara3.length}`);
   R(
-    "C.tulio-unblock-wake-exact",
-    tulio3.length === 1 && textOf(tulio3[0]) === `[System: Task "${t10}" was unblocked and is ready for you to start]`,
-    tulio3.map(textOf).join(" || ") || "(nenhum)",
+    "C.sdet-pass-wake-text",
+    textOf(clara3[0]).includes("SDET (Hugo) has verified") && textOf(clara3[0]).includes("Ready for Quality Gate audit"),
+    textOf(clara3[0]),
   );
-  R("C.no-lead-board-wake", lead3.length === 0, `count=${lead3.length}`);
 
-  // Fecha o SQLite (WAL) antes de remover o scratch: sem isso o checkpoint
-  // recria -wal/-shm durante o rmSync e o diretório sai ENOTEMPTY.
+  // ============ (s3) Guarda de lote consolidado + pool plano ================
+  // Um irmão funcional pendente NÃO é movido nem acordado por um submit; ele
+  // apenas segura o wake do SDET até o lote funcional ser consolidado.
+  seedTeam("s3", "squad-batch", "ses_lead_s3");
+  member("s3", "tulio", "ses_tulio_s3", "build");
+  member("s3", "hugo", "ses_hugo_s3", "hugo");
+  const tA = (await addTask("ses_lead_s3", [{ content: "TASK-A", priority: "high" }])).ids[0];
+  const tB = (await addTask("ses_lead_s3", [{ content: "TASK-B irmã pendente", priority: "high" }])).ids[0];
+  await claim("ses_tulio_s3", tA);
+  const resS3 = await submit("ses_tulio_s3", tA, "lote");
+  R("S3.submit-held", resS3.includes("SDET wake held until the functional batch is consolidated"), resS3);
+  R("S3.sibling-stays-pending", taskRow(tB).status === "pending" && taskRow(tB).assignee === null, JSON.stringify(taskRow(tB)));
+  R("S3.zero-wake", wakes("ses_hugo_s3").length === 0, `count=${wakes("ses_hugo_s3").length}`);
+
+  // ============ Variante standby: wake consome a janela com prepend =========
+  seedTeam("s2b", "squad-standby", "ses_lead_s2b");
+  member("s2b", "tulio", "ses_tulio_s2b", "build");
+  member("s2b", "xena", "ses_xena_s2b", "build", 1, null, "standby", "CTX_QA_BIRTH");
+  const tX = (await addTask("ses_lead_s2b", [{ content: "TASK-X", priority: "high" }])).ids[0];
+  await claim("ses_tulio_s2b", tX);
+  const resX = await submit("ses_tulio_s2b", tX, "standby");
+  const xenaX = wakes("ses_xena_s2b");
+  R("SB.submit-notifies-qa", resX.includes("(notified xena for review)"), resX);
+  R("SB.xena-exec-starting", execOf("s2b", "xena") === "starting", `exec=${execOf("s2b", "xena")}`);
+  R(
+    "SB.standby-wake-consume",
+    xenaX.length === 1 &&
+      textOf(xenaX[0]) === `CTX_QA_BIRTH\n\n[System: Task "${tX}" was submitted for review by tulio (notes: standby)]`,
+    xenaX.map(textOf).join(" || ") || "(nenhum)",
+  );
+
+  // Fecha o SQLite (WAL) antes de remover o scratch.
   try { db.close(); } catch { /* já fechado */ }
   rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   return got;
 }
 
 // ---------------------------------------------------------------------------
-// 2. Fase REAL: todos os cenarios contra o dist autêntico devem passar 100%.
+// 2. Fase REAL: todos os cenários contra o dist autêntico devem passar 100%.
 // ---------------------------------------------------------------------------
 const realFlow = await runFlow(REAL);
 for (const [name, { ok, detail }] of realFlow) check(`[real] ${name}`, ok, detail);
 
 // ---------------------------------------------------------------------------
-// 3. Paridade src↔dist (literais do helper HARNESS-24) + anti-mock estático.
+// 3. Paridade src↔dist (marcadores do pool plano) + anti-mock estático.
 // ---------------------------------------------------------------------------
 const srcTc = readFileSync(path.join(SRC, "tools", "team-tasks-complete.ts"), "utf8");
-const PARITY = [
-  ["function unblockDependents", srcTc],
-  ["function isValidationProfileTask", srcTc],
-  ["function formatUnblockedSuffix", srcTc],
-  ["unblockDependents(deps, teamInfo, args.task_id, now)", srcTc],
-  ["formatUnblockedSuffix(submittedUnblock.unblocked, submittedUnblock.wokeMembers)", srcTc],
-  ["was unblocked and is ready for you to start", srcTc],
-  ['if (dep.status === "in_review" && downstreamIsValidation) return true', srcTc],
-  [" (unblocked ", srcTc],
-  ["unblocked ${unblocked} task", srcTc],
-];
-for (const [lit, src] of PARITY) {
-  check(`paridade src↔dist: literal "${lit.slice(0, 60)}"`, src.includes(lit) && distRaw.includes(lit));
-}
+const srcAdd = readFileSync(path.join(SRC, "tools", "team-tasks-add.ts"), "utf8");
 const srcClaim = readFileSync(path.join(SRC, "tools", "team-claim.ts"), "utf8");
-for (const lit of ['Pre-claimed blocked task', "is already in progress and assigned to you", "enter standby (yield) via team_standby"]) {
-  check(`paridade src↔dist (team-claim): "${lit}"`, srcClaim.includes(lit) && distRaw.includes(lit));
-}
+
+// (a) O mecanismo DAG do HARNESS-24 não existe mais — nem no src nem no dist.
+check("flat-pool: sem 'unblockDependents' (src E dist)", !srcTc.includes("unblockDependents") && !distRaw.includes("unblockDependents"));
+check("flat-pool: sem 'was unblocked and is ready' (src E dist)", !srcTc.includes("was unblocked and is ready") && !distRaw.includes("was unblocked and is ready"));
+check("flat-pool: sem 'blocked by unresolved dependencies' (src E dist)", !srcTc.includes("blocked by unresolved dependencies") && !distRaw.includes("blocked by unresolved dependencies"));
+check("flat-pool: sem 'Pre-claimed blocked task' (src E dist)", !srcClaim.includes("Pre-claimed blocked task") && !distRaw.includes("Pre-claimed blocked task"));
+
+// (b) team-tasks-add: toda tarefa nasce 'pending', sem depends_on/sequential.
+//     Comments are stripped first — the docstring legitimately names the legacy
+//     concepts it purged; only the executable code must be free of them.
+const srcAddCode = srcAdd.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+check("flat-pool: team-tasks-add insere 'pending'", srcAddCode.includes("'pending'"));
+check("flat-pool: team-tasks-add sem depends_on", !srcAddCode.includes("depends_on"));
+check("flat-pool: team-tasks-add sem sequential", !srcAddCode.includes("sequential"));
+
+// (c) Roteamento SDET/QA preservado (paridade src↔dist).
+check("paridade: roteamento SDET-first", srcTc.includes("if (sdetMember && !callerIsSDET) {") && distRaw.includes("if (sdetMember && !callerIsSDET) {"));
+check("paridade: claim idempotente", srcClaim.includes("is already in progress and assigned to you") && distRaw.includes("is already in progress and assigned to you"));
 
 {
   const FORBIDDEN = ["je" + "st.mock", "sin" + "on", "vi.mo" + "ck", "mockImple" + "mentation"];
@@ -407,66 +356,50 @@ for (const lit of ['Pre-claimed blocked task', "is already in progress and assig
 }
 
 // ---------------------------------------------------------------------------
-// 4. PROVA DE MUTAÇÃO: patch determinístico no bundle dist + reexecução dos
-//    mesmos cenarios. Cada mutante precisa FALHAR nas sentinelas do cenário
-//    alvo (sensibilidade) e PERMANECER VERDE nos fluxos intactos (cirurgia).
+// 4. PROVA DE MUTAÇÃO: patch determinístico no bundle dist + reexecução.
 // ---------------------------------------------------------------------------
 const MUTATIONS = [
   {
     id: "M1",
-    desc: "unblock do Flow 1 (submit_review) anulado — TASK-02 permanece 'blocked'",
-    from: "const submittedUnblock = unblockDependents(deps, teamInfo, args.task_id, now)",
-    to: "const submittedUnblock = { unblocked: 0, wokeMembers: 0 }",
+    desc: "roteamento SDET-first desligado (submit_review acorda a QA em vez do SDET)",
+    from: "if (sdetMember && !callerIsSDET) {",
+    to: "if (false) {",
     detect: [
-      "A.submit-t1-unblock-suffix", "A.t2-in-progress-after-submit",
-      "A.t2-claim-already-in-progress", "A.hugo-total-2-wakes", "A.hugo-unblock-wake-exact",
-      "A.hugo-unblock-wake-synthetic",
-      "SB.submit-unblock-suffix", "SB.t2x-in-progress", "SB.xena-exec-starting", "SB.unblock-wake-standby-consume",
-      "B.submit-t2-notifies-clara", "B.submit-t2-unblock-suffix", "B.t2-in-review",
-      "B.t3-in-progress-after-sdet-submit", "B.t3-claim-already-in-progress",
-      "B.clara-total-2-wakes", "B.clara-legacy-wake-exact", "B.clara-unblock-wake-exact",
+      "A.submit-t1-notifies-sdet", "A.hugo-one-wake", "A.hugo-handover-wake-exact",
+      "A.hugo-handover-wake-synthetic", "A.clara-suppressed",
+      "S3.submit-held",
     ],
     unaffected: [
-      "Pre.t1-claimed-in-progress", "Pre.t2-created-blocked", "Pre.t2-preclaim-directive",
-      "Pre.t2-preclaim-assignee-hugo", "Pre.t3-created-blocked", "Pre.t3-preclaim-assignee-clara",
-      "Pre.strict-pair-blocked", "Pre.profile-sdet-hugo", "Pre.profile-qa-clara", "Pre.profile-regular-tulio",
-      "A.submit-t1-notifies-sdet", "A.t1-in-review-with-notes", "A.t2-assignee-preserved",
-      "A.t-reg-unassigned-stays-blocked", "A.t-reg-claimed-stays-blocked",
-      "A.t3-not-triggered-stays-blocked",
-      "A.hugo-handover-wake-exact", "A.clara-suppressed",
-      "SB.t2x-preclaim-blocked", "SB.hugo-handover-only",
-      "B.t3-assignee-clara", "B.hugo-zero-self-wake",
-      "C.t10-created-blocked", "C.t10-preclaim-directive", "C.complete-t9-unblock-suffix",
-      "C.t10-in-progress-after-complete", "C.tulio-unblock-wake-exact", "C.no-lead-board-wake",
+      "Pre.schema-no-depends_on", "Pre.migration-19-flat-pool", "Pre.profile-sdet-hugo",
+      "Pre.profile-qa-clara", "Pre.profile-regular-tulio", "Pre.all-tasks-born-pending",
+      "Pre.t1-claimed-tulio", "Pre.t2-claimed-hugo", "Pre.t3-claimed-clara",
+      "A.submit-t1-no-unblock", "A.t1-in-review-with-notes", "A.t2-unchanged-flat-pool",
+      "A.t3-unchanged-flat-pool",
+      "B.submit-t2-notifies-clara", "B.submit-t2-no-unblock", "B.t2-in-review",
+      "B.t3-unchanged-flat-pool", "B.clara-one-wake", "B.clara-legacy-wake-exact", "B.hugo-zero-self-wake",
+      "C.sdet-pass-recorded", "C.t1-stays-in-review", "C.clara-woken-one", "C.sdet-pass-wake-text",
+      "S3.sibling-stays-pending", "S3.zero-wake",
+      "SB.submit-notifies-qa", "SB.xena-exec-starting", "SB.standby-wake-consume",
     ],
   },
   {
     id: "M2",
-    desc: "transição pré-atribuída anulada (unblock vai para 'pending' em vez de 'in_progress')",
-    from: 'const nextStatus = t.assignee ? "in_progress" : "pending"',
-    to: 'const nextStatus = "pending"',
-    detect: [
-      "A.t2-in-progress-after-submit", "A.t2-claim-already-in-progress",
-      "SB.t2x-in-progress",
-      "B.t3-in-progress-after-sdet-submit", "B.t3-claim-already-in-progress",
-      "C.t10-in-progress-after-complete",
-    ],
+    desc: "texto do handover do SDET adulterado (sufixo removido)",
+    from: " \\u2014 SDET handover: run the deterministic test suite for this delivery before the Quality Gate audits.]",
+    to: "]",
+    detect: ["A.hugo-handover-wake-exact", "A.hugo-handover-wake-synthetic"],
     unaffected: [
-      "Pre.t1-claimed-in-progress", "Pre.t2-created-blocked", "Pre.t2-preclaim-directive",
-      "Pre.t2-preclaim-assignee-hugo", "Pre.t3-created-blocked", "Pre.t3-preclaim-assignee-clara",
-      "Pre.strict-pair-blocked", "Pre.profile-sdet-hugo", "Pre.profile-qa-clara", "Pre.profile-regular-tulio",
-      "A.submit-t1-notifies-sdet", "A.submit-t1-unblock-suffix", "A.t1-in-review-with-notes",
-      "A.t2-assignee-preserved", "A.t-reg-unassigned-stays-blocked", "A.t-reg-claimed-stays-blocked",
-      "A.t3-not-triggered-stays-blocked", "A.hugo-handover-wake-exact", "A.hugo-unblock-wake-exact",
-      "A.hugo-unblock-wake-synthetic", "A.hugo-total-2-wakes", "A.clara-suppressed",
-      "SB.t2x-preclaim-blocked", "SB.submit-unblock-suffix", "SB.hugo-handover-only",
-      "SB.unblock-wake-standby-consume", "SB.xena-exec-starting",
-      "B.submit-t2-notifies-clara", "B.submit-t2-unblock-suffix", "B.t2-in-review",
-      "B.t3-assignee-clara",
-      "B.clara-total-2-wakes", "B.clara-legacy-wake-exact", "B.clara-unblock-wake-exact",
-      "B.hugo-zero-self-wake",
-      "C.t10-created-blocked", "C.t10-preclaim-directive", "C.complete-t9-unblock-suffix",
-      "C.tulio-unblock-wake-exact", "C.no-lead-board-wake",
+      "Pre.schema-no-depends_on", "Pre.migration-19-flat-pool", "Pre.profile-sdet-hugo",
+      "Pre.profile-qa-clara", "Pre.profile-regular-tulio", "Pre.all-tasks-born-pending",
+      "Pre.t1-claimed-tulio", "Pre.t2-claimed-hugo", "Pre.t3-claimed-clara",
+      "A.submit-t1-notifies-sdet", "A.submit-t1-no-unblock", "A.t1-in-review-with-notes",
+      "A.t2-unchanged-flat-pool", "A.t3-unchanged-flat-pool", "A.hugo-one-wake",
+      "A.clara-suppressed",
+      "B.submit-t2-notifies-clara", "B.submit-t2-no-unblock", "B.t2-in-review",
+      "B.t3-unchanged-flat-pool", "B.clara-one-wake", "B.clara-legacy-wake-exact", "B.hugo-zero-self-wake",
+      "C.sdet-pass-recorded", "C.t1-stays-in-review", "C.clara-woken-one", "C.sdet-pass-wake-text",
+      "S3.submit-held", "S3.sibling-stays-pending", "S3.zero-wake",
+      "SB.submit-notifies-qa", "SB.xena-exec-starting", "SB.standby-wake-consume",
     ],
   },
 ];
@@ -496,18 +429,14 @@ for (const m of MUTATIONS) {
   check(
     `${m.id}: asserções sensíveis — mutação detectada [${m.desc}]`,
     missed.length === 0,
-    missed.length
-      ? `não detectaram: ${missed.join(", ")}`
-      : `${m.detect.length}/${m.detect.length} sentinelas falharam`,
+    missed.length ? `não detectaram: ${missed.join(", ")}` : `${m.detect.length}/${m.detect.length} sentinelas falharam`,
   );
 
   const broken = m.unaffected.filter((n) => mutatedFlow.get(n)?.ok !== true);
   check(
     `${m.id}: mutação cirúrgica — fluxos intactos preservados`,
     broken.length === 0,
-    broken.length
-      ? `quebrou: ${broken.join(", ")}`
-      : `${m.unaffected.length}/${m.unaffected.length} verdes preservados`,
+    broken.length ? `quebrou: ${broken.join(", ")}` : `${m.unaffected.length}/${m.unaffected.length} verdes preservados`,
   );
 }
 

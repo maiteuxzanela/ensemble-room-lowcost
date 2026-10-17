@@ -1,16 +1,22 @@
 #!/usr/bin/env node
 /**
- * QUALITY GATE DETERMINÍSTICO — Runtime Standby & Auto-Wake Unblock
- * @hueyexe/opencode-ensemble@0.18.1
+ * QUALITY GATE DETERMINÍSTICO — Runtime Standby & Pool Plano
+ * @maiteuxzanela/ensemble-room-lowcost
  *
  * Guardiã: Clara (Quality Gate & Integridade dos Testes).
  *
+ * TICKET-HARNESS-51 — o board é um pool plano, totalmente paralelo (sem
+ * `depends_on`, sem 'blocked', sem desbloqueio de dependentes).
+ *
  * Sob teste:
- *   - team_claim defensivo em status 'blocked' (lock atômico de pré-atribuição e retorno yield/standby)
- *   - team_standby nativo (suspensão voluntária com execution_status='standby', status='ready', spawn_context=null a 0 tokens)
- *   - auto-wake reativo em team-tasks-complete (desbloqueio de tarefas dependentes acordando o membro em standby)
- *   - fallback de auto-wake para membro livre em standby
- *   - rollback fail-safe de status em falha de transporte no despertar
+ *   - team_claim defensivo no pool plano (pending -> in_progress, lock atômico,
+ *     concorrência rejeitada, idempotência)
+ *   - team_standby nativo (suspensão voluntária com execution_status='standby',
+ *     status='ready', spawn_context=null a 0 tokens)
+ *   - team-tasks-complete: concluir uma tarefa NÃO desbloqueia nem acorda
+ *     ninguém; o único auto-wake por board é o fechamento total (board-close)
+ *   - wake de review do SDET com consumo da janela de standby + rollback
+ *     fail-safe em falha de transporte
  *   - contrato anti-polling em buildTeammateSystemPrompt
  *
  * Regras:
@@ -35,8 +41,6 @@ const TEAM_ID = "team_runtime_standby";
 const LEAD_SESSION = "ses_lead";
 const BOB_SESSION = "ses_bob";
 const ALICE_SESSION = "ses_alice";
-const CHARLIE_SESSION = "ses_charlie";
-const DAVE_SESSION = "ses_dave";
 
 const results = [];
 const check = (name, ok, detail) => {
@@ -131,13 +135,11 @@ function createTestClient() {
     promptAsync: [],
     toasts: [],
   };
-  let shouldFailPromptAsync = false;
+  let failSession = null;
 
   return {
     calls,
-    setShouldFailPromptAsync: (fail) => {
-      shouldFailPromptAsync = fail;
-    },
+    failFor: (ses) => { failSession = ses; },
     client: {
       session: {
         create: async (o) => {
@@ -146,7 +148,7 @@ function createTestClient() {
         },
         promptAsync: async (o) => {
           calls.promptAsync.push(o);
-          if (shouldFailPromptAsync && o.sessionID === DAVE_SESSION) {
+          if (failSession && o.sessionID === failSession) {
             throw new Error("Simulated network transport failure during wake");
           }
           return {};
@@ -172,7 +174,7 @@ async function runSuite() {
   const db = createDb(dbPath);
 
   const userVersion = db.query("PRAGMA user_version").get().user_version;
-  check("Migration 13 aplicada com sucesso", userVersion === MIGRATIONS.length, `user_version=${userVersion}`);
+  check("Migration 19 (pool plano) aplicada com sucesso", userVersion === MIGRATIONS.length && userVersion >= 19, `user_version=${userVersion}`);
 
   // Setup de projeto e equipe
   db.query("INSERT INTO project (id, name, path, status, time_created, time_updated) VALUES ('default', 'Default Project', '', 'active', 0, 0) ON CONFLICT DO NOTHING").run();
@@ -180,12 +182,13 @@ async function runSuite() {
             VALUES ('${TEAM_ID}', 'runtime-standby-team', 'default', '${LEAD_SESSION}', 'active', 0, 0, 0, 'build')
             ON CONFLICT DO NOTHING`).run();
 
+  // NOTE: the lead is deliberately NOT registered as a team_member — it is
+  // resolved from team.lead_session_id (SQLite fallback), so team_standby can
+  // prove the lead is rejected. Registering it as a member would mask the
+  // role and fall through to a "member not found" error instead.
   const registry = new MemberRegistry();
-  registry.register(LEAD_SESSION, "lead", TEAM_ID);
-  registry.register(BOB_SESSION, "bob", TEAM_ID);
-  registry.register(ALICE_SESSION, "alice", TEAM_ID);
-  registry.register(CHARLIE_SESSION, "charlie", TEAM_ID);
-  registry.register(DAVE_SESSION, "dave", TEAM_ID);
+  registry.register(TEAM_ID, "bob", BOB_SESSION);
+  registry.register(TEAM_ID, "alice", ALICE_SESSION);
 
   const now = Date.now();
   // Registrar membros na tabela team_member
@@ -199,8 +202,6 @@ async function runSuite() {
 
   insertMember("bob", BOB_SESSION);
   insertMember("alice", ALICE_SESSION);
-  insertMember("charlie", CHARLIE_SESSION);
-  insertMember("dave", DAVE_SESSION);
 
   const tc = createTestClient();
   const deps = {
@@ -212,11 +213,11 @@ async function runSuite() {
   };
 
   /* ------------------------------------------------------------------ *
-   * CENÁRIO 1: team_claim defensivo em tarefas bloqueadas ('blocked')
+   * CENÁRIO 1: team_claim no pool plano (sem 'blocked'/'depends_on')
    * ------------------------------------------------------------------ */
-  console.log("\n--- CENÁRIO 1: team_claim defensivo em tarefas com status 'blocked' ---");
+  console.log("\n--- CENÁRIO 1: team_claim no pool plano ---");
 
-  // Adicionar duas tarefas com dependência sequencial
+  // TICKET-HARNESS-51: `sequential: true` é inerte — ambas nascem pending.
   await executeTeamTasksAdd(
     deps,
     {
@@ -233,26 +234,20 @@ async function runSuite() {
   const task1 = tasksC1[0];
   const task2 = tasksC1[1];
 
-  check("Task 1 inicia como pending", task1.status === "pending");
-  check("Task 2 inicia como blocked", task2.status === "blocked");
-  check("Task 2 depende de Task 1", task2.depends_on.includes(task1.id));
+  check("Task 1 nasce pending", task1.status === "pending");
+  check("Task 2 nasce pending (sequential não encadeia)", task2.status === "pending", `status=${task2.status}`);
+  check("Task 2 não possui depends_on (coluna expurgada)", task2.depends_on === undefined);
+  check("Nenhuma tarefa nasce 'blocked'", task1.status !== "blocked" && task2.status !== "blocked");
 
-  // Bob tenta reivindicar a Task 2 (que está blocked)
+  // Bob reivindica a Task 2 — pending -> in_progress atômico.
   const bobClaimResult = await executeTeamClaim(deps, { task_id: task2.id }, BOB_SESSION);
-
-  check(
-    "executeTeamClaim em blocked retorna aviso instrutivo sem lançar exceção",
-    bobClaimResult.includes("Pre-claimed blocked task") &&
-      bobClaimResult.includes("team_standby") &&
-      bobClaimResult.includes("automatically wake you"),
-    bobClaimResult,
-  );
+  check("executeTeamClaim reivindica a tarefa pending", bobClaimResult.includes("Claimed task:"), bobClaimResult);
 
   const task2AfterBob = db.query("SELECT * FROM team_task WHERE id = ?").get(task2.id);
-  check("Task 2 mantém status 'blocked' após pre-claim", task2AfterBob.status === "blocked");
-  check("Task 2 recebe lock atômico de pré-atribuição para 'bob'", task2AfterBob.assignee === "bob");
+  check("Task 2 transiciona para 'in_progress'", task2AfterBob.status === "in_progress", `status=${task2AfterBob.status}`);
+  check("Task 2 registra o assignee 'bob'", task2AfterBob.assignee === "bob", `assignee=${task2AfterBob.assignee}`);
 
-  // Alice tenta reivindicar a mesma Task 2 já pré-atribuída
+  // Alice tenta reivindicar a mesma Task 2 já reivindicada
   let aliceClaimThrew = false;
   let aliceClaimError = "";
   try {
@@ -262,37 +257,77 @@ async function runSuite() {
     aliceClaimError = err instanceof Error ? err.message : String(err);
   }
   check(
-    "executeTeamClaim rejeita concorrência na mesma tarefa pré-reivindicada",
+    "executeTeamClaim rejeita concorrência na mesma tarefa",
     aliceClaimThrew && aliceClaimError.includes("already claimed by bob"),
     aliceClaimError,
+  );
+
+  // Bob re-reivindica de forma idempotente.
+  const bobReclaim = await executeTeamClaim(deps, { task_id: task2.id }, BOB_SESSION);
+  check(
+    "team_claim idempotente informa que a tarefa já está sob responsabilidade do Bob",
+    bobReclaim.includes("already in progress and assigned to you"),
+    bobReclaim,
   );
 
   // Verificação direta de claimTask API
   let claimTaskThrewNotFound = false;
   try {
     claimTask(db, TEAM_ID, "task_inexistente", "bob");
-  } catch (err) {
+  } catch {
     claimTaskThrewNotFound = true;
   }
   check("claimTask lança erro se tarefa não existe", claimTaskThrewNotFound);
 
   /* ------------------------------------------------------------------ *
-   * CENÁRIO 2: Invocação de team_standby e suspensão voluntária a 0 tokens
+   * CENÁRIO 2: Pool plano — concluir uma tarefa não desbloqueia/acorda
    * ------------------------------------------------------------------ */
-  console.log("\n--- CENÁRIO 2: Invocação voluntária de team_standby a 0 tokens ---");
+  console.log("\n--- CENÁRIO 2: conclusão no pool plano (sem desbloqueio) ---");
 
   tc.calls.promptAsync = [];
 
-  // Bob entra voluntariamente em standby seguindo a instrução
+  // Alice conclui a Task 1 (independente da Task 2).
+  const completeResult = await executeTeamTasksComplete(deps, { task_id: task1.id }, ALICE_SESSION);
+  check("Mensagem de complete confirma a conclusão", completeResult.includes("Completed task"), completeResult);
+  check(
+    "Mensagem de complete NÃO menciona desbloqueio/wake",
+    !completeResult.includes("unblocked") && !completeResult.includes("woke"),
+    completeResult,
+  );
+
+  const task2AfterComplete = db.query("SELECT * FROM team_task WHERE id = ?").get(task2.id);
+  check("Task 2 permanece 'in_progress' (independente)", task2AfterComplete.status === "in_progress", `status=${task2AfterComplete.status}`);
+  check("Task 2 preserva o assignee 'bob'", task2AfterComplete.assignee === "bob", `assignee=${task2AfterComplete.assignee}`);
+  check("ZERO promptAsync ao concluir 1 de 2 tarefas", tc.calls.promptAsync.length === 0, `chamadas=${tc.calls.promptAsync.length}`);
+
+  // Bob conclui a Task 2 -> board fecha -> board-close wake do lead.
+  const completeMsg2 = await executeTeamTasksComplete(deps, { task_id: task2.id }, BOB_SESSION);
+  check("Task 2 concluída pelo Bob", completeMsg2.includes("Completed task"), completeMsg2);
+
+  const leadWakes = tc.calls.promptAsync.filter((c) => c.sessionID === LEAD_SESSION);
+  check("board-close: EXATAMENTE 1 promptAsync para o lead", leadWakes.length === 1, `chamadas=${leadWakes.length}`);
+  check(
+    "board-close: texto canônico do wake do lead",
+    leadWakes[0]?.synthetic === true && leadWakes[0]?.parts?.[0]?.text === "[System: All team tasks completed on board by bob]",
+    leadWakes[0]?.parts?.[0]?.text,
+  );
+
+  /* ------------------------------------------------------------------ *
+   * CENÁRIO 3: Invocação de team_standby e suspensão voluntária a 0 tokens
+   * ------------------------------------------------------------------ */
+  console.log("\n--- CENÁRIO 3: Invocação voluntária de team_standby a 0 tokens ---");
+
+  tc.calls.promptAsync = [];
+
   const standbyResult = await executeTeamStandby(
     deps,
-    { reason: "Aguardando conclusão da Tarefa 1 para iniciar a Tarefa 2" },
+    { reason: "Aguardando novas mensagens da sala" },
     BOB_SESSION,
   );
 
   check(
     "executeTeamStandby retorna confirmação de suspensão",
-    standbyResult.includes("Entered standby mode") && standbyResult.includes("Execution suspended until dependencies are unblocked"),
+    standbyResult.includes("Entered standby mode") && standbyResult.includes("Execution suspended until a new message arrives"),
     standbyResult,
   );
 
@@ -330,170 +365,83 @@ async function runSuite() {
   let setStandbyThrew = false;
   try {
     setMemberStandby(db, TEAM_ID, "membro_fantasma", "teste");
-  } catch (err) {
+  } catch {
     setStandbyThrew = true;
   }
   check("setMemberStandby lança erro para membro inexistente", setStandbyThrew);
 
   /* ------------------------------------------------------------------ *
-   * CENÁRIO 3: Auto-wake reativo quando a dependência é concluída
+   * CENÁRIO 4: Wake de review do SDET + consumo de standby + rollback
    * ------------------------------------------------------------------ */
-  console.log("\n--- CENÁRIO 3: Auto-wake reativo no team-tasks-complete ---");
+  console.log("\n--- CENÁRIO 4: wake do SDET, consumo de standby e rollback ---");
 
+  const seedTeam = (id, name, lead) =>
+    db.run(
+      "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated, lead_agent) VALUES (?, ?, 'default', ?, 'active', 0, ?, ?, 'build')",
+      [id, name, lead, now, now],
+    );
+  const seedMember = (teamId, name, ses, agent, exec = "idle", ctx = null) => {
+    db.run(
+      `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, spawn_context, time_created, time_updated, reported_to_lead)
+       VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, ?, 0)`,
+      [teamId, name, ses, agent, exec, ctx, now, now],
+    );
+    registry.register(teamId, name, ses);
+  };
+
+  // 4a. Wake do SDET consumindo a janela de standby (prepend de spawn_context).
+  const A = "team_standby_wake";
+  seedTeam(A, "standby-wake-team", "ses_lead_a");
+  seedMember(A, "tulio", "ses_tulio_a", "build");
+  seedMember(A, "hugo", "ses_hugo_a", "hugo", "standby", "SDET_BIRTH_CTX");
+  const addA = await executeTeamTasksAdd(deps, { tasks: [{ content: "TASK-A", priority: "high" }] }, "ses_lead_a");
+  const tA = addA.match(/Added \d+ tasks?: (.+)/)?.[1]?.trim();
+  await executeTeamClaim(deps, { task_id: tA }, "ses_tulio_a");
   tc.calls.promptAsync = [];
-
-  // Alice completa a Tarefa 1 (desbloqueando a Tarefa 2)
-  const completeResult = await executeTeamTasksComplete(
-    deps,
-    { task_id: task1.id },
-    ALICE_SESSION,
-  );
-
+  const subA = await executeTeamTasksComplete(deps, { task_id: tA, action: "submit_review", notes: "PR pronto" }, "ses_tulio_a");
+  check("4a submit_review notifica o SDET", subA.includes("(notified hugo for deterministic tests)"), subA);
+  const hugoWakes = tc.calls.promptAsync.filter((c) => c.sessionID === "ses_hugo_a");
+  check("4a SDET woken (1 wake)", hugoWakes.length === 1, `chamadas=${hugoWakes.length}`);
   check(
-    "Mensagem de complete reflete desbloqueio e auto-wake de 1 membro",
-    completeResult.includes("unblocked 1 task") && completeResult.includes("woke 1 member"),
-    completeResult,
+    "4a wake do SDET = spawn_context prepend + handover",
+    hugoWakes[0]?.synthetic === true
+      && hugoWakes[0]?.agent === "hugo"
+      && String(hugoWakes[0]?.parts?.[0]?.text).startsWith("SDET_BIRTH_CTX\n\n[System: Task")
+      && String(hugoWakes[0]?.parts?.[0]?.text).includes("SDET handover"),
+    hugoWakes[0]?.parts?.[0]?.text,
   );
+  const hugoA = db.query("SELECT execution_status FROM team_member WHERE team_id = ? AND name = 'hugo'").get(A);
+  check("4a SDET transiciona standby -> starting", hugoA.execution_status === "starting", `exec=${hugoA.execution_status}`);
 
-  const task2AfterComplete = db.query("SELECT * FROM team_task WHERE id = ?").get(task2.id);
-  check("Task 2 é desbloqueada diretamente para 'in_progress'", task2AfterComplete.status === "in_progress");
-  check("Task 2 preserva a pré-atribuição para 'bob'", task2AfterComplete.assignee === "bob");
-
-  const bobAfterWake = db.query("SELECT * FROM team_member WHERE team_id = ? AND name = 'bob'").get(TEAM_ID);
-  check("Bob transiciona execution_status para 'starting'", bobAfterWake.execution_status === "starting");
-
-  // Validar envio do promptAsync de despertar para Bob
-  const bobPrompts = tc.calls.promptAsync.filter((c) => c.sessionID === BOB_SESSION);
-  check("promptAsync foi despachado para Bob", bobPrompts.length === 1);
-  const wakePrompt = bobPrompts[0]?.parts?.[0]?.text ?? "";
-  check("promptAsync para Bob possui synthetic: true", bobPrompts[0]?.synthetic === true);
-  check(
-    "promptAsync de Bob contém notificação de unblock limpa",
-    wakePrompt.includes(`[System: Task "${task2.id}" was unblocked and is ready for you to start]`),
-    wakePrompt,
-  );
-  check(
-    "promptAsync de Bob NÃO contém contexto residual de nascimento",
-    !wakePrompt.includes("You are \"bob\"") && !wakePrompt.includes("birth"),
-  );
-
-  // Bob acorda e chama executeTeamClaim de forma idempotente sem exceção de tarefa já atribuída
-  let bobPostWakeThrew = false;
-  let bobPostWakeResult = "";
-  try {
-    bobPostWakeResult = await executeTeamClaim(deps, { task_id: task2.id }, BOB_SESSION);
-  } catch (err) {
-    bobPostWakeThrew = true;
-    bobPostWakeResult = err?.message ?? String(err);
-  }
-  check("Bob acordado executa team_claim pós-wake de forma idempotente sem erro", !bobPostWakeThrew, bobPostWakeResult);
-  check(
-    "team_claim pós-wake informa que a tarefa já está in_progress sob responsabilidade do Bob",
-    bobPostWakeResult.includes("already in progress and assigned to you"),
-    bobPostWakeResult,
-  );
-
-  const task2AfterBobClaim = db.query("SELECT * FROM team_task WHERE id = ?").get(task2.id);
-  check("Task 2 permanece 'in_progress' com assignee 'bob' após claim idempotente", task2AfterBobClaim.status === "in_progress" && task2AfterBobClaim.assignee === "bob");
+  // 4b. Rollback fail-safe: falha de transporte reverte o standby.
+  const B = "team_standby_rollback";
+  seedTeam(B, "standby-rollback-team", "ses_lead_b");
+  seedMember(B, "tulio", "ses_tulio_b", "build");
+  seedMember(B, "hugo", "ses_hugo_b", "hugo", "standby", "ROLLBACK_CTX");
+  const addB = await executeTeamTasksAdd(deps, { tasks: [{ content: "TASK-B", priority: "high" }] }, "ses_lead_b");
+  const tB = addB.match(/Added \d+ tasks?: (.+)/)?.[1]?.trim();
+  await executeTeamClaim(deps, { task_id: tB }, "ses_tulio_b");
+  tc.failFor("ses_hugo_b");
+  await executeTeamTasksComplete(deps, { task_id: tB, action: "submit_review", notes: "rollback" }, "ses_tulio_b");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  const hugoB = db.query("SELECT execution_status FROM team_member WHERE team_id = ? AND name = 'hugo'").get(B);
+  check("4b rollback fail-safe: SDET revertido para 'standby'", hugoB.execution_status === "standby", `exec=${hugoB.execution_status}`);
+  tc.failFor(null);
 
   /* ------------------------------------------------------------------ *
-   * CENÁRIO 4: Fallback de auto-wake para membro livre em standby
+   * CENÁRIO 5: Contrato do Teammate System Prompt (pool plano)
    * ------------------------------------------------------------------ */
-  console.log("\n--- CENÁRIO 4: Fallback de auto-wake para membro livre em standby ---");
-
-  // Criar tarefas 3 e 4: Tarefa 4 sem assignee bloqueada por Tarefa 3
-  await executeTeamTasksAdd(
-    deps,
-    {
-      tasks: [
-        { content: "Tarefa 3: Preparar Dados", priority: "medium" },
-        { content: "Tarefa 4: Processar Pipeline", priority: "medium" },
-      ],
-      sequential: true,
-    },
-    LEAD_SESSION,
-  );
-
-  const tasksC4 = db.query("SELECT * FROM team_task WHERE team_id = ? AND content LIKE 'Tarefa %' ORDER BY time_created ASC").all(TEAM_ID);
-  const task3 = tasksC4[2];
-  const task4 = tasksC4[3];
-
-  check("Task 4 não tem assignee inicialmente", task4.assignee === null);
-  check("Task 4 está bloqueada", task4.status === "blocked");
-
-  // Colocar Charlie em standby
-  setMemberStandby(db, TEAM_ID, "charlie", "Livre aguardando tarefas");
-  const charlieStandby = db.query("SELECT execution_status FROM team_member WHERE team_id = ? AND name = 'charlie'").get(TEAM_ID);
-  check("Charlie está em standby", charlieStandby.execution_status === "standby");
-
-  tc.calls.promptAsync = [];
-
-  // Concluir Tarefa 3
-  const completeT3 = await executeTeamTasksComplete(deps, { task_id: task3.id }, LEAD_SESSION);
-  check("Conclusão da Tarefa 3 desbloqueou tarefa e acordou membro", completeT3.includes("unblocked 1 task") && completeT3.includes("woke 1 member"));
-
-  const charlieWoken = db.query("SELECT execution_status FROM team_member WHERE team_id = ? AND name = 'charlie'").get(TEAM_ID);
-  check("Charlie foi acordado pelo fallback de membro livre", charlieWoken.execution_status === "starting");
-
-  const charliePrompts = tc.calls.promptAsync.filter((c) => c.sessionID === CHARLIE_SESSION);
-  check("promptAsync disparado para Charlie via fallback", charliePrompts.length === 1);
-  check(
-    "promptAsync de Charlie aponta para o desbloqueio da Task 4",
-    charliePrompts[0]?.parts?.[0]?.text?.includes(`[System: Task "${task4.id}" was unblocked and is ready for you to start]`),
-  );
-
-  /* ------------------------------------------------------------------ *
-   * CENÁRIO 5: Rollback fail-safe em falha de transporte no despertar
-   * ------------------------------------------------------------------ */
-  console.log("\n--- CENÁRIO 5: Rollback fail-safe em falha de transporte ---");
-
-  // Criar tarefas 5 e 6 com dependência
-  await executeTeamTasksAdd(
-    deps,
-    {
-      tasks: [
-        { content: "Tarefa 5: Upstream Fail-Safe", priority: "low" },
-        { content: "Tarefa 6: Downstream com falha de rede simulada", priority: "low" },
-      ],
-      sequential: true,
-    },
-    LEAD_SESSION,
-  );
-
-  const tasksC5 = db.query("SELECT * FROM team_task WHERE team_id = ? AND content LIKE 'Tarefa %' ORDER BY time_created ASC").all(TEAM_ID);
-  const task5 = tasksC5[4];
-  const task6 = tasksC5[5];
-
-  // Dave pré-reivindica a Task 6 e entra em standby
-  await executeTeamClaim(deps, { task_id: task6.id }, DAVE_SESSION);
-  await executeTeamStandby(deps, { reason: "Aguardando Task 5" }, DAVE_SESSION);
-
-  const daveBefore = db.query("SELECT execution_status FROM team_member WHERE team_id = ? AND name = 'dave'").get(TEAM_ID);
-  check("Dave está em standby antes da falha", daveBefore.execution_status === "standby");
-
-  // Armar falha de transporte em promptAsync para Dave
-  tc.setShouldFailPromptAsync(true);
-
-  // Concluir Tarefa 5
-  const completeT5 = await executeTeamTasksComplete(deps, { task_id: task5.id }, LEAD_SESSION);
-  check("Conclusão de Tarefa 5 executada com sucesso apesar do erro de transporte do par", completeT5.includes("Completed task"));
-
-  // Aguardar microtask/tick para o catch assíncrono executar o rollback
-  await new Promise((resolve) => setTimeout(resolve, 50));
-
-  const daveAfterFail = db.query("SELECT execution_status FROM team_member WHERE team_id = ? AND name = 'dave'").get(TEAM_ID);
-  check("Dave teve execution_status revertido para 'standby' via rollback fail-safe", daveAfterFail.execution_status === "standby");
-
-  /* ------------------------------------------------------------------ *
-   * CENÁRIO 6: Contrato do Teammate System Prompt
-   * ------------------------------------------------------------------ */
-  console.log("\n--- CENÁRIO 6: Contrato do Teammate System Prompt ---");
+  console.log("\n--- CENÁRIO 5: Contrato do Teammate System Prompt ---");
 
   const promptText = buildTeammateSystemPrompt(db, TEAM_ID, "bob", DEFAULT_CONFIG);
   check("Prompt contém seção ANTI-POLLING & EVENT-DRIVEN CONTRACT", promptText.includes("ANTI-POLLING & EVENT-DRIVEN CONTRACT:"));
   check("Prompt proíbe polling em loops no board", promptText.includes("Do NOT poll team_tasks_list or team_status in loops"));
-  check("Prompt instrui suspensão via team_standby", promptText.includes("enter standby via team_standby"));
+  check("Prompt declara o pool plano (tarefa independente reivindicável)", promptText.includes("every board task is independent and ready to claim with team_claim"));
+  check("Prompt declara a ausência de DAG/bloqueio", promptText.includes("there is no task-blocking or DAG sequencing"));
   check("Prompt garante auto-wake pelo runtime", promptText.includes("The runtime automatically wakes you with a synthetic system prompt"));
+
+  // resolveStandbyWake é exportado e resolve o prepend do spawn_context.
+  check("resolveStandbyWake é uma função exportada", typeof resolveStandbyWake === "function");
 }
 
 await runSuite();

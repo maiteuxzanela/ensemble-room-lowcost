@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 /**
- * QUALITY GATE DETERMINÍSTICO — Auto-Sequenciamento e Auto-Standby
- * @hueyexe/opencode-ensemble@0.18.0
+ * QUALITY GATE DETERMINÍSTICO — Pool plano do board + Auto-Standby semântico
+ * @maiteuxzanela/ensemble-room-lowcost
  *
  * Guardiã: Clara (Quality Gate).
  *
- * Sob teste:
- *   - executeTeamTasksAdd -> src/tools/team-tasks-add.ts
- *   - executeTeamSpawn    -> src/tools/team-spawn.ts
+ * TICKET-HARNESS-51 — o board é um pool plano, totalmente paralelo:
+ *   - executeTeamTasksAdd -> src/tools/team-tasks-add.ts: TODA tarefa nasce
+ *     'pending'; a flag legada `sequential` é inerte (sem encadeamento, sem
+ *     `depends_on`, sem 'blocked').
+ *   - executeTeamSpawn    -> src/tools/team-spawn.ts: reivindicar uma tarefa
+ *     pending não força standby (não há dependência bloqueante); o auto-standby
+ *     semântico remanescente é o da Guardiã do Quality Gate.
  */
 
 import { spawnSync } from "node:child_process";
@@ -100,7 +104,10 @@ async function runSuite() {
     progressTracker,
   };
 
-  // 1. Validar team_tasks_add sequencial com flag sequential: true
+  // 1. TICKET-HARNESS-51: o board é um pool plano, totalmente paralelo. A flag
+  //    legada `sequential` é INERTE — ambas as tarefas nascem 'pending' e NÃO
+  //    existe mais coluna `depends_on` (expurgada na Migration 19) nem estado
+  //    'blocked' (removido do CHECK constraint).
   const resTasks = await executeTeamTasksAdd(deps, {
     tasks: [
       { content: "Task 0", priority: "medium" },
@@ -110,45 +117,55 @@ async function runSuite() {
   }, LEAD_SESSION);
 
   check("team_tasks_add rodou sem erro", typeof resTasks === "string");
-  
+  check("team_tasks_add reporta 2 tarefas", resTasks.includes("Added 2 tasks"), resTasks);
+
   const tasks = db.query("SELECT * FROM team_task WHERE team_id = ? ORDER BY time_created ASC").all(TEAM_ID);
   check("Duas tasks foram criadas no SQLite", tasks.length === 2);
-  
+
   const t0 = tasks[0];
   const t1 = tasks[1];
-  
-  check("Task 0 inicia com status pending", t0.status === "pending");
-  check("Task 1 inicia com status blocked", t1.status === "blocked", `status=${t1.status}`);
-  
-  const t1_depends = JSON.parse(t1.depends_on);
-  check("Task 1 tem depends_on apontando para Task 0", Array.isArray(t1_depends) && t1_depends.includes(t0.id));
 
-  // 2. Validar auto-standby no spawn para task bloqueada
+  check("Task 0 nasce pending (pool plano)", t0.status === "pending");
+  check("Task 1 nasce pending (sequential não encadeia)", t1.status === "pending", `status=${t1.status}`);
+  check(
+    "Nenhuma tarefa possui a coluna depends_on (expurgada na Migration 19)",
+    t0.depends_on === undefined && t1.depends_on === undefined,
+  );
+  check("Nenhuma tarefa nasce 'blocked'", t0.status !== "blocked" && t1.status !== "blocked");
+
+  // 2. Spawn com claim_task de uma tarefa pending: reivindica atomicamente
+  //    (pending -> in_progress) e NÃO força standby — não há mais 'blocked'.
   const resSpawn = await executeTeamSpawn(deps, {
     name: "membro1",
     agent: "build",
     claim_task: t1.id,
-    prompt: "Faca a task 1" // standby foi omitido! (falso por padrão)
+    prompt: "Faca a task 1" // standby omitido (default = false)
   }, LEAD_SESSION);
 
   check("team_spawn rodou sem erro", typeof resSpawn === "string");
-  
-  // Validar status no DB do membro
+  check("Spawn reporta a reivindicação da tarefa", resSpawn.includes("claimed task"), resSpawn);
+
+  // Validar status no DB do membro — pool plano: nasce busy/starting, não standby.
   const member = db.query("SELECT * FROM team_member WHERE team_id = ? AND name = 'membro1'").get(TEAM_ID);
-  check("Membro existe e está ready", member && member.status === "ready");
-  check("Membro teve execution_status forçado para standby", member && member.execution_status === "standby", `execution_status=${member ? member.execution_status : 'N/A'}`);
-  check("Membro teve spawn_context gravado", member && member.spawn_context !== null && member.spawn_context.includes("Faca a task 1"));
-  
+  check("Membro existe e está busy", member && member.status === "busy", `status=${member ? member.status : "N/A"}`);
+  check(
+    "Membro NÃO foi forçado a standby (não há tarefa bloqueada)",
+    member && member.execution_status === "starting",
+    `execution_status=${member ? member.execution_status : "N/A"}`,
+  );
+  check("Membro NÃO tem spawn_context (nascimento normal, não standby)", member && member.spawn_context === null);
+
   // Validar task
   const t1_updated = db.query("SELECT * FROM team_task WHERE id = ?").get(t1.id);
-  check("Task 1 continua blocked", t1_updated.status === "blocked");
-  check("Task 1 foi pré-atribuída ao membro", t1_updated.assignee === "membro1", `assignee=${t1_updated.assignee}`);
+  check("Task 1 reivindicada passa a in_progress", t1_updated.status === "in_progress", `status=${t1_updated.status}`);
+  check("Task 1 foi atribuída ao membro", t1_updated.assignee === "membro1", `assignee=${t1_updated.assignee}`);
 
-  // Validar promptAsync (zero calls)
-  check("ZERO chamadas promptAsync realizadas durante o spawn", mc.calls.promptAsync.length === 0, `chamadas=${mc.calls.promptAsync.length}`);
+  // Validar promptAsync: o spawn normal dispara exatamente 1 prompt (sem standby).
+  check("UMA chamada promptAsync no spawn normal", mc.calls.promptAsync.length === 1, `chamadas=${mc.calls.promptAsync.length}`);
 
   // 3. Validar auto-standby semântico para a Guardiã do Quality Gate (clara)
   // Quando há tarefas pendentes ou outros membros ativos na equipe, Clara nasce em standby
+  mc.calls.promptAsync = [];
   const resClara = await executeTeamSpawn(deps, {
     name: "clara",
     agent: "clara",

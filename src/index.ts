@@ -10,10 +10,10 @@ import { wrapThrowingClient } from "./client"
 import { recoverStaleMembers, recoverUndeliveredMessages, recoverOrphanedWorktrees, recoverOrphanedBranches, recoverOrphanedTeams, rehydrateRegistry } from "./recovery"
 import { MemberRegistry, DescendantTracker, PendingPurgeApprovals } from "./state"
 import { isWorktreeInstance } from "./util"
-import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, shouldAlarmFastIdle, shouldNudgeInReviewTasks, inReviewNudges, IN_REVIEW_NUDGE_MESSAGE, handleSessionErrorEvent, handleRetryModelFailover, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
+import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, shouldAlarmFastIdle, shouldNudgeInReviewTasks, inReviewNudges, IN_REVIEW_NUDGE_MESSAGE, handleSessionErrorEvent, handleRetryModelFailover, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
 // Re-exported so test harnesses (and the dist bundle) can exercise the nudge /
 // fast-idle decisions against a real SQLite database without reimplementing them.
-export { shouldNudgeIdleMember, shouldAlarmFastIdle, shouldNudgeInReviewTasks, inReviewNudges, IN_REVIEW_NUDGE_MESSAGE, hasBlockedAssignedTasks, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
+export { shouldNudgeIdleMember, shouldAlarmFastIdle, shouldNudgeInReviewTasks, inReviewNudges, IN_REVIEW_NUDGE_MESSAGE, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
 // Silent rate-limit failover (zero-noise) — exported for the deterministic
 // suites to drive and inspect the cooldown map without wall-clock sleeps.
 export { handleRetryModelFailover, failoverCooldown, FAILOVER_COOLDOWN_MS } from "./hooks"
@@ -93,6 +93,23 @@ const plugin: Plugin = async (input) => {
   const tracker = new DescendantTracker()
   const purgeApprovals = new PendingPurgeApprovals()
   const nudgedMembers = new Set<string>()
+  // HARNESS-38 (M11): nudgedMembers is a per-lifetime suppression set keyed by
+  // `${teamId}:${memberName}` (idle nudge) and `fastidle:${teamId}:${memberName}`
+  // (fast-idle alarm). Without pruning it grows unbounded for the whole process
+  // lifetime and keeps stale entries for members that already shut down — a
+  // re-spawned member would then be wrongly suppressed. Prune on member/room
+  // shutdown (see the team_shutdown/team_cleanup tools and the shutdown event).
+  const clearMemberNudges = (teamId: string, memberName: string): void => {
+    nudgedMembers.delete(`${teamId}:${memberName}`)
+    nudgedMembers.delete(`fastidle:${teamId}:${memberName}`)
+  }
+  const clearTeamNudges = (teamId: string): void => {
+    const idlePrefix = `${teamId}:`
+    const fastIdlePrefix = `fastidle:${teamId}:`
+    for (const key of nudgedMembers) {
+      if (key.startsWith(idlePrefix) || key.startsWith(fastIdlePrefix)) nudgedMembers.delete(key)
+    }
+  }
   const progressTracker = new ProgressTracker()
   const activityBuffer = new ActivityBuffer()
   const wakeLeadTimestamps = new Map<string, number>()
@@ -227,6 +244,9 @@ const plugin: Plugin = async (input) => {
         if (transition) {
           if (transition.to === "shutdown") {
             notifyTeamEvent(client, "shutdown", { memberName: transition.memberName })
+            // HARNESS-38 (M11): prune this member's nudge suppressions so a
+            // later re-spawn under the same name is not silently suppressed.
+            clearMemberNudges(transition.teamId, transition.memberName)
           } else if (transition.to === "ready" && transition.from === "busy") {
             notifyTeamEvent(client, "completed", { memberName: transition.memberName })
 
@@ -234,8 +254,8 @@ const plugin: Plugin = async (input) => {
             // the model likely failed silently (auth error, invalid model, etc.)
             // The whole verdict lives in shouldAlarmFastIdle() (src/hooks.ts): it returns
             // false for members in execution_status 'standby' and for members holding
-            // tasks blocked on unresolved dependencies, so their early silence never
-            // wakes the lead nor raises a false "failed to spawn" alarm.
+            // tasks under review, so their early silence never wakes the lead nor
+            // raises a false "failed to spawn" alarm.
             const fastIdleKey = `fastidle:${transition.teamId}:${transition.memberName}`
             if (!nudgedMembers.has(fastIdleKey) && shouldAlarmFastIdle(db, transition.teamId, transition.memberName)) {
               nudgedMembers.add(fastIdleKey)
@@ -639,7 +659,8 @@ const plugin: Plugin = async (input) => {
         async execute(args, ctx) {
           const result = await executeTeamMessage(deps, args, ctx.sessionID)
           // Track message activity for stall detection
-          progressTracker.recordMessage(ctx.sessionID)
+          // HARNESS-38 (M10): a message to the lead resets the chatty report.
+          progressTracker.recordMessage(ctx.sessionID, args.to === "lead")
           // Track peer messages for chatty detection
           if (args.to !== "lead") progressTracker.recordPeerMessage(ctx.sessionID)
           ctx.metadata({ title: args.model ? `Set ${args.to} model → ${args.model}` : `Message → ${args.to}` })
@@ -678,14 +699,12 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_tasks_add: tool({
-        description: "Add tasks to the shared team task board so teammates can see what work is available and claim it.",
+        description: "Add tasks to the shared team task board so teammates can see what work is available and claim it. Every task is born ready to claim — the board is a flat, fully-parallel pool.",
         args: {
           tasks: tool.schema.array(tool.schema.object({
             content: tool.schema.string().describe("Task description"),
             priority: tool.schema.enum(["high", "medium", "low"]).default("medium").describe("Task priority"),
-            depends_on: tool.schema.array(tool.schema.string()).optional().describe("Task IDs this depends on"),
           })).describe("Tasks to add"),
-          sequential: tool.schema.boolean().optional().describe("If true, tasks are added in sequence where each task depends on the previous one. Defaults to false (tasks are independent/parallel unless depends_on is explicitly specified)."),
         },
         async execute(args, ctx) {
           const result = await executeTeamTasksAdd(deps, args, ctx.sessionID)
@@ -695,7 +714,7 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_tasks_complete: tool({
-        description: "Mark a task as completed on the shared board, or submit/reject a review. This unblocks any tasks that depend on it.",
+        description: "Mark a task as completed on the shared board, or submit/reject a review.",
         args: {
           task_id: tool.schema.string().describe("ID of the task to mark complete, submit for review, or reject"),
           action: tool.schema.enum(["complete", "submit_review", "reject", "sdet_pass"]).optional().describe("Action to take: 'complete' (default), 'submit_review' (in_progress -> in_review), 'reject' (in_review -> in_progress), or 'sdet_pass' (SDET-only: record a green deterministic suite and wake the Quality Gate). Any other value is rejected with INVALID_ACTION."),
@@ -711,7 +730,7 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_claim: tool({
-        description: "Claim a pending task from the shared task list. Only unclaimed, unblocked tasks can be claimed.",
+        description: "Claim a pending task from the shared task list. Only unclaimed tasks can be claimed.",
         args: {
           task_id: tool.schema.string().describe("ID of the task to claim"),
         },
@@ -723,7 +742,7 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_standby: tool({
-        description: "Suspend active execution and enter standby mode voluntarily until unblocked or awakened by new messages or task dependencies.",
+        description: "Suspend active execution and enter standby mode voluntarily until awakened by new messages or task activity.",
         args: {
           reason: tool.schema.string().optional().describe("Reason for entering standby"),
         },
@@ -776,6 +795,12 @@ const plugin: Plugin = async (input) => {
           confirm_token: tool.schema.string().optional().describe("Confirmation token from the purge preview. Valid only after the matching exact approval answer is selected in this session."),
         },
         async execute(args, ctx) {
+          // M11 (HARNESS-38): resolve the CALLER's team BEFORE executeTeamShutdown.
+          // A full-room shutdown archives the team, after which findTeamBySession
+          // (which requires status='active') returns undefined — making the whole
+          // nudge/progress cleanup block below unreachable. team_cleanup already
+          // captures its teamInfo before cleanup; mirror that canonical order here.
+          const callerTeam = findTeamBySession(db, registry, ctx.sessionID)
           const result = await executeTeamShutdown(deps, args, ctx.sessionID, undefined, undefined, undefined, undefined, undefined, config.mergeOnCleanup)
           // Clean up progress tracking for the shut-down member(s).
           // M5 (TICKET-HARNESS-37): scope the lookup to the CALLER's team. A bare
@@ -783,7 +808,6 @@ const plugin: Plugin = async (input) => {
           // cleanup could evict the wrong session's tracker/buffer while the real
           // shut-down member's entries leaked. The teamId is resolved from the
           // current session via findTeamBySession.
-          const callerTeam = findTeamBySession(db, registry, ctx.sessionID)
           if (callerTeam) {
             const memberArg = args.member?.trim()
             const wildcard = !memberArg || memberArg === "*" || memberArg.toLowerCase() === "all"
@@ -794,6 +818,9 @@ const plugin: Plugin = async (input) => {
                 progressTracker.remove(s.session_id)
                 activityBuffer.remove(s.session_id)
               }
+              // HARNESS-38 (M11): drop every nudge suppression for the room.
+              // Guarded so a blocked (uncommitted) shutdown keeps its entries.
+              if (!result.includes("uncommitted")) clearTeamNudges(callerTeam.teamId)
             } else {
               const member = deps.db.query(
                 "SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status IN ('shutdown', 'shutdown_requested')"
@@ -801,6 +828,7 @@ const plugin: Plugin = async (input) => {
               if (member) {
                 progressTracker.remove(member.session_id)
                 activityBuffer.remove(member.session_id)
+                clearMemberNudges(callerTeam.teamId, memberArg)
               }
             }
           }
@@ -840,6 +868,8 @@ const plugin: Plugin = async (input) => {
           // Clean up activity buffers for team members after successful cleanup
           if (!result.includes("uncommitted") && !args.purge) {
             for (const sid of memberSessions) activityBuffer.remove(sid)
+            // HARNESS-38 (M11): the whole-room alias also drops nudge suppressions.
+            if (teamInfoForCleanup) clearTeamNudges(teamInfoForCleanup.teamId)
           }
           const blocked = result.includes("uncommitted")
           const title = args.purge
