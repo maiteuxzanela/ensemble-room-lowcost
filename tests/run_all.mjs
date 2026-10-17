@@ -60,6 +60,7 @@ const SUITES = [
   { file: "test_multi_repo_commit_and_sdet_pass.mjs", label: "HARNESS-27A/27B (Auto-commit multi-repo: room+aninhado, frescor de irmãos & sdet_pass: autorização, estado, card em in_review, wake canônico da Clara, git real + prova de mutação)" },
   { file: "test_ticket_harness_33_board_and_messaging.mjs", label: "HARNESS-33A/33B (Action estrita fail-fast + schema V1↔V2; isolamento de team_results & fan-out resiliente de team_broadcast + injeção no prompt; git real + prova de mutação)" },
   { file: "test_ticket_harness_34_quality_gate_and_silent_lead.mjs", label: "HARNESS-34 (A6 trava anti-bypass do Quality Gate + A2 filtro de abort + A1 coerência do silentLead; git real + prova de mutação)" },
+  { file: "test_ticket_harness_35.mjs", label: "HARNESS-35 (A4 bind 127.0.0.1 + gate Host/Origin global + A5 chat do lead com modelo/persona/standby/delivered; prova de mutação)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

@@ -6712,6 +6712,11 @@ async function handleActivityRoute(db, sessionId, options, res, corsOrigin) {
 function handleDashboardRequest(db, port, req, res, options) {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? `localhost:${port}`}`);
   const corsOrigin = corsOriginFor(port, req.headers.origin);
+  if (!isTrustedLocalRequest(port, req)) {
+    log(`dashboard:forbidden path=${url.pathname} method=${req.method ?? "-"} host=${req.headers.host ?? "-"} origin=${req.headers.origin ?? "-"}`);
+    sendJson(res, { ok: false, error: "Forbidden" }, corsOrigin, 403);
+    return;
+  }
   if (url.pathname === "/api/health") {
     sendJson(res, { ensemble: true, pid: process.pid }, corsOrigin);
     return;
@@ -6721,11 +6726,6 @@ function handleDashboardRequest(db, port, req, res, options) {
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/chat/send") {
-    if (!isTrustedLocalRequest(port, req)) {
-      log(`dashboard:chat:forbidden host=${req.headers.host ?? "-"} origin=${req.headers.origin ?? "-"}`);
-      sendJson(res, { ok: false, error: "Forbidden" }, corsOrigin, 403);
-      return;
-    }
     const chunks = [];
     let received = 0;
     let tooLarge = false;
@@ -6789,20 +6789,50 @@ function handleDashboardRequest(db, port, req, res, options) {
         let messageId;
         if (isBroadcast) {
           messageId = broadcastMessage(db, { teamId, from: "human", content: text });
-          const members = db.query("SELECT session_id, name FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error')").all(teamId);
-          for (const m of members) {
-            if (hasReportedCompletion(db, teamId, m.name)) continue;
-            recipients.push(m.name);
-            if (options?.client) {
-              options.client.session.promptAsync({
+          const members = db.query("SELECT session_id, name, agent FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error')").all(teamId);
+          const pending = members.filter((m) => !hasReportedCompletion(db, teamId, m.name));
+          for (const m of pending) recipients.push(m.name);
+          if (options?.client && pending.length) {
+            const deliveries = pending.map((m) => {
+              const wake = resolveStandbyWake(db, teamId, m.name, `[Team broadcast from human]: ${text}`);
+              const model = getMemberModel(db, teamId, m.name);
+              const agent = wake.agent ?? m.agent ?? void 0;
+              return options.client.session.promptAsync({
                 sessionID: m.session_id,
-                parts: [{ type: "text", text: `[Team broadcast from human]: ${text}` }],
-                synthetic: true
+                parts: [{ type: "text", text: wake.text }],
+                synthetic: true,
+                ...agent ? { agent } : {},
+                ...model ? { model } : {}
               }).catch((err) => log(`dashboard:chat broadcast failed to ${m.name} err=${err}`));
-            }
+            });
+            Promise.allSettled(deliveries).then((settled) => {
+              if (settled.every((s) => s.status === "fulfilled")) markDelivered(db, messageId);
+            }).catch(() => {
+            });
+          }
+        } else if (to === "lead") {
+          const team = db.query("SELECT lead_session_id, lead_agent FROM team WHERE id = ?").get(teamId);
+          if (!team?.lead_session_id) {
+            sendJson(res, { ok: false, error: "Team lead not found" }, corsOrigin, 404);
+            return;
+          }
+          messageId = sendMessage(db, { teamId, from: "human", to: "lead", content: text });
+          recipients.push("lead");
+          if (options?.client) {
+            const wake = resolveStandbyWake(db, teamId, "lead", `[Direct message from human]: ${text}`);
+            const model = getMemberModel(db, teamId, "lead");
+            options.client.session.promptAsync({
+              sessionID: team.lead_session_id,
+              parts: [{ type: "text", text: wake.text }],
+              synthetic: true,
+              agent: team.lead_agent ?? "dante",
+              ...model ? { model } : {}
+            }).then(() => {
+              markDelivered(db, messageId);
+            }).catch((err) => log(`dashboard:chat lead msg failed err=${err}`));
           }
         } else {
-          const member = db.query("SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status NOT IN ('shutdown', 'error')").get(teamId, to);
+          const member = db.query("SELECT session_id, agent FROM team_member WHERE team_id = ? AND name = ? AND status NOT IN ('shutdown', 'error')").get(teamId, to);
           if (!member) {
             sendJson(res, { ok: false, error: `Member '${to}' not found in active team` }, corsOrigin, 404);
             return;
@@ -6810,10 +6840,17 @@ function handleDashboardRequest(db, port, req, res, options) {
           messageId = sendMessage(db, { teamId, from: "human", to, content: text });
           recipients.push(to);
           if (options?.client) {
+            const wake = resolveStandbyWake(db, teamId, to, `[Direct message from human]: ${text}`);
+            const model = getMemberModel(db, teamId, to);
+            const agent = wake.agent ?? member.agent ?? void 0;
             options.client.session.promptAsync({
               sessionID: member.session_id,
-              parts: [{ type: "text", text: `[Direct message from human]: ${text}` }],
-              synthetic: true
+              parts: [{ type: "text", text: wake.text }],
+              synthetic: true,
+              ...agent ? { agent } : {},
+              ...model ? { model } : {}
+            }).then(() => {
+              markDelivered(db, messageId);
             }).catch((err) => log(`dashboard:chat direct msg failed to ${to} err=${err}`));
           }
         }
@@ -6892,7 +6929,7 @@ async function startDashboard(db, port, options) {
       log(`dashboard:failed err=${err.message}`);
       resolve(null);
     });
-    server.listen(port, () => {
+    server.listen(port, "127.0.0.1", () => {
       log(`dashboard:started port=${port} url=http://localhost:${port}`);
       resolve(toDashboardServer(server));
     });

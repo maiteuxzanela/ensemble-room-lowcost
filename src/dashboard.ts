@@ -6,7 +6,9 @@ import { DASHBOARD_JS_CORE } from "./dashboard-js-core"
 import { DASHBOARD_JS_EVENTS } from "./dashboard-js-events"
 import { DASHBOARD_JS_RENDER } from "./dashboard-js-render"
 import { log } from "./log"
-import { broadcastMessage, sendMessage, hasReportedCompletion } from "./messaging"
+import { broadcastMessage, sendMessage, markDelivered, hasReportedCompletion } from "./messaging"
+import { getMemberModel } from "./member-model"
+import { resolveStandbyWake } from "./tools/shared"
 import type { ActivityBuffer, ActivityEntry } from "./activity"
 import type { PluginClient } from "./types"
 
@@ -394,6 +396,18 @@ function handleDashboardRequest(
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? `localhost:${port}`}`)
   const corsOrigin = corsOriginFor(port, req.headers.origin)
 
+  // HARNESS-35 (A4) — DNS rebinding / host spoofing gate applied to EVERY
+  // route, not just the state-changing POST. The dashboard only ever runs on a
+  // loopback listener, so `Host` must name this exact port on a loopback
+  // address (and, when the browser sends one, `Origin` must be loopback too).
+  // Anything else is refused before any GET (/api/health, /api/state,
+  // activity, /) or POST handler runs — no state is read or mutated.
+  if (!isTrustedLocalRequest(port, req)) {
+    log(`dashboard:forbidden path=${url.pathname} method=${req.method ?? "-"} host=${req.headers.host ?? "-"} origin=${req.headers.origin ?? "-"}`)
+    sendJson(res, { ok: false, error: "Forbidden" }, corsOrigin, 403)
+    return
+  }
+
   if (url.pathname === "/api/health") {
     sendJson(res, { ensemble: true, pid: process.pid }, corsOrigin)
     return
@@ -405,12 +419,8 @@ function handleDashboardRequest(
   }
 
   if (req.method === "POST" && url.pathname === "/api/chat/send") {
-    // DEF-5 — refuse anything that does not come from this loopback port.
-    if (!isTrustedLocalRequest(port, req)) {
-      log(`dashboard:chat:forbidden host=${req.headers.host ?? "-"} origin=${req.headers.origin ?? "-"}`)
-      sendJson(res, { ok: false, error: "Forbidden" }, corsOrigin, 403)
-      return
-    }
+    // DEF-5/A4 — the loopback Host/Origin gate already ran at the top of this
+    // function (applies to every route), so no per-route re-check is needed.
 
     // DEF-7 — hard 64 KiB ceiling on the request body. The buffer is discarded
     // as soon as the limit is crossed: no partial parse, no unbounded growth.
@@ -486,21 +496,60 @@ function handleDashboardRequest(
 
         if (isBroadcast) {
           messageId = broadcastMessage(db, { teamId, from: "human", content: text })
-          const members = db.query("SELECT session_id, name FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error')").all(teamId) as { session_id: string, name: string }[]
-          
-          for (const m of members) {
-            if (hasReportedCompletion(db, teamId, m.name)) continue
-            recipients.push(m.name)
-            if (options?.client) {
-              options.client.session.promptAsync({
+          const members = db.query("SELECT session_id, name, agent FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error')").all(teamId) as { session_id: string, name: string, agent: string | null }[]
+
+          // Recipients skip members who already reported completion (matching the
+          // historical behaviour) and are collected regardless of transport.
+          const pending = members.filter((m) => !hasReportedCompletion(db, teamId, m.name))
+          for (const m of pending) recipients.push(m.name)
+
+          if (options?.client && pending.length) {
+            // HARNESS-35 — same model/agent/standby preservation as the DM path.
+            const deliveries = pending.map((m) => {
+              const wake = resolveStandbyWake(db, teamId, m.name, `[Team broadcast from human]: ${text}`)
+              const model = getMemberModel(db, teamId, m.name)
+              const agent = wake.agent ?? m.agent ?? undefined
+              return options.client!.session.promptAsync({
                 sessionID: m.session_id,
-                parts: [{ type: "text", text: `[Team broadcast from human]: ${text}` }],
-                synthetic: true
+                parts: [{ type: "text", text: wake.text }],
+                synthetic: true,
+                ...(agent ? { agent } : {}),
+                ...(model ? { model } : {}),
               }).catch((err: unknown) => log(`dashboard:chat broadcast failed to ${m.name} err=${err}`))
-            }
+            })
+
+            // The broadcast is persisted as a single shared row (to_name = NULL),
+            // so stamp it delivered only once every recipient transport settled
+            // successfully; a partial failure leaves it pending for recovery.
+            Promise.allSettled(deliveries).then((settled) => {
+              if (settled.every((s) => s.status === "fulfilled")) markDelivered(db, messageId)
+            }).catch(() => { /* best effort — never crash the response path */ })
+          }
+        } else if (to === "lead") {
+          // HARNESS-35 (a) — the lead is NOT in team_member; resolve it from the
+          // team row. Previously this path 404'd because it only looked up members.
+          const team = db.query("SELECT lead_session_id, lead_agent FROM team WHERE id = ?").get(teamId) as { lead_session_id: string, lead_agent: string | null } | null
+          if (!team?.lead_session_id) {
+            sendJson(res, { ok: false, error: "Team lead not found" }, corsOrigin, 404)
+            return
+          }
+          messageId = sendMessage(db, { teamId, from: "human", to: "lead", content: text })
+          recipients.push("lead")
+          if (options?.client) {
+            const wake = resolveStandbyWake(db, teamId, "lead", `[Direct message from human]: ${text}`)
+            const model = getMemberModel(db, teamId, "lead")
+            options.client.session.promptAsync({
+              sessionID: team.lead_session_id,
+              parts: [{ type: "text", text: wake.text }],
+              synthetic: true,
+              agent: team.lead_agent ?? "dante",
+              ...(model ? { model } : {}),
+            }).then(() => {
+              markDelivered(db, messageId)
+            }).catch((err: unknown) => log(`dashboard:chat lead msg failed err=${err}`))
           }
         } else {
-          const member = db.query("SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status NOT IN ('shutdown', 'error')").get(teamId, to) as { session_id: string } | null
+          const member = db.query("SELECT session_id, agent FROM team_member WHERE team_id = ? AND name = ? AND status NOT IN ('shutdown', 'error')").get(teamId, to) as { session_id: string, agent: string | null } | null
           if (!member) {
             sendJson(res, { ok: false, error: `Member '${to}' not found in active team` }, corsOrigin, 404)
             return
@@ -508,10 +557,20 @@ function handleDashboardRequest(
           messageId = sendMessage(db, { teamId, from: "human", to, content: text })
           recipients.push(to)
           if (options?.client) {
+            // HARNESS-35 (b/c/d) — preserve the member's model and persona,
+            // consume the standby window with the full spawn context, and mark
+            // the row delivered so the recovery sweep doesn't replay it.
+            const wake = resolveStandbyWake(db, teamId, to, `[Direct message from human]: ${text}`)
+            const model = getMemberModel(db, teamId, to)
+            const agent = wake.agent ?? member.agent ?? undefined
             options.client.session.promptAsync({
               sessionID: member.session_id,
-              parts: [{ type: "text", text: `[Direct message from human]: ${text}` }],
-              synthetic: true
+              parts: [{ type: "text", text: wake.text }],
+              synthetic: true,
+              ...(agent ? { agent } : {}),
+              ...(model ? { model } : {}),
+            }).then(() => {
+              markDelivered(db, messageId)
             }).catch((err: unknown) => log(`dashboard:chat direct msg failed to ${to} err=${err}`))
           }
         }
@@ -606,7 +665,10 @@ export async function startDashboard(db: Database, port: number, options?: Dashb
       resolve(null)
     })
 
-    server.listen(port, () => {
+    // HARNESS-35 (A4) — bind explicitly to the IPv4 loopback so the dashboard is
+    // never reachable from the LAN. The Host/Origin gate in
+    // handleDashboardRequest is the second layer against DNS rebinding.
+    server.listen(port, "127.0.0.1", () => {
       log(`dashboard:started port=${port} url=http://localhost:${port}`)
       resolve(toDashboardServer(server))
     })
