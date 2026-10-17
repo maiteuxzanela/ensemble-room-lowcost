@@ -319,7 +319,12 @@ export class Watchdog {
       const stallAgent = resolveWatchdogNudgeAgent(member)
       this.client.session.promptAsync({
         sessionID: member.session_id,
-        parts: [{ type: "text", text: "[System]: You appear stalled — no progress detected. Report your current status to the lead via team_message, or wrap up your work." }],
+        // M1 (TICKET-HARNESS-37): under silentLead (config.silentLead !== false)
+        // the nudge steers to the task / board instead of demanding a lead-bound
+        // report; the legacy phrasing is preserved for silentLead: false.
+        parts: [{ type: "text", text: this.config?.silentLead !== false
+          ? "[System]: You appear stalled — no progress detected. Refocus on your current task and drive it forward; record progress on the shared board and coordinate with peers via team_message, or wrap up your work."
+          : "[System]: You appear stalled — no progress detected. Report your current status to the lead via team_message, or wrap up your work." }],
         agent: stallAgent,
         ...(stallModel ? { model: stallModel } : {}),
       }).then(() => {
@@ -378,7 +383,11 @@ export class Watchdog {
       const chattyAgent = resolveWatchdogNudgeAgent(member)
       this.client.session.promptAsync({
         sessionID: member.session_id,
-        parts: [{ type: "text", text: "[System]: You've sent several messages to teammates. Focus on completing your task and send your results to the lead via team_message." }],
+        // M1 (TICKET-HARNESS-37): silentLead-aware chatty nudge (legacy phrasing
+        // kept for silentLead: false).
+        parts: [{ type: "text", text: this.config?.silentLead !== false
+          ? "[System]: You've sent several messages to teammates. Focus on completing your current task and advancing it on the shared board rather than over-coordinating."
+          : "[System]: You've sent several messages to teammates. Focus on completing your task and send your results to the lead via team_message." }],
         agent: chattyAgent,
         ...(chattyModel ? { model: chattyModel } : {}),
       }).catch((err) => {

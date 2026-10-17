@@ -60,8 +60,8 @@ const TEAM_C = { name: "thmulti", lead: "ses_lead_hugo_c" };
 const SQUAD_MARKER = "Implementador, Hugo (deterministic tests) and Clara (Quality Gate)";
 const DISPATCH_MARKER =
   "Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.";
-const SDET_MSG = (team) =>
-  `Engenheiro de Testes 'hugo' já está ativo na equipe '${team}'. Papéis de engenharia de testes são exclusivos e não admitem instâncias concorrentes.`;
+const SDET_MSG = (team, name = "hugo") =>
+  `Engenheiro de Testes '${name}' já está ativo na equipe '${team}'. Papéis de engenharia de testes são exclusivos e não admitem instâncias concorrentes.`;
 
 const V2_SPAWN_KEYS = [
   "agent", "claim_task", "is_qa", "model", "name", "plan_approval",
@@ -118,7 +118,7 @@ const {
 // ---------------------------------------------------------------------------
 check(
   "dist contém a trava de exclusividade SDET do Hugo",
-  distRaw.includes("Engenheiro de Testes 'hugo' j") &&
+  distRaw.includes("Engenheiro de Testes '${existingSDET.name}' j") &&
     distRaw.includes("testes s\\xE3o exclusivos"),
   "template interpolado presente",
 );
@@ -365,7 +365,7 @@ async function runSuite() {
   const c2 = await trySpawn(deps, TEAM_C.lead, spawnArgs({ name: "sdet-runner2", agent: "hugo" }));
   check(
     "(3) existente 'hugo-sdet' (agent build) bloqueia entrante por base persona",
-    !c2.ok && c2.err === SDET_MSG(TEAM_C.name),
+    !c2.ok && c2.err === SDET_MSG(TEAM_C.name, "hugo-sdet"),
     c2.err ?? "sem erro",
   );
 

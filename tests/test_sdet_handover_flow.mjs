@@ -283,8 +283,14 @@ async function runFlow(mod) {
   const pClara = buildTeammateSystemPrompt(db, "s1", "clara", DEFAULT_CONFIG);
   const pHugo = buildTeammateSystemPrompt(db, "s1", "hugo", DEFAULT_CONFIG);
   R(
-    "S6.implementer-hands-baton-to-sdet",
-    pTulio.includes("SDET HANDOVER:") && pTulio.includes("team_message(to: 'hugo')"),
+    // TICKET-HARNESS-37 (M2): o implementador NÃO faz mais handoff manual. O
+    // runtime acorda o SDET automaticamente no submit_review (wake retido para
+    // batching pelo HARNESS-25), então o handover deve instruir a submissão —
+    // e NÃO deve mandar o implementador enviar team_message ao SDET.
+    "S6.implementer-submits-review-no-manual-handoff",
+    pTulio.includes("SDET HANDOVER:") &&
+      pTulio.includes("the runtime wakes the SDET automatically") &&
+      !pTulio.includes("team_message(to: 'hugo')"),
     "",
   );
   R("S6.implementer-gate-not-direct-peer", pTulio.includes("The Quality Gate is NOT a direct peer for you"));

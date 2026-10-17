@@ -865,14 +865,32 @@ export async function executeTeamTasksComplete(
     if (task.status !== "in_review") {
       throw new Error("Task must be in review to record sdet_pass")
     }
+    // TICKET-HARNESS-37-M8: preserve the implementer's existing review notes and
+    // concatenate the SDET verdict under labelled sections (implementer notes are
+    // context the Quality Gate must not lose). No existing note → store the SDET
+    // note verbatim (byte-stable with the historical contract). No SDET note →
+    // keep the existing note untouched (never an orphan "recorded: .").
+    const existingNotes = task.review_notes?.trim() || null
+    const sdetNotes = notes?.trim() || null
+    const mergedNotes = existingNotes && sdetNotes
+      ? `[Implementador]: ${existingNotes}\n[SDET]: ${sdetNotes}`
+      : (sdetNotes ?? existingNotes)
     deps.db.run(
       "UPDATE team_task SET review_notes = ?, time_updated = ? WHERE id = ?",
-      [notes, now, args.task_id],
+      [mergedNotes, now, args.task_id],
     )
     if (qaMember) {
-      wakeQualityGateForSdetPass(deps, teamInfo.teamId, args.task_id, notes, qaMember)
+      wakeQualityGateForSdetPass(deps, teamInfo.teamId, args.task_id, mergedNotes, qaMember)
     }
-    return `Task ${args.task_id} SDET verification recorded: ${notes ?? ""}. Quality Gate guardian notified.`
+    // M8: only claim the Quality Gate was notified when a reviewer actually
+    // exists; otherwise report precisely that the room has none.
+    const recorded = mergedNotes
+      ? `SDET verification recorded: ${mergedNotes}.`
+      : "SDET verification recorded."
+    const qaStatus = qaMember
+      ? `Quality Gate guardian (${qaMember.name}) notified.`
+      : "No Quality Gate guardian present in the room — the verdict was recorded on the board."
+    return `Task ${args.task_id} ${recorded} ${qaStatus}`
   }
 
   // Flow 1: Submit to review (in_progress -> in_review)
@@ -1072,6 +1090,24 @@ export async function executeTeamTasksComplete(
     }).catch(() => { /* TUI may not be available */ })
   } catch { log(`tasks-complete:toast:failed`) }
 
+  // HARNESS-26A — native post-QA auto-commit (Portão 1). When the Quality Gate
+  // reviewer (Clara — isQAMember) or the team lead approves the card here, the
+  // runtime commits the shared workspace LOCALLY and atomically so no manual
+  // `git add`/`git commit` is needed. Local only: pushing stays reserved for the
+  // pre-push batch gate (Portão 2 / Diana). Git failures are swallowed — the
+  // board transition above already happened.
+  //
+  // TICKET-HARNESS-37-M7: this block runs BEFORE the board-close wake below, so
+  // by the time the lead session is woken the commit is already recorded and the
+  // working tree is consistent when the lead inspects it. (Previously the wake
+  // was dispatched first and the lead could observe a still-dirty tree.)
+  let commitSuffix = ""
+  if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {
+    // TICKET-32A — ledger-gated surgical auto-commit: staged from the room's
+    // `team_modified_file` rows for this team (no mtime freshness window).
+    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content)
+  }
+
   // Systematic board wake (silent-lead design): when the last active task on the
   // board flips to completed, wake the lead session with a synthetic system prompt.
   // While silentLead is active the lead receives no text-message prompts, so
@@ -1102,19 +1138,6 @@ export async function executeTeamTasksComplete(
         log(`tasks-complete:wake-lead:failed team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`)
       }
     }
-  }
-
-  // HARNESS-26A — native post-QA auto-commit (Portão 1). When the Quality Gate
-  // reviewer (Clara — isQAMember) or the team lead approves the card here, the
-  // runtime commits the shared workspace LOCALLY and atomically so no manual
-  // `git add`/`git commit` is needed. Local only: pushing stays reserved for the
-  // pre-push batch gate (Portão 2 / Diana). Git failures are swallowed — the
-  // board transition above already happened.
-  let commitSuffix = ""
-  if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {
-    // TICKET-32A — ledger-gated surgical auto-commit: staged from the room's
-    // `team_modified_file` rows for this team (no mtime freshness window).
-    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content)
   }
 
   return `Completed task: ${task.content}${formatUnblockedSuffix(unblocked, wokeMembers)}${commitSuffix}`

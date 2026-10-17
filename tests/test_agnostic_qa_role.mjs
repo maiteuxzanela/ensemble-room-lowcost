@@ -186,7 +186,7 @@ const v2End = v2SrcRaw.indexOf('name: "team_message"', v2Start);
 const v2Block = v2Start >= 0 && v2End > v2Start ? v2SrcRaw.slice(v2Start, v2End) : "";
 {
   check("0.5.1 src/v2-tools.ts declara a propriedade 'role' no schema de team_spawn", /\n\s{10}role:\s*\{/.test(v2Block));
-  check("0.5.2 'role' usa enum [\"qa\", \"member\"] (paridade com o enum V1)", /enum:\s*\[\s*"qa"\s*,\s*"member"\s*\]/.test(v2Block));
+  check("0.5.2 'role' usa enum [\"sdet\", \"qa\", \"member\"] (paridade com o enum V1)", /enum:\s*\[\s*"sdet"\s*,\s*"qa"\s*,\s*"member"\s*\]/.test(v2Block));
   check("0.5.3 src/v2-tools.ts declara a propriedade 'is_qa' booleana via helper bool(...)", /\n\s{10}is_qa:\s*bool\(/.test(v2Block));
   check(
     "0.5.4 required [name,prompt] e additionalProperties:false preservados no team_spawn V2",
@@ -201,8 +201,8 @@ const v1End = v1SrcRaw.indexOf("team_message: tool({", v1Start);
 const v1Block = v1Start >= 0 && v1End > v1Start ? v1SrcRaw.slice(v1Start, v1End) : "";
 {
   check(
-    "0.5.5 V1 (src/index.ts) declara role: enum [\"qa\", \"member\"] no team_spawn",
-    /role:\s*tool\.schema\.enum\(\s*\[\s*"qa"\s*,\s*"member"\s*\]/.test(v1Block),
+    "0.5.5 V1 (src/index.ts) declara role: enum [\"sdet\", \"qa\", \"member\"] no team_spawn",
+    /role:\s*tool\.schema\.enum\(\s*\[\s*"sdet"\s*,\s*"qa"\s*,\s*"member"\s*\]/.test(v1Block),
   );
   check("0.5.6 V1 (src/index.ts) declara is_qa: tool.schema.boolean() no team_spawn", /is_qa:\s*tool\.schema\.boolean\(\)/.test(v1Block));
 }
@@ -215,8 +215,8 @@ let spawnDist = null;
   check("0.6.1 registerV2Tools (dist) registra a tool team_spawn no V2", Boolean(spawnDist));
   const props = spawnDist?.input?.properties ?? {};
   check(
-    "0.6.2 schema V2 registrado expõe properties.role com type=string e enum [qa, member]",
-    props.role?.type === "string" && JSON.stringify(props.role?.enum) === JSON.stringify(["qa", "member"]),
+    "0.6.2 schema V2 registrado expõe properties.role com type=string e enum [sdet, qa, member]",
+    props.role?.type === "string" && JSON.stringify(props.role?.enum) === JSON.stringify(["sdet", "qa", "member"]),
     `role=${JSON.stringify(props.role)}`,
   );
   check("0.6.3 schema V2 registrado expõe properties.is_qa com type=boolean", props.is_qa?.type === "boolean", `is_qa=${JSON.stringify(props.is_qa)}`);

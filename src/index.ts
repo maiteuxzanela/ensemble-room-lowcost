@@ -594,9 +594,9 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_spawn: tool({
-        description: "Spawn a new teammate that works in parallel. The teammate starts immediately with the given prompt. " +
+        description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). " +
           "Each teammate gets their own git worktree for file isolation. " +
-          "Teammates work asynchronously and will message you when done. Do not poll for their status. " +
+          "Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. " +
           "Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
         args: {
           name: tool.schema.string().describe("Teammate name (lowercase alphanumeric with hyphens)"),
@@ -607,7 +607,7 @@ const plugin: Plugin = async (input) => {
           worktree: tool.schema.boolean().default(true).describe("Create a git worktree for file isolation (default: true, set false for read-only agents)"),
           plan_approval: tool.schema.boolean().default(false).describe("Require teammate to send a plan for approval before writing files (default: false)"),
           standby: tool.schema.boolean().default(false).describe("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)"),
-          role: tool.schema.enum(["qa", "member"]).optional().describe("Teammate role: 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)"),
+          role: tool.schema.enum(["sdet", "qa", "member"]).optional().describe("Teammate role: 'sdet' marks the deterministic-test engineer (exclusive per room, persists role='sdet'; also auto-detected for agent 'hugo'), 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)"),
           is_qa: tool.schema.boolean().optional().describe("Explicitly flag this teammate as the Quality Gate reviewer (stored in team_member.is_qa). Omitted = auto-detect (agent 'clara' or base persona 'clara' → QA)"),
         },
         async execute(args, ctx) {
@@ -660,7 +660,7 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_tasks_list: tool({
-        description: "View the shared team task board. Use this to check task status, not to wait for teammates. Teammates will message you when done.",
+        description: "View the shared team task board. Use this to check task status, not to wait for teammates. Under silentLead you are not woken for each individual completion — rely on the board and team_results.",
         args: {},
         async execute(_args, ctx) {
           const result = await executeTeamTasksList(deps, ctx.sessionID)
@@ -748,11 +748,21 @@ const plugin: Plugin = async (input) => {
         },
         async execute(args, ctx) {
           const result = await executeTeamShutdown(deps, args, ctx.sessionID)
-          // Clean up progress tracking for the shut-down member
-          const member = deps.db.query("SELECT session_id FROM team_member WHERE name = ? AND status IN ('shutdown', 'shutdown_requested')").get(args.member) as { session_id: string } | null
-          if (member) {
-            progressTracker.remove(member.session_id)
-            activityBuffer.remove(member.session_id)
+          // Clean up progress tracking for the shut-down member.
+          // M5 (TICKET-HARNESS-37): scope the lookup to the CALLER's team. A bare
+          // `name = ?` matched same-named members in OTHER active teams, so the
+          // cleanup could evict the wrong session's tracker/buffer while the real
+          // shut-down member's entries leaked. The teamId is resolved from the
+          // current session via findTeamBySession.
+          const callerTeam = findTeamBySession(db, registry, ctx.sessionID)
+          if (callerTeam) {
+            const member = deps.db.query(
+              "SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status IN ('shutdown', 'shutdown_requested')"
+            ).get(callerTeam.teamId, args.member) as { session_id: string } | null
+            if (member) {
+              progressTracker.remove(member.session_id)
+              activityBuffer.remove(member.session_id)
+            }
           }
           const hasWarning = result.includes("uncommitted")
           ctx.metadata({ title: hasWarning ? `${args.member} shut down — uncommitted changes` : `${args.member} shut down` })

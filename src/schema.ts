@@ -331,6 +331,20 @@ export const MIGRATIONS: string[] = [
      PRIMARY KEY (team_id, file_path)
    );
    CREATE INDEX IF NOT EXISTS team_modified_file_team_idx ON team_modified_file(team_id);`,
+  // Migration 18 (TICKET-HARNESS-37 / M4): per-member lead-decision queue.
+  //
+  // Migration 15 tracked at most ONE waiting member per team: every new
+  // decision_lead overwrote `awaiting_decision_member`, and the lead's reply
+  // cleared the whole flag — so with two members waiting on the lead, replying
+  // to one silently unpaused the watchdog AND dropped the other's pending
+  // decision. `awaiting_decision_members` holds a JSON array of
+  // `{ member, at, payload }` entries (one per waiting member) so the pause is
+  // lifted ONLY when no member is left pending. The legacy
+  // `awaiting_decision_member` / `awaiting_decision_at` columns stay in sync
+  // (latest raise) for observability and backward compatibility. Additive-only
+  // (same non-negotiable as Migrations 9-11/14/15/16/17): nullable TEXT, no
+  // CHECK constraint, no table rebuild.
+  `ALTER TABLE team ADD COLUMN awaiting_decision_members TEXT;`,
 ]
 
 /**

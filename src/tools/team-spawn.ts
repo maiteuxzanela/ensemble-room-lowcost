@@ -151,9 +151,10 @@ export async function executeTeamSpawn(
   // SDET / Test Engineering role detection (agnostic): the canonical test-
   // engineering persona is "hugo" — matched either as the explicit agent type
   // or via the base persona of a multi-instance name ("hugo-sdet" → "hugo").
-  // An explicit `role: "sdet"` arg (direct API; V1/V2 tool schemas keep the
-  // ["qa","member"] enum) also marks the member as SDET and is persisted in
-  // team_member.role (Migration 16) so qa-role.ts can resolve it back.
+  // An explicit `role: "sdet"` arg (declared in the V1/V2 tool schemas) also
+  // marks the member as SDET and is persisted in team_member.role (Migration 16)
+  // so qa-role.ts can resolve it back — the role is NEVER bound to the literal
+  // name "hugo".
   const isHugo = basePersonaName === "hugo" || agent === "hugo"
   const spawnIsSDET = isHugo || args.role === "sdet"
 
@@ -192,15 +193,17 @@ export async function executeTeamSpawn(
   // fail-fast (before any worktree/session side effect).
   //
   // Message shape (runtime-asserted by test_hugo_sdet_integration — keep the
-  // template byte-stable):
-  //   Engenheiro de Testes 'hugo' já está ativo na equipe '<team>'.
+  // template byte-stable): the NAME slot interpolates the ACTUAL active SDET
+  // (`existingSDET.name`), never the hardcoded literal "hugo", so a custom
+  // SDET persona is reported by its own name:
+  //   Engenheiro de Testes '<existingSDET.name>' já está ativo na equipe '<team>'.
   //   Papéis de engenharia de testes são exclusivos e não admitem
   //   instâncias concorrentes.
   if (spawnIsSDET) {
     const existingSDET = getTeamSDETMember(deps.db, teamInfo.teamId)
     if (existingSDET) {
       throw new Error(
-        `Engenheiro de Testes 'hugo' já está ativo na equipe '${teamInfo.teamName}'. Papéis de engenharia de testes são exclusivos e não admitem instâncias concorrentes.`,
+        `Engenheiro de Testes '${existingSDET.name}' já está ativo na equipe '${teamInfo.teamName}'. Papéis de engenharia de testes são exclusivos e não admitem instâncias concorrentes.`,
       )
     }
   }
@@ -650,13 +653,14 @@ export async function executeTeamSpawn(
     )
   }
 
-  // HARNESS-23 (TASK-02) delivery-flow peers, resolved pre-INSERT:
+  // HARNESS-23 (TASK-02) + HARNESS-37 (M2) delivery-flow peers, resolved pre-INSERT:
   //   1. This member IS the SDET → submit_review wakes the Quality Gate by
   //      itself (team-tasks-complete SDET-first routing) — no peer message.
-  //   2. The room has an SDET (and this member is not it) → the baton goes
-  //      EXCLUSIVELY to the SDET for the deterministic test suite; the Quality
-  //      Gate is not cited in implementer prompts at all — it only enters after
-  //      the SDET verdict, via the automatic wake.
+  //   2. The room has an SDET (and this member is not it) → the runtime routes
+  //      the card to the SDET automatically on submit_review (held for batching
+  //      by HARNESS-25); implementers must NOT hand off via team_message. The
+  //      Quality Gate is not cited in implementer prompts at all — it only
+  //      enters after the SDET verdict, via the automatic wake.
   //   3. No SDET in the room → legacy QA peer-to-peer clause (retrocompat —
   //      byte-stable, runtime-asserted by test_agnostic_qa_role A.10).
   //   4. Nobody to review → generic fallback (no dangling member references).
@@ -670,7 +674,7 @@ export async function executeTeamSpawn(
       return `2. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) — the Quality Gate reviewer is woken automatically after your deterministic suite is submitted. Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. ${tail}`
     }
     if (sdetPeerName) {
-      return `2. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes), then pass the baton exclusively to the SDET ${sdetPeerName} via team_message(to: '${sdetPeerName}') for the deterministic test suite. Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. ${tail}`
+      return `2. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) — the runtime routes the card to the SDET ${sdetPeerName} automatically for the deterministic test suite (held until the functional batch is consolidated); do NOT message the SDET to hand off. Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. ${tail}`
     }
     if (qaPeerName) {
       return claimScope === "a standalone task"
@@ -698,7 +702,7 @@ export async function executeTeamSpawn(
     context.push(
       "",
       "QUALITY GATE ORIENTATION:",
-      `Wait for the SDET's (${sdetPeerName}) deterministic test suite before auditing: implementers pass the baton to the SDET after submit_review, and only then is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`,
+      `Wait for the SDET's (${sdetPeerName}) deterministic test suite before auditing: implementers submit via submit_review, the runtime routes the card to the SDET first, and only after the SDET verdict is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`,
     )
   }
 
@@ -720,7 +724,7 @@ export async function executeTeamSpawn(
   } else {
     context.push(
       sdetPeerName && !spawnIsSDET
-        ? `1. If your task requires review or peer feedback, pass the baton to the SDET ${sdetPeerName} via team_message(to: '${sdetPeerName}') for the deterministic test suite. If you claimed a task, mark it complete using team_tasks_complete.`
+        ? `1. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' — the runtime routes the card to the SDET ${sdetPeerName} automatically for the deterministic test suite (do NOT message the SDET to hand off). If you claimed a task, mark it complete using team_tasks_complete.`
         : qaPeerName
           ? `1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). If you claimed a task, mark it complete using team_tasks_complete.`
           : `1. If your task requires Quality Gate review or peer feedback, coordinate with the team lead via team_message. If you claimed a task, mark it complete using team_tasks_complete.`,

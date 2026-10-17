@@ -99,9 +99,9 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
     editor.add({
       name: "team_spawn",
       description:
-        "Spawn a new teammate that works in parallel. The teammate starts immediately with the given prompt. " +
+        "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). " +
         "Each teammate gets their own git worktree for file isolation. " +
-        "Teammates work asynchronously and will message you when done. Do not poll for their status. " +
+        "Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. " +
         "Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
       input: {
         type: "object",
@@ -116,8 +116,8 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
           standby: bool("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)", false),
           role: {
             type: "string",
-            description: "Teammate role: 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)",
-            enum: ["qa", "member"],
+            description: "Teammate role: 'sdet' marks the deterministic-test engineer (exclusive per room, persists role='sdet'; also auto-detected for agent 'hugo'), 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)",
+            enum: ["sdet", "qa", "member"],
           },
           is_qa: bool("Explicitly flag this teammate as the Quality Gate reviewer (stored in team_member.is_qa). Omitted = auto-detect (agent 'clara' or base persona 'clara' → QA)", false),
         },
@@ -171,7 +171,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
     editor.add({
       name: "team_tasks_list",
       description:
-        "View the shared team task board. Use this to check task status, not to wait for teammates. Teammates will message you when done.",
+        "View the shared team task board. Use this to check task status, not to wait for teammates. Under silentLead you are not woken for each individual completion — rely on the board and team_results.",
       input: { type: "object", properties: {}, additionalProperties: false },
       execute: runSession(executeTeamTasksList),
     })

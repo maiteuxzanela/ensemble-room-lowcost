@@ -75,11 +75,13 @@ export async function executeTeamMessage(
       content: text,
     })
     log(`team_message:queued from=${senderName} to=${args.to} (recipient not yet spawned)`)
-    // HARNESS-22: the message was durably queued, so a lead-authored send is a
-    // deliberation even against a not-yet-spawned recipient — lift the pause
-    // only now that persistence succeeded.
+    // HARNESS-22 / TICKET-HARNESS-37-M4: the message was durably queued, so a
+    // lead-authored send is a deliberation even against a not-yet-spawned
+    // recipient — lift the pause only now that persistence succeeded, scoped to
+    // the addressed member (`args.to`): answering one waiting member must not
+    // unlock nor silence another member that is also pending.
     if (teamInfo.role === "lead") {
-      clearAwaitingLeadDecision(deps.db, teamInfo.teamId)
+      clearAwaitingLeadDecision(deps.db, teamInfo.teamId, args.to)
     }
     return `Message queued for ${args.to} — they haven't been spawned yet. It will be delivered when they join the team.`
   }
@@ -132,15 +134,18 @@ export async function executeTeamMessage(
     content: messageText,
   })
 
-  // HARNESS-22: a lead-authored message IS the deliberation — it lifts the
-  // pending-decision flag so the room-inactivity watchdog resumes its normal
-  // Clara autoawake (paused while team.awaiting_lead_decision = 1). This must
-  // run ONLY after the message is durably persisted: if any validation above
-  // rejected the call (invalid model, unknown recipient, permission error,
-  // not-in-plan-approval), the flag must survive intact so the paused
-  // watchdog does not mistake a failed send for an actual deliberation.
+  // HARNESS-22 / TICKET-HARNESS-37-M4: a lead-authored message IS the
+  // deliberation — it lifts the pending-decision entry for the ADDRESSED member
+  // (per-member queue), so the room-inactivity watchdog resumes its normal
+  // Clara autoawake only once NO member is left pending. A message addressed to
+  // a member with no pending decision is a general deliberation and clears the
+  // queue (pre-M4 behavior). This must run ONLY after the message is durably
+  // persisted: if any validation above rejected the call (invalid model,
+  // unknown recipient, permission error, not-in-plan-approval), the queue must
+  // survive intact so the paused watchdog does not mistake a failed send for an
+  // actual deliberation.
   if (teamInfo.role === "lead") {
-    clearAwaitingLeadDecision(deps.db, teamInfo.teamId)
+    clearAwaitingLeadDecision(deps.db, teamInfo.teamId, args.to)
   }
 
   const isToLead = args.to === "lead"

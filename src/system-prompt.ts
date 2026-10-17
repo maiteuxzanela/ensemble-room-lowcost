@@ -100,6 +100,12 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
     }
   }
 
+  // M6 (TICKET-HARNESS-37): collect ids and mark them delivered ONLY once the
+  // whole prompt body has been assembled successfully (final flush before the
+  // return). Marking inside the loop loses messages if a later line throws: the
+  // row would be flipped delivered=1 but the prompt never reaches the lead.
+  const deliveredMessageIds: string[] = []
+
   if (pendingMessages.length > 0) {
     lines.push("", "--- Team Messages ---")
     const MAX_MSG = 500
@@ -114,7 +120,7 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
       } else {
         lines.push(`[From ${msg.from_name}]: ${msg.content}`)
       }
-      markDelivered(db, msg.id)
+      deliveredMessageIds.push(msg.id)
     }
     lines.push("--- End Messages ---")
   }
@@ -151,6 +157,29 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
     )
   }
 
+  // M1 (TICKET-HARNESS-37): the async-coordination guidance must match the
+  // silentLead contract. Under silentLead (the default) the lead is NOT woken
+  // for each individual completion — reports are persisted and surfaced on the
+  // board / via team_results. Promising "message you when done" manufactured
+  // false expectations and spurious lead wakes. Legacy silentLead:false keeps
+  // the original wording byte-for-byte.
+  const silentLead = config?.silentLead !== false
+  const coordinationLines = silentLead
+    ? [
+        "Teammates work asynchronously; under silentLead you are NOT woken for each individual completion.",
+        "Progress lives on the shared board and in team_results — do not expect or demand a completion message per member.",
+        "Rest until the board closes (all tasks completed) or a teammate escalates an emergency with decision_lead.",
+        "Do NOT poll team_status or team_tasks_list repeatedly — wait for the board to close or an emergency escalation.",
+        "After spawning all teammates, tell the user what you've set up and wait.",
+        "When the board closes, inspect team_results / team_tasks_list, summarize results, and suggest next steps.",
+      ]
+    : [
+        "Teammates work asynchronously and message you when done.",
+        "Do NOT poll team_status or team_tasks_list repeatedly — wait for messages.",
+        "After spawning all teammates, tell the user what you've set up and wait.",
+        "When all teammates finish, summarize results and suggest next steps.",
+      ]
+
   lines.push(
     "",
     "Spawn teammates ONE AT A TIME. Wait for each tool result before spawning the next.",
@@ -158,10 +187,7 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
     "Read-only agents (explore, plan) automatically skip worktree creation.",
     "For other agents that only need to read, pass worktree: false to avoid unnecessary isolation.",
     "",
-    "Teammates work asynchronously and message you when done.",
-    "Do NOT poll team_status or team_tasks_list repeatedly — wait for messages.",
-    "After spawning all teammates, tell the user what you've set up and wait.",
-    "When all teammates finish, summarize results and suggest next steps.",
+    ...coordinationLines,
     "",
     "MERGE WORKFLOW:",
     "When teammates use isolated worktrees (worktree: true), use team_merge to merge their branch after they finish and you shut them down.",
@@ -180,7 +206,21 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
     "Only if the user selects that exact approval option, call team_cleanup again with the same purge value, confirm_purge: true, and the confirm_token from the preview.",
   )
 
-  return lines.join("\n")
+  const prompt = lines.join("\n")
+
+  // M6 (TICKET-HARNESS-37): flush delivery flags as the LAST step, best-effort.
+  // A flag-write failure must never discard an already-built prompt, and a
+  // failure building any line above must leave the rows pending (delivered=0)
+  // so the recovery sweep re-delivers them instead of losing them silently.
+  for (const id of deliveredMessageIds) {
+    try {
+      markDelivered(db, id)
+    } catch {
+      /* best effort — the row stays pending for the recovery sweep */
+    }
+  }
+
+  return prompt
 }
 
 /**
@@ -210,10 +250,11 @@ export function buildTeammateSystemPrompt(db: Database, teamId: string, memberNa
     "If a genuinely blocking decision requires the lead, escalate with decision_lead instead of a best-effort message.",
   ]
 
-  // HARNESS-23 (TASK-02): SDET-first delivery order, resolved against the LIVE
-  // room membership every turn (spawn-order independent):
-  //   - Implementers with an SDET in the room hand the baton EXCLUSIVELY to the
-  //     SDET after submit_review; the Quality Gate is not a direct peer for them.
+  // HARNESS-23 (TASK-02) + HARNESS-37 (M2): SDET-first delivery order, resolved
+  // against the LIVE room membership every turn (spawn-order independent):
+  //   - Implementers with an SDET in the room just submit their deliverable via
+  //     submit_review; the runtime wakes the SDET automatically (held for
+  //     batching by HARNESS-25). They must NOT hand off via team_message.
   //   - The Quality Gate guardian waits for the SDET's deterministic suite before
   //     auditing — the wake only reaches it after the SDET verdict.
   //   - The SDET itself is reminded never to self-audit (auto-review is banned).
@@ -229,13 +270,13 @@ export function buildTeammateSystemPrompt(db: Database, teamId: string, memberNa
     lines.push(
       "",
       "SDET HANDOVER:",
-      `After submitting a task via submit_review, pass the baton exclusively to the SDET (${roomSdet.name}) via team_message(to: '${roomSdet.name}') for the deterministic test suite. The Quality Gate is NOT a direct peer for you — it only enters after the SDET verdict.`,
+      "When your deliverable is complete, submit it via submit_review — the runtime wakes the SDET automatically for the deterministic test suite (the wake is held until the functional batch is consolidated). Do NOT message the SDET to hand off. The Quality Gate is NOT a direct peer for you — it only enters after the SDET verdict.",
     )
   } else if (roomSdet) {
     lines.push(
       "",
       "QUALITY GATE ORDER:",
-      `Wait for the SDET's (${roomSdet.name}) deterministic test suite before auditing: implementers pass the baton to the SDET after submit_review, and only then is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`,
+      `Wait for the SDET's (${roomSdet.name}) deterministic test suite before auditing: implementers submit via submit_review, the runtime routes the card to the SDET first, and only after the SDET verdict is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`,
     )
   }
 
@@ -245,24 +286,46 @@ export function buildTeammateSystemPrompt(db: Database, teamId: string, memberNa
     "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND (to_name = ? OR to_name IS NULL) AND delivered = 0 ORDER BY time_created ASC"
   ).all(teamId, memberName) as Array<{ id: string; from_name: string; content: string }>
 
+  // M6 (TICKET-HARNESS-37): ids are marked delivered only after the whole prompt
+  // body is assembled (final flush below), so a failure never silently loses a
+  // pending message.
+  const deliveredMessageIds: string[] = []
+
   if (pendingMessages.length > 0) {
     lines.push("", "--- Messages for you ---")
     const MAX_MSG = 500
     for (const msg of pendingMessages) {
       const parsed = parseTaskResult(msg.content)
       if (parsed) {
-        lines.push(formatTaskResult(msg.from_name, { ...parsed, details: truncate(parsed.details, MAX_MSG) }))
+        const truncatedDetails = truncate(parsed.details, MAX_MSG)
+        const body = formatTaskResult(msg.from_name, { ...parsed, details: truncatedDetails })
+        // M6 (TICKET-HARNESS-37): when the structured details were truncated,
+        // point at team_results canonically for the full content.
+        lines.push(truncatedDetails.length > MAX_MSG ? `${body}\n  (use team_results to read the full message)` : body)
       } else if (msg.content.length > MAX_MSG) {
-        lines.push(`[From ${msg.from_name}]: ${msg.content.slice(0, MAX_MSG)}... (truncated)`)
+        lines.push(`[From ${msg.from_name}]: ${msg.content.slice(0, MAX_MSG)}... (truncated — use team_results to read the full message)`)
       } else {
         lines.push(`[From ${msg.from_name}]: ${msg.content}`)
       }
-      markDelivered(db, msg.id)
+      deliveredMessageIds.push(msg.id)
     }
     lines.push("--- End Messages ---")
   }
 
-  return lines.join("\n")
+  const prompt = lines.join("\n")
+
+  // M6 (TICKET-HARNESS-37): flush delivery flags as the LAST step, best-effort —
+  // see the lead prompt above. Rows stay pending (delivered=0) if assembly fails,
+  // so the recovery sweep re-delivers them instead of losing them silently.
+  for (const id of deliveredMessageIds) {
+    try {
+      markDelivered(db, id)
+    } catch {
+      /* best effort — the row stays pending for the recovery sweep */
+    }
+  }
+
+  return prompt
 }
 
 /**
