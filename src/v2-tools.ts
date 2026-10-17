@@ -11,7 +11,6 @@ import { executeTeamStandby } from "./tools/team-standby"
 import { executeTeamTaskHandover } from "./tools/team-task-handover"
 import { executeTeamResults } from "./tools/team-results"
 import { executeTeamShutdown } from "./tools/team-shutdown"
-import { executeTeamCleanup } from "./tools/team-cleanup"
 import { executeTeamMerge } from "./tools/team-merge"
 import { executeTeamStatus } from "./tools/team-status"
 import { executeTeamView } from "./tools/team-view"
@@ -308,14 +307,24 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
     editor.add({
       name: "team_shutdown",
       description:
-        "Request a teammate to shut down. The teammate finishes current work then stops. Pass force: true to abort immediately without waiting.",
+        "Shut down the team lifecycle. Pass a specific member name to stop that teammate (legacy). " +
+        "Omit member — or pass '*'/'all' — to shut down and abort every active/standby teammate in parallel AND run the full room cleanup " +
+        "(merge safety net, worktree/workspace teardown, archive) in a single call. " +
+        "Pass force: true to abort immediately without waiting. Use purge for archived-team administration.",
       input: {
         type: "object",
         properties: {
-          member: str("Teammate name to shut down"),
+          member: str("Teammate name to shut down. Omit — or pass '*'/'all' — to shut down and clean up the entire team."),
           force: bool("Force immediate abort without waiting for current work to finish", false),
+          acknowledge_uncommitted: bool("Acknowledge uncommitted worktree changes and proceed with full-team shutdown/cleanup", false),
+          purge: {
+            type: "array",
+            items: { type: "string" },
+            description: "Archived team names to permanently delete, or ['*'] for all archived teams.",
+          },
+          confirm_purge: bool("Set true only after the user explicitly approves the purge preview.", false),
+          confirm_token: str("Confirmation token from the purge preview."),
         },
-        required: ["member"],
         additionalProperties: false,
       },
       execute: run(executeTeamShutdown),
@@ -324,11 +333,11 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
     editor.add({
       name: "team_cleanup",
       description:
-        "Clean up the current team, or purge archived teams after human approval. Omit purge for normal cleanup.",
+        "Deprecated alias of team_shutdown. Cleans up the current team (shutting down any active members), or purges archived teams after human approval. Delegates to the unified team_shutdown routine. Omit purge for normal cleanup.",
       input: {
         type: "object",
         properties: {
-          force: bool("Force cleanup even if members are active (will abort them)", false),
+          force: bool("Force immediate abort of active members", false),
           acknowledge_uncommitted: bool("Acknowledge uncommitted changes", false),
           purge: {
             type: "array",
@@ -348,9 +357,12 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
           confirm_purge?: boolean
           confirm_token?: string
         }
-        const content = await executeTeamCleanup(
+        // Alias: wildcard member routes team_shutdown through the whole-room
+        // cleanup (or the purge path when purge is set).
+        const content = await executeTeamShutdown(
           deps,
           {
+            member: "*",
             force: args.force ?? false,
             acknowledge_uncommitted: args.acknowledge_uncommitted,
             purge: args.purge,

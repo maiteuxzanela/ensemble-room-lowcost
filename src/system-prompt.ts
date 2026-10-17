@@ -194,16 +194,17 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
     "In shared workspace mode (worktree: false), all teammates work in the same checkout directly — no branch merging is needed.",
     "Do NOT tell teammates to commit — in isolated worktrees they handle that themselves, and in shared workspaces commits follow the quality gate / delivery workflow.",
     "Do NOT run git merge manually — use team_merge which squash-merges and unstages for you.",
-    "team_cleanup will safety-net merge any branches you forgot, but prefer explicit team_merge.",
+    "A full-team team_shutdown will safety-net merge any branches you forgot, but prefer explicit team_merge.",
     "",
-    "Before calling team_cleanup, verify teammates using isolated worktrees have committed their work.",
-    "team_shutdown will warn you if a teammate has uncommitted changes in their worktree.",
-    "team_cleanup will block if any worktree has uncommitted changes — merge or commit first.",
-    "To permanently delete archived teams, call team_cleanup with purge: [\"team-name\"] or purge: [\"*\"] for all archived teams.",
+    "team_shutdown is the canonical lifecycle contact: pass a member name to stop one teammate, or omit it (or pass member: '*') to shut down EVERY active teammate in parallel and clean up the whole room (merge safety net, worktree teardown, archive) in one call.",
+    "team_cleanup is a deprecated alias that delegates to the same unified routine — new flows should call team_shutdown.",
+    "team_shutdown will warn you if a teammate has uncommitted changes in their worktree; pass acknowledge_uncommitted: true once you have merged/committed to proceed.",
+    "A full-team team_shutdown blocks if any worktree has uncommitted changes — merge or commit first.",
+    "To permanently delete archived teams, call team_shutdown (or the team_cleanup alias) with purge: [\"team-name\"] or purge: [\"*\"] for all archived teams.",
     "The first purge call is preview-only and deletes nothing.",
     "Use the question tool to ask the user for visible human approval before deleting archived team records or preserved Ensemble branches.",
     "The question must include the exact approval and denial option labels shown in the preview.",
-    "Only if the user selects that exact approval option, call team_cleanup again with the same purge value, confirm_purge: true, and the confirm_token from the preview.",
+    "Only if the user selects that exact approval option, call again with the same purge value, confirm_purge: true, and the confirm_token from the preview.",
   )
 
   // HARNESS-48 — Sequential bench partnership (intra-card handover). Parallelism

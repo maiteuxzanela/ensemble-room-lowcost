@@ -625,10 +625,16 @@ check(
 const MUTATIONS = [
   {
     id: "M1",
-    desc: "descoberta de repo aninhado desabilitada (só o room comita)",
-    from: "for (const nested of findNestedRepoRoots(dir, NESTED_REPO_SCAN_DEPTH)) {",
-    to: "for (const nested of []) {",
-    detect: ["MR1.suffix-lists-two-repos", "MR1.two-distinct-hashes", "MR1.nested-head-in-suffix", "MR1.nested-advances-one-commit", "MR1.nested-tree-clean", "MR1.nested-message-exact", "MR1.room-tree-clean"],
+    desc: "descoberta de repos (aninhado + derivado do ledger) desabilitada (só o room comita)",
+    // HARNESS-48 tornou a descoberta de aninhados REDUNDANTE com a descoberta
+    // derivada do ledger (todo arquivo aninhado no ledger resolve o toplevel do
+    // próprio aninhado). Um mutante neutral de um único patch deixaria de ser
+    // detectado; o mutante honesto desabilita AMBAS as descobertas.
+    patches: [
+      ["for (const nested of findNestedRepoRoots(dir, NESTED_REPO_SCAN_DEPTH)) {", "for (const nested of []) {"],
+      ["for (const rawPath of ledger) {", "for (const rawPath of []) {"],
+    ],
+    detect: ["MR1.suffix-lists-two-repos", "MR1.two-distinct-hashes", "MR1.nested-head-in-suffix", "MR1.nested-advances-one-commit", "MR1.nested-tree-clean", "MR1.nested-message-exact"],
     unaffected: ["MR1.room-message-exact", "SP4.status-stays-in-review", "SP4.notes-recorded"],
   },
   {
@@ -711,12 +717,20 @@ for (const m of MUTATIONS) {
   for (const n of [...m.detect, ...m.unaffected]) {
     check(`${m.id}: sentinela "${n}" existe nos checks reais`, realFlow.has(n), "");
   }
-  const occurrences = countOcc(distRaw, m.from);
-  check(`${m.id}: patch aplicável (1 ocorrência exata no dist)`, occurrences === 1, `ocorrências=${occurrences}`);
-  if (occurrences !== 1) continue;
+  // Mutante pode ser multi-patch (m.patches) ou single-patch legado (m.from/m.to).
+  const patches = m.patches ?? [[m.from, m.to]];
+  let mutatedRaw = distRaw;
+  let patchOk = true;
+  for (const [from, to] of patches) {
+    const occurrences = countOcc(distRaw, from);
+    check(`${m.id}: patch aplicável (1 ocorrência exata no dist)`, occurrences === 1, `ocorrências=${occurrences} :: ${from.slice(0, 48)}`);
+    if (occurrences !== 1) { patchOk = false; break; }
+    mutatedRaw = mutatedRaw.split(from).join(to);
+  }
+  if (!patchOk) continue;
 
   const mutantFile = path.join(TMP, `_mr_sdet_${m.id.toLowerCase()}.mjs`);
-  writeFileSync(mutantFile, buildHarnessCode(distRaw.split(m.from).join(m.to)));
+  writeFileSync(mutantFile, buildHarnessCode(mutatedRaw));
 
   let mutantFlow;
   try {

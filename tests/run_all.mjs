@@ -64,6 +64,8 @@ const SUITES = [
   { file: "test_ticket_harness_36.mjs", label: "HARNESS-36 (A3/A7 unificação de Watchdogs V1/V2 + P3 anti-amnésia recovery/wake-peer + P4 releaseMemberTasks + P5 revert de standby no spawn + P6 resolveAgentForSession só times active + P7 decision_lead no spawn_context; prova de mutação)" },
   { file: "test_ticket_harness_37.mjs", label: "HARNESS-37 (M1 prompts/nudges silentLead + M2 sem handoff manual ao SDET + M3 role SDET V1/V2 + M4 fila por membro decision_lead + M5 cleanup shutdown por team_id + M6 resiliência de mensagens + M7 auto-commit antes do wake + M8 review_notes concatenadas; git real + prova de mutação)" },
   { file: "test_ticket_harness_48_handover.mjs", label: "HARNESS-48 (Handover Intra-Card team_task_handover: reatribuição atômica + notas, wake do receptor com persona/spawn_context, standby do transmissor, fail-fast sem side effects, lead soberano, paridade V1↔V2 + allowlist + Parceria de Bancada; prova de mutação)" },
+  { file: "test_ticket_harness_48_ledger_discovery.mjs", label: "HARNESS-48/Frente 1 (Auto-commit universal via ledger: repo fora da árvore da sala, multi-mount, diretório não-git, repo já-limpo + prova de mutação)" },
+  { file: "test_ticket_harness_49_lifecycle.mjs", label: "HARNESS-49/Frente 2 (Ciclo de vida unificado: team_shutdown wildcard/omisso/'*'/'all' paralelo, retrocompat single-member, guarda de uncommitted, alias team_cleanup + prova de mutação)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

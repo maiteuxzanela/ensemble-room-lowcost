@@ -46,8 +46,10 @@
  *   AC5  Lead completa card in_review (ledger populado) → hook dispara.
  *   AC6  Diretório não-repo com ledger populado → sem throw, board completa,
  *        sem sufixo (sem candidato a repo → nada a comitar).
- *   AC7  Caminho aninhado dentro de um repo maior SUJO com ledger apontando
- *        para o repo pai → guarda de toplevel pula, HEAD do pai intacto.
+ *   AC7  Sala rodando de um subdiretório NÃO-repo dentro de um repo maior SUJO,
+ *        com o ledger apontando para o repo pai. HARNESS-48: a descoberta
+ *        derivada do ledger resolve o toplevel e comita CIRURGICAMENTE só o
+ *        arquivo registrado (HEAD do pai avança 1, árvore fica limpa).
  *   AC8  git commit falha (sem identidade user.email/user.name) → sem throw,
  *        board completa, sem sufixo (fail-graceful).
  *   AC9  Injeção de shell no task.content (`$(...)`, backticks, aspas, `&`) →
@@ -332,7 +334,7 @@ async function runBehavior(mod) {
     env.cleanup();
   }
 
-  // ============ AC7: caminho aninhado em repo maior SUJO → pulado ==========
+  // ====== AC7: sala em subdir não-repo + repo pai no ledger (HARNESS-48) ======
   {
     const env = newEnv(mod, (base) => {
       const outer = path.join(base, "outer");
@@ -352,17 +354,19 @@ async function runBehavior(mod) {
     seedTeam(env.db, "ac7", "ses_lead_ac7");
     addMember(env.db, env.registry, "ac7", "clara", "ses_clara_ac7", "clara", { isQa: 1 });
     addTask(env.db, "ac7", "T7", "tales", "in_review", "Feat nested dir");
-    // Ledger aponta para o repo PAI (onde o arquivo sujo vive): mesmo assim a
-    // guarda de toplevel deve segurar — dir interno não É o toplevel do repo.
+    // Ledger aponta para o repo PAI: HARNESS-48 resolve o toplevel pelo ledger
+    // (o dir interno não É o toplevel) e comita SÓ o arquivo registrado.
     mod.recordModifiedFile(env.db, "ac7", path.join(outer, "outer-dirty.txt"));
     const outerBefore = headHash(outer);
     const outerCountBefore = headCount(outer);
     const { res, err } = await env.doComplete("ses_clara_ac7", { task_id: "T7", action: "complete" });
+    const names = git(outer, ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]).out.split("\n").filter(Boolean).sort();
     R("AC7.no-error", err === null, err);
     R("AC7.board-completed", taskStatus(env.db, "T7") === "completed");
-    R("AC7.no-commit-suffix", !/locally committed|already clean/.test(res), res);
-    R("AC7.parent-head-unchanged", headHash(outer) === outerBefore && headCount(outer) === outerCountBefore, `${outerCountBefore}->${headCount(outer)}`);
-    R("AC7.parent-still-dirty", git(outer, ["status", "--porcelain"]).out !== "");
+    R("AC7.ledger-derived-commit", /Task completed and locally committed: outer \([0-9a-f]{7,}\)/.test(res), res);
+    R("AC7.parent-head-advances-one", headHash(outer) !== outerBefore && headCount(outer) === outerCountBefore + 1, `${outerCountBefore}->${headCount(outer)}`);
+    R("AC7.parent-tree-clean", git(outer, ["status", "--porcelain"]).out === "", `status="${git(outer, ["status", "--porcelain"]).out}"`);
+    R("AC7.commit-file-set", names.length === 1 && names[0] === "outer-dirty.txt", `names=${names.join(",")}`);
     env.cleanup();
   }
 
@@ -641,10 +645,13 @@ const MUTATIONS = [
   },
   {
     id: "M4",
-    desc: "guarda de toplevel removida (passa a comitar a árvore de terceiros)",
-    from: "if (primary && primary === normalizeDir(dir)) {",
-    to: "if (primary) {",
-    detect: ["AC7.no-commit-suffix", "AC7.parent-head-unchanged", "AC7.parent-still-dirty"],
+    desc: "descoberta derivada do ledger desabilitada (repo pai fora da árvore não comita)",
+    // A guarda de toplevel do caminho 1 ficou NÃO-observável após o HARNESS-48:
+    // qualquer repo cujo arquivo esteja no ledger é redescoberto por este loop,
+    // então o mutante honesto para AC7 é desabilitar a própria descoberta.
+    from: "for (const rawPath of ledger) {",
+    to: "for (const rawPath of []) {",
+    detect: ["AC7.ledger-derived-commit", "AC7.parent-head-advances-one", "AC7.parent-tree-clean", "AC7.commit-file-set"],
     unaffected: ["AC1.commit-message-exact", "AC6.no-commit-suffix", "AC3.throw-unauthorized"],
   },
   {

@@ -23,6 +23,11 @@ export { executeTeamStandby, setMemberStandby } from "./tools/team-standby"
 export { executeTeamClaim, claimTask } from "./tools/team-claim"
 // HARNESS-48 — intra-card cooperative handover (Parceria de Bancada Sequencial).
 export { executeTeamTaskHandover } from "./tools/team-task-handover"
+// HARNESS-49 — unified lifecycle: team_shutdown (single member or whole room)
+// absorbs team_cleanup. Both are exported so the deterministic suites can drive
+// the real routines against an isolated SQLite database.
+export { executeTeamShutdown }
+export { executeTeamCleanup } from "./tools/team-cleanup"
 // HARNESS-22 — emergency lead-decision escalation + the pending-decision helpers
 // (mark/clear/has) the watchdog and message paths share.
 export { executeDecisionLead, markAwaitingLeadDecision, clearAwaitingLeadDecision, hasAwaitingLeadDecision } from "./tools/decision-lead"
@@ -49,7 +54,6 @@ import { executeTeamSpawn } from "./tools/team-spawn"
 import { executeTeamMessage } from "./tools/team-message"
 import { executeTeamBroadcast } from "./tools/team-broadcast"
 import { executeTeamShutdown } from "./tools/team-shutdown"
-import { executeTeamCleanup } from "./tools/team-cleanup"
 import { executeTeamMerge } from "./tools/team-merge"
 import { executeTeamTasksList } from "./tools/team-tasks-list"
 import { executeTeamTasksAdd } from "./tools/team-tasks-add"
@@ -759,15 +763,21 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_shutdown: tool({
-        description: "Request a teammate to shut down. The teammate finishes current work then stops. " +
-          "Pass force: true to abort immediately without waiting.",
+        description: "Shut down the team lifecycle. Pass a specific member name to stop that teammate (legacy behavior). " +
+          "Omit member — or pass '*'/'all' — to shut down and abort EVERY active/standby teammate in parallel AND run the full room cleanup " +
+          "(merge safety net, worktree/workspace teardown, archive) in a single call. " +
+          "Pass force: true to abort immediately without waiting. Use purge for archived-team administration.",
         args: {
-          member: tool.schema.string().describe("Teammate name to shut down"),
+          member: tool.schema.string().optional().describe("Teammate name to shut down. Omit — or pass '*'/'all' — to shut down and clean up the entire team."),
           force: tool.schema.boolean().default(false).describe("Force immediate abort without waiting for current work to finish"),
+          acknowledge_uncommitted: tool.schema.boolean().default(false).describe("Acknowledge uncommitted worktree changes and proceed with full-team shutdown/cleanup"),
+          purge: tool.schema.array(tool.schema.string()).optional().describe("Archived team names to permanently delete, or ['*'] for all archived teams. Requires human approval."),
+          confirm_purge: tool.schema.boolean().default(false).describe("Set true only after the user explicitly selects the exact approval option from the purge preview via the question tool."),
+          confirm_token: tool.schema.string().optional().describe("Confirmation token from the purge preview. Valid only after the matching exact approval answer is selected in this session."),
         },
         async execute(args, ctx) {
-          const result = await executeTeamShutdown(deps, args, ctx.sessionID)
-          // Clean up progress tracking for the shut-down member.
+          const result = await executeTeamShutdown(deps, args, ctx.sessionID, undefined, undefined, undefined, undefined, undefined, config.mergeOnCleanup)
+          // Clean up progress tracking for the shut-down member(s).
           // M5 (TICKET-HARNESS-37): scope the lookup to the CALLER's team. A bare
           // `name = ?` matched same-named members in OTHER active teams, so the
           // cleanup could evict the wrong session's tracker/buffer while the real
@@ -775,60 +785,65 @@ const plugin: Plugin = async (input) => {
           // current session via findTeamBySession.
           const callerTeam = findTeamBySession(db, registry, ctx.sessionID)
           if (callerTeam) {
-            const member = deps.db.query(
-              "SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status IN ('shutdown', 'shutdown_requested')"
-            ).get(callerTeam.teamId, args.member) as { session_id: string } | null
-            if (member) {
-              progressTracker.remove(member.session_id)
-              activityBuffer.remove(member.session_id)
+            const memberArg = args.member?.trim()
+            const wildcard = !memberArg || memberArg === "*" || memberArg.toLowerCase() === "all"
+            if (wildcard) {
+              const sessions = deps.db.query("SELECT session_id FROM team_member WHERE team_id = ?")
+                .all(callerTeam.teamId) as Array<{ session_id: string }>
+              for (const s of sessions) {
+                progressTracker.remove(s.session_id)
+                activityBuffer.remove(s.session_id)
+              }
+            } else {
+              const member = deps.db.query(
+                "SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status IN ('shutdown', 'shutdown_requested')"
+              ).get(callerTeam.teamId, memberArg) as { session_id: string } | null
+              if (member) {
+                progressTracker.remove(member.session_id)
+                activityBuffer.remove(member.session_id)
+              }
             }
           }
           const hasWarning = result.includes("uncommitted")
-          ctx.metadata({ title: hasWarning ? `${args.member} shut down — uncommitted changes` : `${args.member} shut down` })
+          const wildcard = !args.member?.trim() || args.member.trim() === "*" || args.member.trim().toLowerCase() === "all"
+          ctx.metadata({
+            title: hasWarning
+              ? "Shutdown blocked — uncommitted changes"
+              : wildcard ? "Team shut down and cleaned up" : `${args.member} shut down`,
+          })
           return result
         },
       }),
 
       team_cleanup: tool({
-        description: "Clean up the current team, or purge archived teams after human approval. " +
+        description: "Deprecated alias of team_shutdown. Cleans up the current team (shutting down any active members), " +
+          "or purges archived teams after human approval. Delegates to the unified team_shutdown routine. " +
           "Omit purge for normal cleanup. Pass purge with archived team names, or ['*'] for all archived teams. " +
           "First purge call returns a preview, exact approval and denial options, and confirmation token only. " +
-          "Archived worktree/workspace references and stale Ensemble-owned branches are shown in the preview and cleaned during confirmed purge. " +
           "Use the question tool with those exact options, then call again with confirm_purge: true and confirm_token only if the user selected the exact approval option.",
         args: {
-          force: tool.schema.boolean().default(false).describe("Force cleanup even if members are active (will abort them)"),
+          force: tool.schema.boolean().default(false).describe("Force immediate abort of active members"),
           acknowledge_uncommitted: tool.schema.boolean().default(false),
           purge: tool.schema.array(tool.schema.string()).optional().describe("Archived team names to permanently delete, or ['*'] for all archived teams. Requires human approval."),
           confirm_purge: tool.schema.boolean().default(false).describe("Set true only after the user explicitly selects the exact approval option from the purge preview via the question tool."),
           confirm_token: tool.schema.string().optional().describe("Confirmation token from the purge preview. Valid only after the matching exact approval answer is selected in this session."),
         },
         async execute(args, ctx) {
-          const approvePurge = args.purge && args.purge.length > 0 && args.confirm_purge
-            ? async (preview: string) => {
-              await ctx.ask({
-                permission: "team_cleanup.purge",
-                patterns: args.purge ?? [],
-                always: [],
-                metadata: {
-                  title: "Purge archived teams",
-                  preview,
-                },
-              })
-            }
-            : undefined
           // Collect member session IDs before cleanup so we can clean up activity buffers after
           const teamInfoForCleanup = findTeamBySession(db, registry, ctx.sessionID)
           const memberSessions = teamInfoForCleanup
             ? (db.query("SELECT session_id FROM team_member WHERE team_id = ?").all(teamInfoForCleanup.teamId) as Array<{ session_id: string }>).map(m => m.session_id)
             : []
-          const result = await executeTeamCleanup(deps, args, ctx.sessionID, undefined, undefined, undefined, config.mergeOnCleanup, undefined, approvePurge)
+          // Alias: delegate to the unified lifecycle routine. Wildcard member makes
+          // team_shutdown run the whole-room cleanup (or the purge path when purge is set).
+          const result = await executeTeamShutdown(deps, { ...args, member: "*" }, ctx.sessionID, undefined, undefined, undefined, undefined, undefined, config.mergeOnCleanup)
           // Clean up activity buffers for team members after successful cleanup
           if (!result.includes("uncommitted") && !args.purge) {
             for (const sid of memberSessions) activityBuffer.remove(sid)
           }
           const blocked = result.includes("uncommitted")
           const title = args.purge
-            ? result.startsWith("No archived teams") ? "No archived teams to purge" : result.startsWith("Purge preview") ? "Purge confirmation required" : "Archived teams purged"
+            ? result.startsWith("No archived teams") ? "No archived teams to purge" : result.startsWith("Purge") ? "Purge confirmation required" : "Archived teams purged"
             : blocked ? "Cleanup blocked — uncommitted changes" : "Team cleaned up"
           ctx.metadata({ title })
           return result

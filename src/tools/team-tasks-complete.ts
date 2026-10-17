@@ -582,7 +582,7 @@ function extraRepoRoots(): string[] {
  * produces candidates; the ledger gate lives in `resolveCommitTargets`, which
  * keeps a repo only when the room actually touched files under it.
  */
-async function discoverCandidateRepos(dir: string): Promise<string[]> {
+async function discoverCandidateRepos(dir: string, ledger: string[] = []): Promise<string[]> {
   const candidates: string[] = []
   const seen = new Set<string>()
   const add = (rawPath: string) => {
@@ -614,6 +614,23 @@ async function discoverCandidateRepos(dir: string): Promise<string[]> {
   // 4) Explicit overrides — force-candidates regardless of layout.
   for (const extra of extraRepoRoots()) {
     if (extra !== normalizeDir(dir) && isRepoRoot(extra)) add(extra)
+  }
+
+  // 5) TICKET-HARNESS-48 — ledger-derived repositories. A room that runs from a
+  //    mount point (ex: /mnt/...) but touches files on a different mount (ex:
+  //    /home/...) has those repos neither nested nor siblings of the room dir,
+  //    so they were silently dropped. Resolve the git toplevel of every
+  //    room-touched file path and add it as a candidate; `resolveCommitTargets`
+  //    still applies the ledger gate (a repo with no owned file commits nothing).
+  for (const rawPath of ledger) {
+    const abs = normalizeModifiedPath(rawPath)
+    if (abs === "") continue
+    try {
+      const top = await gitToplevel(path.dirname(abs))
+      if (top) add(top)
+    } catch {
+      // Non-git path or transient failure — ignore, other candidates still apply.
+    }
   }
 
   return candidates
@@ -664,7 +681,7 @@ async function autoCommitApprovedTask(deps: ToolDeps, teamId: string, taskConten
     const ledger = listModifiedFiles(deps.db, teamId)
     if (ledger.length === 0) return ""
 
-    const candidates = await discoverCandidateRepos(dir)
+    const candidates = await discoverCandidateRepos(dir, ledger)
     const targets = resolveCommitTargets(candidates, ledger)
     if (targets.length === 0) return ""
 
