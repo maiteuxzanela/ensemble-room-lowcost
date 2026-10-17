@@ -58,6 +58,7 @@ import { executeTeamResults } from "./tools/team-results"
 import { executeTeamStatus } from "./tools/team-status"
 import { executeTeamView } from "./tools/team-view"
 import { executeDecisionLead } from "./tools/decision-lead"
+import { resolveStandbyWake } from "./tools/shared"
 import type { ToolDeps, } from "./types"
 import { TokenBucket } from "./rate-limit"
 import { Watchdog } from "./watchdog"
@@ -174,25 +175,35 @@ const plugin: Plugin = async (input) => {
     refillIntervalMs: DEFAULT_RATE_LIMIT_INTERVAL_MS,
   })
 
-  // Initialize watchdog — config value already accounts for env var override
-  const watchdog = new Watchdog({
-    db, client, registry,
-    ttlMs: config.timeoutMs,
-    checkIntervalMs: DEFAULT_WATCHDOG_CHECK_MS,
-    progressTracker,
-    stallThresholdMs: config.stallThresholdMs,
-    stallMinSteps: config.stallMinSteps,
-    stallTokenThreshold: config.stallTokenThreshold,
-    cwd: input.directory,
-    peerMessageLimit: config.peerMessageLimit,
-    peerMessageWindowMs: config.peerMessageWindowMs,
-    roomInactivityThresholdMs: config.roomInactivityThresholdMs,
-    roomInactivityCheckMs: config.roomInactivityCheckMs,
-    // F2: thread config so watchdog notifyLead wakes use the model-aware
-    // ladder (agent + fallback chain step-down) instead of a modelless wake.
-    config,
-  })
-  watchdog.start()
+  // Initialize watchdog — config value already accounts for env var override.
+  // TICKET-HARNESS-36 (A3): the Watchdog is created and started ONLY on the main
+  // project instance. Teammate worktree instances share the same global SQLite
+  // database; a concurrent watchdog there would run duplicate TTL/stall/chatty
+  // sweeps against the same rows (double aborts, double board releases). The
+  // same isWorktreeInstance guard already skips recovery/dashboard above.
+  let watchdog: Watchdog | undefined
+  if (!isWorktreeInstance(input.directory)) {
+    watchdog = new Watchdog({
+      db, client, registry,
+      ttlMs: config.timeoutMs,
+      checkIntervalMs: DEFAULT_WATCHDOG_CHECK_MS,
+      progressTracker,
+      stallThresholdMs: config.stallThresholdMs,
+      stallMinSteps: config.stallMinSteps,
+      stallTokenThreshold: config.stallTokenThreshold,
+      cwd: input.directory,
+      peerMessageLimit: config.peerMessageLimit,
+      peerMessageWindowMs: config.peerMessageWindowMs,
+      roomInactivityThresholdMs: config.roomInactivityThresholdMs,
+      roomInactivityCheckMs: config.roomInactivityCheckMs,
+      // F2: thread config so watchdog notifyLead wakes use the model-aware
+      // ladder (agent + fallback chain step-down) instead of a modelless wake.
+      config,
+    })
+    watchdog.start()
+  } else {
+    log(`init:skip-watchdog (worktree instance: ${input.directory})`)
+  }
 
   return {
     // Event hook — drives state machine transitions + descendant tracking + toasts
@@ -443,9 +454,15 @@ const plugin: Plugin = async (input) => {
               // SOBRESCREVER session.agent, sequestrando a persona do membro.
               // Fonte: team_member.agent; sessão do lead → team.lead_agent.
               const peerAgent = sessionID === member.lead_session_id ? member.lead_agent : member.member_agent
+              // TICKET-HARNESS-36 (P3): a peer wake must be able to revive a
+              // member that is in standby WITHOUT amnesia. resolveStandbyWake
+              // prepends the member's spawn_context and flips execution_status
+              // 'standby' -> 'starting'. For a non-standby member it is a
+              // byte-identical pass-through, so the explicit agent below still
+              // re-asserts the member's persona (HARNESS-17).
               client.session.promptAsync({
                 sessionID,
-                parts: [{ type: "text", text: `[System: ${peerMsgs.c} new message(s) from teammates]` }],
+                parts: [{ type: "text", text: resolveStandbyWake(db, member.team_id, member.name, `[System: ${peerMsgs.c} new message(s) from teammates]`).text }],
                 ...(peerAgent ? { agent: peerAgent } : {}),
                 ...(peerModel ? { model: peerModel } : {}),
               }).catch((err) => {

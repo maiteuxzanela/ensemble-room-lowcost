@@ -1226,11 +1226,15 @@ function notifyLead(client, db, teamId, content, options) {
 
 // src/tasks.ts
 function releaseMemberTasks(db, teamId, memberName) {
-  const result = db.run(
-    "UPDATE team_task SET status = 'pending', assignee = NULL, time_updated = ? WHERE team_id = ? AND assignee = ? AND status = 'in_progress'",
+  const released = db.run(
+    "UPDATE team_task SET status = 'pending', assignee = NULL, time_updated = ? WHERE team_id = ? AND assignee = ? AND status IN ('in_progress', 'in_review')",
     [Date.now(), teamId, memberName]
   );
-  return result.changes;
+  const unassigned = db.run(
+    "UPDATE team_task SET assignee = NULL, time_updated = ? WHERE team_id = ? AND assignee = ? AND status = 'blocked'",
+    [Date.now(), teamId, memberName]
+  );
+  return released.changes + unassigned.changes;
 }
 
 // src/types.ts
@@ -1837,9 +1841,14 @@ function getMemberModel(db, teamId, memberName) {
 }
 function resolveAgentForSession(db, sessionID) {
   if (!sessionID) return void 0;
-  const member = db.query("SELECT agent FROM team_member WHERE session_id = ?").get(sessionID);
+  const member = db.query(
+    `SELECT tm.agent AS agent
+     FROM team_member tm
+     JOIN team t ON tm.team_id = t.id
+     WHERE tm.session_id = ? AND t.status = 'active'`
+  ).get(sessionID);
   if (member?.agent) return member.agent;
-  const lead = db.query("SELECT lead_agent FROM team WHERE lead_session_id = ?").get(sessionID);
+  const lead = db.query("SELECT lead_agent FROM team WHERE lead_session_id = ? AND status = 'active'").get(sessionID);
   if (lead) return lead.lead_agent ?? "dante";
   return void 0;
 }
@@ -1983,6 +1992,88 @@ function createV2Client(ctx, deps = {}) {
   };
 }
 
+// src/tools/shared.ts
+init_process();
+init_log();
+function resolveStandbyWake(db, teamId, memberName, baseText) {
+  const row = db.query(
+    "SELECT agent, execution_status, spawn_context FROM team_member WHERE team_id = ? AND name = ?"
+  ).get(teamId, memberName);
+  if (!row || row.execution_status !== "standby") {
+    return { text: baseText, woke: false };
+  }
+  const result = db.run(
+    "UPDATE team_member SET execution_status = 'starting', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'standby'",
+    [Date.now(), teamId, memberName]
+  );
+  if (!result.changes) {
+    log(`standby:wake:lost-race member=${memberName} team=${teamId} \u2014 delivering without prepend`);
+    return { text: baseText, woke: false };
+  }
+  const context = row.spawn_context?.trim();
+  log(`standby:wake member=${memberName} team=${teamId} context=${context ? `${context.length} chars` : "none"} runtime=${!context}`);
+  return {
+    text: context ? `${context}
+
+${baseText}` : baseText,
+    woke: true,
+    agent: row.agent
+  };
+}
+async function countBranchCommits(branch, cwd) {
+  try {
+    const result = await runCommand(["git", "rev-list", "--count", `HEAD..${branch}`], { cwd });
+    if (result.exitCode !== 0) return -1;
+    const n = Number.parseInt(result.stdout.trim(), 10);
+    return Number.isNaN(n) ? -1 : n;
+  } catch {
+    return -1;
+  }
+}
+async function checkWorktreeDirty(dir) {
+  try {
+    const result = await runCommand(["git", "-C", dir, "status", "--porcelain"]);
+    if (result.exitCode !== 0) return false;
+    return result.stdout.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+function requireLead(deps, sessionId) {
+  const teamInfo = findTeamBySession(deps.db, deps.registry, sessionId);
+  if (!teamInfo) throw new Error("This session is not in a team. Use team_create first.");
+  if (teamInfo.role !== "lead") throw new Error("Only the team lead can use this tool.");
+  return { teamId: teamInfo.teamId, teamName: teamInfo.teamName };
+}
+function requireTeamMember(deps, sessionId) {
+  const teamInfo = findTeamBySession(deps.db, deps.registry, sessionId);
+  if (!teamInfo) throw new Error("This session is not in a team.");
+  return teamInfo;
+}
+function requireCanPurgeArchivedTeams(deps, sessionId) {
+  const activeMembers = deps.db.query(
+    `SELECT tm.session_id
+     FROM team_member tm
+     JOIN team t ON tm.team_id = t.id
+     WHERE t.status = 'active'`
+  ).all();
+  if (activeMembers.some((member) => member.session_id === sessionId)) {
+    throw new Error("Team members cannot purge archived teams");
+  }
+  const activeLeads = deps.db.query("SELECT lead_session_id FROM team WHERE status = 'active'").all();
+  if (deps.tracker.getParent(sessionId)) {
+    throw new Error("Sub-agents cannot purge archived teams");
+  }
+  if (activeLeads.some((team) => team.lead_session_id === sessionId)) return;
+  const activeTeamSessions = /* @__PURE__ */ new Set([
+    ...activeMembers.map((member) => member.session_id),
+    ...activeLeads.map((team) => team.lead_session_id)
+  ]);
+  if (deps.tracker.isDescendantOf(sessionId, activeTeamSessions)) {
+    throw new Error("Sub-agents cannot purge archived teams");
+  }
+}
+
 // src/recovery.ts
 init_merge_helper();
 init_log();
@@ -2110,9 +2201,16 @@ async function recoverUndeliveredMessages(db, client, registry) {
       }
       try {
         const recipientModel = getMemberModel(db, team.id, msg.to_name);
+        const wake = resolveStandbyWake(
+          db,
+          team.id,
+          msg.to_name,
+          `[Recovered team message from ${msg.from_name}]: ${msg.content}`
+        );
         await client.session.promptAsync({
           sessionID: recipientSessionId,
-          parts: [{ type: "text", text: `[Recovered team message from ${msg.from_name}]: ${msg.content}` }],
+          parts: [{ type: "text", text: wake.text }],
+          ...wake.agent ? { agent: wake.agent } : {},
           ...recipientModel ? { model: recipientModel } : {}
         });
         markDelivered(db, msg.id);
@@ -2201,88 +2299,6 @@ async function executeTeamCreate(deps, args, sessionId) {
     [id, args.name, projectId, sessionId, now, now]
   );
   return `Team "${args.name}" created. You are the lead. Para demandas de engenharia, convoque o squad can\xF4nico via team_spawn: Implementador, Hugo (testes determin\xEDsticos) e Clara (Quality Gate). Use team_tasks_add para planejar as frentes.`;
-}
-
-// src/tools/shared.ts
-init_process();
-init_log();
-function resolveStandbyWake(db, teamId, memberName, baseText) {
-  const row = db.query(
-    "SELECT agent, execution_status, spawn_context FROM team_member WHERE team_id = ? AND name = ?"
-  ).get(teamId, memberName);
-  if (!row || row.execution_status !== "standby") {
-    return { text: baseText, woke: false };
-  }
-  const result = db.run(
-    "UPDATE team_member SET execution_status = 'starting', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'standby'",
-    [Date.now(), teamId, memberName]
-  );
-  if (!result.changes) {
-    log(`standby:wake:lost-race member=${memberName} team=${teamId} \u2014 delivering without prepend`);
-    return { text: baseText, woke: false };
-  }
-  const context = row.spawn_context?.trim();
-  log(`standby:wake member=${memberName} team=${teamId} context=${context ? `${context.length} chars` : "none"} runtime=${!context}`);
-  return {
-    text: context ? `${context}
-
-${baseText}` : baseText,
-    woke: true,
-    agent: row.agent
-  };
-}
-async function countBranchCommits(branch, cwd) {
-  try {
-    const result = await runCommand(["git", "rev-list", "--count", `HEAD..${branch}`], { cwd });
-    if (result.exitCode !== 0) return -1;
-    const n = Number.parseInt(result.stdout.trim(), 10);
-    return Number.isNaN(n) ? -1 : n;
-  } catch {
-    return -1;
-  }
-}
-async function checkWorktreeDirty(dir) {
-  try {
-    const result = await runCommand(["git", "-C", dir, "status", "--porcelain"]);
-    if (result.exitCode !== 0) return false;
-    return result.stdout.trim().length > 0;
-  } catch {
-    return false;
-  }
-}
-function requireLead(deps, sessionId) {
-  const teamInfo = findTeamBySession(deps.db, deps.registry, sessionId);
-  if (!teamInfo) throw new Error("This session is not in a team. Use team_create first.");
-  if (teamInfo.role !== "lead") throw new Error("Only the team lead can use this tool.");
-  return { teamId: teamInfo.teamId, teamName: teamInfo.teamName };
-}
-function requireTeamMember(deps, sessionId) {
-  const teamInfo = findTeamBySession(deps.db, deps.registry, sessionId);
-  if (!teamInfo) throw new Error("This session is not in a team.");
-  return teamInfo;
-}
-function requireCanPurgeArchivedTeams(deps, sessionId) {
-  const activeMembers = deps.db.query(
-    `SELECT tm.session_id
-     FROM team_member tm
-     JOIN team t ON tm.team_id = t.id
-     WHERE t.status = 'active'`
-  ).all();
-  if (activeMembers.some((member) => member.session_id === sessionId)) {
-    throw new Error("Team members cannot purge archived teams");
-  }
-  const activeLeads = deps.db.query("SELECT lead_session_id FROM team WHERE status = 'active'").all();
-  if (deps.tracker.getParent(sessionId)) {
-    throw new Error("Sub-agents cannot purge archived teams");
-  }
-  if (activeLeads.some((team) => team.lead_session_id === sessionId)) return;
-  const activeTeamSessions = /* @__PURE__ */ new Set([
-    ...activeMembers.map((member) => member.session_id),
-    ...activeLeads.map((team) => team.lead_session_id)
-  ]);
-  if (deps.tracker.isDescendantOf(sessionId, activeTeamSessions)) {
-    throw new Error("Sub-agents cannot purge archived teams");
-  }
 }
 
 // src/tools/team-claim.ts
@@ -2472,7 +2488,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
     autoStandbyReason = "hugo sdet default standby";
     log(`spawn:auto-standby member=${args.name} agent=${agent} reason=hugo_sdet_default`);
   }
-  const useStandby = (args.standby === true || autoStandby) && args.standby !== false;
+  let useStandby = (args.standby === true || autoStandby) && args.standby !== false;
+  let standbyReverted = false;
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`);
   let worktreeDir = null;
   let worktreeBranch = null;
@@ -2665,6 +2682,16 @@ async function executeTeamSpawn(deps, args, sessionId) {
       if (updateResult.changes === 0) {
         claimWarning = `Task "${args.claim_task}" is already claimed or missing`;
         log(`spawn:claim-blocked:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`);
+        if (useStandby && claimedTaskBlocked && !spawnIsQA && !spawnIsSDET && args.standby !== true) {
+          useStandby = false;
+          standbyReverted = true;
+          deps.db.run(
+            "UPDATE team_member SET status = 'busy', execution_status = 'starting', time_updated = ? WHERE team_id = ? AND name = ?",
+            [Date.now(), teamInfo.teamId, args.name]
+          );
+          deps.progressTracker.recordBusyStart(childSessionId);
+          log(`spawn:claim-blocked:standby-reverted name=${args.name} task=${args.claim_task}`);
+        }
       } else {
         const taskRow = deps.db.query("SELECT content FROM team_task WHERE id = ? AND team_id = ?").get(args.claim_task, teamInfo.teamId);
         claimedTaskContent = taskRow?.content ?? null;
@@ -2740,7 +2767,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
       "- team_message: send a message to the lead or another teammate",
       "- team_broadcast: send a message to all team members",
       "- team_tasks_list: view the shared team task board",
-      "- team_standby: yield execution and enter standby mode until unblocked or messaged"
+      "- team_standby: yield execution and enter standby mode until unblocked or messaged",
+      "- decision_lead: escalate an emergency decision to the team lead and pause until they deliberate"
     );
   } else {
     context.push(
@@ -2752,7 +2780,8 @@ async function executeTeamSpawn(deps, args, sessionId) {
       "- team_tasks_add: add tasks to the shared board",
       "- team_tasks_complete: mark a task complete on the shared board",
       "- team_claim: claim a pending task from the shared board",
-      "- team_standby: yield execution and enter standby mode until unblocked or messaged"
+      "- team_standby: yield execution and enter standby mode until unblocked or messaged",
+      "- decision_lead: escalate an emergency decision to the team lead and pause until they deliberate"
     );
   }
   if (otherMembers.length > 0) {
@@ -2919,7 +2948,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     });
   }
   const branchInfo = worktreeBranch ? ` (branch: ${worktreeBranch})` : "";
-  const standbyInfo = autoStandby ? ` (auto-standby: ${claimedTaskBlocked ? `claimed task ${args.claim_task} is blocked` : autoStandbyReason})` : useStandby ? " [standby \u2014 no prompt sent; wakes on first team_message]" : "";
+  const standbyInfo = standbyReverted ? ` (standby reverted: claimed task ${args.claim_task} was already claimed \u2014 member started normally)` : autoStandby ? ` (auto-standby: ${claimedTaskBlocked ? `claimed task ${args.claim_task} is blocked` : autoStandbyReason})` : useStandby ? " [standby \u2014 no prompt sent; wakes on first team_message]" : "";
   const planInfo = usePlanApproval ? " [plan mode \u2014 will send plan for approval]" : "";
   const claimInfo = claimedTaskContent ? ` (claimed task: ${args.claim_task})` : claimWarning ? ` (could not claim task: ${claimWarning})` : "";
   spawnFailures.delete(teamInfo.teamId);
@@ -7045,298 +7074,6 @@ async function emitNoticeEvent(registration, data) {
   await registration.events.emit("notice", data);
 }
 
-// src/v2-setup.ts
-init_log();
-function extractQuestionOutput(result) {
-  const content = result?.content;
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n");
-  }
-  return "";
-}
-async function setupEnsemble(ctx, options = {}) {
-  const db = createDb(options.dbPath ?? getDbPath());
-  const config = loadConfig(ctx.location.directory);
-  const registry = new MemberRegistry();
-  const tracker = new DescendantTracker();
-  const purgeApprovals = new PendingPurgeApprovals();
-  const activityBuffer = new ActivityBuffer();
-  const progressTracker = new ProgressTracker();
-  const nudgedMembers = /* @__PURE__ */ new Set();
-  const rehydrated = rehydrateRegistry(db, registry);
-  if (rehydrated > 0) vlog(`init:registry:rehydrated members=${rehydrated}`);
-  const nudgeMember = (teamId, memberName, sessionId) => {
-    const nudgeKey = `${teamId}:${memberName}`;
-    if (nudgedMembers.has(nudgeKey)) return;
-    if (!shouldNudgeIdleMember(db, teamId, memberName, config)) return;
-    if (hasReportedCompletion(db, teamId, memberName)) return;
-    nudgedMembers.add(nudgeKey);
-    db.run("UPDATE team_member SET last_nudged_at = ? WHERE team_id = ? AND name = ?", [
-      Date.now(),
-      teamId,
-      memberName
-    ]);
-    vlog(`nudge:idle-without-report name=${memberName}`);
-    void deliverPrompt(
-      ctx.session,
-      sessionId,
-      "[System]: You completed your work but did not report results. Send your findings to the lead via team_message now.",
-      resolveAgentForSession(db, sessionId)
-    ).catch((err) => {
-      vlog(`nudge:idle-without-report:failed name=${memberName} err=${err instanceof Error ? err.message : String(err)}`);
-    });
-  };
-  if (config.silentLead === false) {
-    const nudgeCutoff = Date.now() - 60 * 60 * 1e3;
-    const silent = db.query(
-      `SELECT tm.team_id, tm.name, tm.session_id FROM team_member tm
-       JOIN team t ON tm.team_id = t.id
-       WHERE t.status = 'active' AND tm.status = 'ready'
-         AND tm.execution_status != 'standby'
-         AND (tm.last_nudged_at IS NULL OR tm.last_nudged_at < ?)`
-    ).all(nudgeCutoff);
-    for (const member of silent) nudgeMember(member.team_id, member.name, member.session_id);
-  }
-  const rateLimiter = new TokenBucket({
-    capacity: config.rateLimitCapacity,
-    refillRate: 2,
-    refillIntervalMs: 1e3
-  });
-  const controller = new AbortController();
-  let failoverCtx;
-  const dispatch = async (event) => {
-    const transition = dispatchV2Event(db, registry, tracker, event, failoverCtx);
-    if (transition && transition.to === "ready" && transition.from === "busy") {
-      const entry = registry.getByName(transition.teamId, transition.memberName);
-      if (entry) {
-        nudgeMember(transition.teamId, transition.memberName, entry.sessionId);
-        const reviewTaskId = shouldNudgeInReviewTasks(db, transition.teamId, transition.memberName);
-        if (reviewTaskId) {
-          const key = `${transition.teamId}:${transition.memberName}:${reviewTaskId}`;
-          const currentCount = inReviewNudges.get(key) ?? 0;
-          inReviewNudges.set(key, currentCount + 1);
-          vlog(`nudge:in-review-tasks name=${transition.memberName} task=${reviewTaskId} attempt=${currentCount + 1}`);
-          void deliverPrompt(
-            ctx.session,
-            entry.sessionId,
-            IN_REVIEW_NUDGE_MESSAGE,
-            resolveAgentForSession(db, entry.sessionId)
-          ).catch((err) => {
-            vlog(`nudge:in-review-tasks:failed name=${transition.memberName} err=${err instanceof Error ? err.message : String(err)}`);
-          });
-        }
-      }
-    }
-    if (transition && rpc) {
-      await emitMemberEvent(rpc, transition).catch(() => {
-      });
-      if (transition.to === "ready" && transition.from === "busy") {
-        await emitNoticeEvent(rpc, {
-          title: "Team",
-          message: `${transition.memberName} finished`,
-          variant: "success"
-        }).catch(() => void 0);
-      } else if (transition.to === "error") {
-        await emitNoticeEvent(rpc, {
-          title: "Team",
-          message: `${transition.memberName} errored`,
-          variant: "error"
-        }).catch(() => void 0);
-      }
-    }
-  };
-  let rpc = null;
-  try {
-    rpc = await ctx.rpc.register(EnsembleRpc, {
-      summary: async (input) => {
-        const team = input.team ?? "";
-        const row = db.query("SELECT status FROM team WHERE name = ?").get(team);
-        if (!row) return { text: `No team "${team}".` };
-        const members = db.query("SELECT name, status FROM team_member WHERE team_id IN (SELECT id FROM team WHERE name = ?)").all(team);
-        const summary = members.map((m) => `${m.name}: ${m.status}`).join(", ");
-        return { text: `Team "${team}" (${row.status}): ${summary || "no members"}` };
-      },
-      teamContext: async (input) => {
-        const sessionID = input.sessionID ?? "";
-        const teamInfo = findTeamBySession(db, registry, sessionID);
-        if (!teamInfo) return { team: null, members: [], tasks: { pending: 0, done: 0 } };
-        const members = db.query("SELECT name, status FROM team_member WHERE team_id = ?").all(
-          teamInfo.teamId
-        );
-        const pending = db.query("SELECT COUNT(*) as c FROM team_task WHERE team_id = ? AND status != 'completed'").get(
-          teamInfo.teamId
-        ).c;
-        const done = db.query("SELECT COUNT(*) as c FROM team_task WHERE team_id = ? AND status = 'completed'").get(
-          teamInfo.teamId
-        ).c;
-        return { team: teamInfo.teamName, members, tasks: { pending, done } };
-      }
-    });
-  } catch (err) {
-    vlog(`init:rpc:failed err=${err instanceof Error ? err.message : String(err)}`);
-  }
-  void (async () => {
-    try {
-      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-        await dispatch(event);
-      }
-    } catch {
-    }
-  })();
-  await ctx.tool.hook("execute.before", (raw) => {
-    const input = raw;
-    checkToolIsolation(registry, tracker, input.tool, input.sessionID, db);
-    if (input.tool.startsWith("team_")) {
-      if (!rateLimiter.tryConsume()) {
-        return rateLimiter.waitForToken().then(() => void 0);
-      }
-    }
-    recordFromToolBefore({ sessionID: input.sessionID, tool: input.tool }, registry, activityBuffer);
-  });
-  await ctx.tool.hook("execute.after", (raw) => {
-    const event = raw;
-    if (event.tool === "question") {
-      purgeApprovals.recordQuestionAnswer(
-        event.sessionID,
-        extractQuestionOutput(event.result),
-        event.input
-      );
-    }
-    recordFileFromToolCall(db, registry, event.sessionID, event.tool, event.input);
-    recordFromToolAfter(
-      { sessionID: event.sessionID, tool: event.tool },
-      {},
-      registry,
-      activityBuffer
-    );
-  });
-  await ctx.session.hook("context", (raw) => {
-    const event = raw;
-    if (!event.sessionID) return;
-    const teamInfo = findTeamBySession(db, registry, event.sessionID);
-    if (!teamInfo) return;
-    const prompt = teamInfo.role === "lead" ? buildLeadSystemPrompt(db, teamInfo.teamId, config) : buildTeammateSystemPrompt(db, teamInfo.teamId, teamInfo.memberName ?? "unknown", config);
-    vlog(`system-prompt:injected role=${teamInfo.role} len=${prompt.length}`);
-    event.system.push({ type: "text", text: prompt });
-    if (teamInfo.role === "member") {
-      event.system.push({
-        type: "text",
-        text: 'Ensemble tools on this platform are called through the execute tool, e.g. tools.team_message({ to: "lead", text: "..." }). Do not call them directly.'
-      });
-    }
-  });
-  await ctx.session.hook("compaction", (raw) => {
-    const event = raw;
-    if (!event.sessionID) return;
-    const teamInfo = findTeamBySession(db, registry, event.sessionID);
-    if (!teamInfo) return;
-    const context = buildTeamCompactionContext(db, teamInfo.teamId, teamInfo.role, teamInfo.memberName, config);
-    event.system.push({ type: "text", text: context });
-  });
-  await ctx.shell.hook("create.before", () => void 0);
-  const client = createV2Client(ctx, rpc ? { rpcEmitter: rpc } : {});
-  failoverCtx = { client, config };
-  const deps = {
-    db,
-    registry,
-    tracker,
-    purgeApprovals,
-    client,
-    directory: ctx.location.directory,
-    config,
-    progressTracker
-  };
-  await registerV2Tools(ctx.tool, deps);
-  let dashboard = null;
-  const dashboardPort = options.dashboardPort ?? config.dashboardPort;
-  if (dashboardPort !== 0 && !isWorktreeInstance(ctx.location.directory)) {
-    dashboard = await startDashboard(db, dashboardPort, { activityBuffer, client }).catch((err) => {
-      vlog(`init:dashboard:failed err=${err instanceof Error ? err.message : String(err)}`);
-      return null;
-    });
-  }
-  return {
-    db,
-    registry,
-    tracker,
-    dispatch,
-    dispose: async () => {
-      controller.abort();
-      dashboard?.stop();
-    }
-  };
-}
-
-// src/index.ts
-import { tool } from "@opencode-ai/plugin";
-import { OpencodeClient } from "@opencode-ai/sdk/v2";
-import path7 from "node:path";
-import { mkdirSync } from "node:fs";
-
-// src/client.ts
-function extractError(err) {
-  if (err && typeof err === "object" && "message" in err) return String(err.message);
-  return String(err);
-}
-function throwing(fn) {
-  return async (...args) => {
-    const result = await fn(...args);
-    if (result && typeof result === "object" && "error" in result && result.error !== void 0) {
-      throw new Error(extractError(result.error));
-    }
-    return result;
-  };
-}
-function throwingPromptAsync(fn, agentResolver) {
-  return async (...args) => {
-    const [params, ...rest] = args;
-    let effectiveParams = params;
-    if (agentResolver && params && typeof params === "object") {
-      const injected = params;
-      const agent = injected.agent;
-      const hasExplicitAgent = agent !== void 0 && agent !== null && !(typeof agent === "string" && agent.length === 0);
-      if (!hasExplicitAgent && typeof injected.sessionID === "string" && injected.sessionID.length > 0) {
-        const resolved = agentResolver(injected.sessionID);
-        if (resolved) effectiveParams = { ...params, agent: resolved };
-      }
-    }
-    const result = await fn(effectiveParams, ...rest);
-    if (result && typeof result === "object" && "error" in result && result.error !== void 0) {
-      throw new Error(extractError(result.error));
-    }
-    return result;
-  };
-}
-function wrapThrowingClient(raw, agentResolver) {
-  const r = raw;
-  return {
-    session: {
-      create: throwing(r.session.create.bind(r.session)),
-      promptAsync: throwingPromptAsync(r.session.promptAsync.bind(r.session), agentResolver),
-      abort: throwing(r.session.abort.bind(r.session)),
-      status: throwing(r.session.status.bind(r.session)),
-      messages: throwing(r.session.messages.bind(r.session)),
-      get: throwing(r.session.get.bind(r.session))
-    },
-    tui: {
-      showToast: throwing(r.tui.showToast.bind(r.tui)),
-      selectSession: throwing(r.tui.selectSession.bind(r.tui))
-    },
-    worktree: {
-      create: throwing(r.worktree.create.bind(r.worktree)),
-      remove: throwing(r.worktree.remove.bind(r.worktree)),
-      list: throwing(r.worktree.list.bind(r.worktree)),
-      reset: throwing(r.worktree.reset.bind(r.worktree))
-    },
-    workspace: {
-      create: throwing(r.experimental.workspace.create.bind(r.experimental.workspace)),
-      remove: throwing(r.experimental.workspace.remove.bind(r.experimental.workspace)),
-      list: throwing(r.experimental.workspace.list.bind(r.experimental.workspace))
-    }
-  };
-}
-
 // src/watchdog.ts
 init_merge_helper();
 import { createRequire as createRequire2 } from "node:module";
@@ -7723,6 +7460,322 @@ var Watchdog = class _Watchdog {
   }
 };
 
+// src/v2-setup.ts
+init_log();
+function extractQuestionOutput(result) {
+  const content = result?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n");
+  }
+  return "";
+}
+async function setupEnsemble(ctx, options = {}) {
+  const db = createDb(options.dbPath ?? getDbPath());
+  const config = loadConfig(ctx.location.directory);
+  const registry = new MemberRegistry();
+  const tracker = new DescendantTracker();
+  const purgeApprovals = new PendingPurgeApprovals();
+  const activityBuffer = new ActivityBuffer();
+  const progressTracker = new ProgressTracker();
+  const nudgedMembers = /* @__PURE__ */ new Set();
+  const rehydrated = rehydrateRegistry(db, registry);
+  if (rehydrated > 0) vlog(`init:registry:rehydrated members=${rehydrated}`);
+  const nudgeMember = (teamId, memberName, sessionId) => {
+    const nudgeKey = `${teamId}:${memberName}`;
+    if (nudgedMembers.has(nudgeKey)) return;
+    if (!shouldNudgeIdleMember(db, teamId, memberName, config)) return;
+    if (hasReportedCompletion(db, teamId, memberName)) return;
+    nudgedMembers.add(nudgeKey);
+    db.run("UPDATE team_member SET last_nudged_at = ? WHERE team_id = ? AND name = ?", [
+      Date.now(),
+      teamId,
+      memberName
+    ]);
+    vlog(`nudge:idle-without-report name=${memberName}`);
+    void deliverPrompt(
+      ctx.session,
+      sessionId,
+      "[System]: You completed your work but did not report results. Send your findings to the lead via team_message now.",
+      resolveAgentForSession(db, sessionId)
+    ).catch((err) => {
+      vlog(`nudge:idle-without-report:failed name=${memberName} err=${err instanceof Error ? err.message : String(err)}`);
+    });
+  };
+  if (config.silentLead === false) {
+    const nudgeCutoff = Date.now() - 60 * 60 * 1e3;
+    const silent = db.query(
+      `SELECT tm.team_id, tm.name, tm.session_id FROM team_member tm
+       JOIN team t ON tm.team_id = t.id
+       WHERE t.status = 'active' AND tm.status = 'ready'
+         AND tm.execution_status != 'standby'
+         AND (tm.last_nudged_at IS NULL OR tm.last_nudged_at < ?)`
+    ).all(nudgeCutoff);
+    for (const member of silent) nudgeMember(member.team_id, member.name, member.session_id);
+  }
+  const rateLimiter = new TokenBucket({
+    capacity: config.rateLimitCapacity,
+    refillRate: 2,
+    refillIntervalMs: 1e3
+  });
+  const controller = new AbortController();
+  let failoverCtx;
+  const dispatch = async (event) => {
+    const transition = dispatchV2Event(db, registry, tracker, event, failoverCtx);
+    if (transition && transition.to === "ready" && transition.from === "busy") {
+      const entry = registry.getByName(transition.teamId, transition.memberName);
+      if (entry) {
+        nudgeMember(transition.teamId, transition.memberName, entry.sessionId);
+        const reviewTaskId = shouldNudgeInReviewTasks(db, transition.teamId, transition.memberName);
+        if (reviewTaskId) {
+          const key = `${transition.teamId}:${transition.memberName}:${reviewTaskId}`;
+          const currentCount = inReviewNudges.get(key) ?? 0;
+          inReviewNudges.set(key, currentCount + 1);
+          vlog(`nudge:in-review-tasks name=${transition.memberName} task=${reviewTaskId} attempt=${currentCount + 1}`);
+          void deliverPrompt(
+            ctx.session,
+            entry.sessionId,
+            IN_REVIEW_NUDGE_MESSAGE,
+            resolveAgentForSession(db, entry.sessionId)
+          ).catch((err) => {
+            vlog(`nudge:in-review-tasks:failed name=${transition.memberName} err=${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+      }
+    }
+    if (transition && rpc) {
+      await emitMemberEvent(rpc, transition).catch(() => {
+      });
+      if (transition.to === "ready" && transition.from === "busy") {
+        await emitNoticeEvent(rpc, {
+          title: "Team",
+          message: `${transition.memberName} finished`,
+          variant: "success"
+        }).catch(() => void 0);
+      } else if (transition.to === "error") {
+        await emitNoticeEvent(rpc, {
+          title: "Team",
+          message: `${transition.memberName} errored`,
+          variant: "error"
+        }).catch(() => void 0);
+      }
+    }
+  };
+  let rpc = null;
+  try {
+    rpc = await ctx.rpc.register(EnsembleRpc, {
+      summary: async (input) => {
+        const team = input.team ?? "";
+        const row = db.query("SELECT status FROM team WHERE name = ?").get(team);
+        if (!row) return { text: `No team "${team}".` };
+        const members = db.query("SELECT name, status FROM team_member WHERE team_id IN (SELECT id FROM team WHERE name = ?)").all(team);
+        const summary = members.map((m) => `${m.name}: ${m.status}`).join(", ");
+        return { text: `Team "${team}" (${row.status}): ${summary || "no members"}` };
+      },
+      teamContext: async (input) => {
+        const sessionID = input.sessionID ?? "";
+        const teamInfo = findTeamBySession(db, registry, sessionID);
+        if (!teamInfo) return { team: null, members: [], tasks: { pending: 0, done: 0 } };
+        const members = db.query("SELECT name, status FROM team_member WHERE team_id = ?").all(
+          teamInfo.teamId
+        );
+        const pending = db.query("SELECT COUNT(*) as c FROM team_task WHERE team_id = ? AND status != 'completed'").get(
+          teamInfo.teamId
+        ).c;
+        const done = db.query("SELECT COUNT(*) as c FROM team_task WHERE team_id = ? AND status = 'completed'").get(
+          teamInfo.teamId
+        ).c;
+        return { team: teamInfo.teamName, members, tasks: { pending, done } };
+      }
+    });
+  } catch (err) {
+    vlog(`init:rpc:failed err=${err instanceof Error ? err.message : String(err)}`);
+  }
+  void (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        await dispatch(event);
+      }
+    } catch {
+    }
+  })();
+  await ctx.tool.hook("execute.before", (raw) => {
+    const input = raw;
+    checkToolIsolation(registry, tracker, input.tool, input.sessionID, db);
+    if (input.tool.startsWith("team_")) {
+      if (!rateLimiter.tryConsume()) {
+        return rateLimiter.waitForToken().then(() => void 0);
+      }
+    }
+    recordFromToolBefore({ sessionID: input.sessionID, tool: input.tool }, registry, activityBuffer);
+  });
+  await ctx.tool.hook("execute.after", (raw) => {
+    const event = raw;
+    if (event.tool === "question") {
+      purgeApprovals.recordQuestionAnswer(
+        event.sessionID,
+        extractQuestionOutput(event.result),
+        event.input
+      );
+    }
+    recordFileFromToolCall(db, registry, event.sessionID, event.tool, event.input);
+    recordFromToolAfter(
+      { sessionID: event.sessionID, tool: event.tool },
+      {},
+      registry,
+      activityBuffer
+    );
+  });
+  await ctx.session.hook("context", (raw) => {
+    const event = raw;
+    if (!event.sessionID) return;
+    const teamInfo = findTeamBySession(db, registry, event.sessionID);
+    if (!teamInfo) return;
+    const prompt = teamInfo.role === "lead" ? buildLeadSystemPrompt(db, teamInfo.teamId, config) : buildTeammateSystemPrompt(db, teamInfo.teamId, teamInfo.memberName ?? "unknown", config);
+    vlog(`system-prompt:injected role=${teamInfo.role} len=${prompt.length}`);
+    event.system.push({ type: "text", text: prompt });
+    if (teamInfo.role === "member") {
+      event.system.push({
+        type: "text",
+        text: 'Ensemble tools on this platform are called through the execute tool, e.g. tools.team_message({ to: "lead", text: "..." }). Do not call them directly.'
+      });
+    }
+  });
+  await ctx.session.hook("compaction", (raw) => {
+    const event = raw;
+    if (!event.sessionID) return;
+    const teamInfo = findTeamBySession(db, registry, event.sessionID);
+    if (!teamInfo) return;
+    const context = buildTeamCompactionContext(db, teamInfo.teamId, teamInfo.role, teamInfo.memberName, config);
+    event.system.push({ type: "text", text: context });
+  });
+  await ctx.shell.hook("create.before", () => void 0);
+  const client = createV2Client(ctx, rpc ? { rpcEmitter: rpc } : {});
+  failoverCtx = { client, config };
+  const deps = {
+    db,
+    registry,
+    tracker,
+    purgeApprovals,
+    client,
+    directory: ctx.location.directory,
+    config,
+    progressTracker
+  };
+  await registerV2Tools(ctx.tool, deps);
+  let watchdog;
+  if (!isWorktreeInstance(ctx.location.directory)) {
+    watchdog = new Watchdog({
+      db,
+      client,
+      registry,
+      ttlMs: config.timeoutMs,
+      checkIntervalMs: 60 * 1e3,
+      progressTracker,
+      stallThresholdMs: config.stallThresholdMs,
+      stallMinSteps: config.stallMinSteps,
+      stallTokenThreshold: config.stallTokenThreshold,
+      cwd: ctx.location.directory,
+      peerMessageLimit: config.peerMessageLimit,
+      peerMessageWindowMs: config.peerMessageWindowMs,
+      roomInactivityThresholdMs: config.roomInactivityThresholdMs,
+      roomInactivityCheckMs: config.roomInactivityCheckMs,
+      config
+    });
+    watchdog.start();
+  } else {
+    vlog(`init:skip-watchdog (worktree instance: ${ctx.location.directory})`);
+  }
+  let dashboard = null;
+  const dashboardPort = options.dashboardPort ?? config.dashboardPort;
+  if (dashboardPort !== 0 && !isWorktreeInstance(ctx.location.directory)) {
+    dashboard = await startDashboard(db, dashboardPort, { activityBuffer, client }).catch((err) => {
+      vlog(`init:dashboard:failed err=${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    });
+  }
+  return {
+    db,
+    registry,
+    tracker,
+    dispatch,
+    dispose: async () => {
+      controller.abort();
+      watchdog?.stop();
+      dashboard?.stop();
+    }
+  };
+}
+
+// src/index.ts
+import { tool } from "@opencode-ai/plugin";
+import { OpencodeClient } from "@opencode-ai/sdk/v2";
+import path7 from "node:path";
+import { mkdirSync } from "node:fs";
+
+// src/client.ts
+function extractError(err) {
+  if (err && typeof err === "object" && "message" in err) return String(err.message);
+  return String(err);
+}
+function throwing(fn) {
+  return async (...args) => {
+    const result = await fn(...args);
+    if (result && typeof result === "object" && "error" in result && result.error !== void 0) {
+      throw new Error(extractError(result.error));
+    }
+    return result;
+  };
+}
+function throwingPromptAsync(fn, agentResolver) {
+  return async (...args) => {
+    const [params, ...rest] = args;
+    let effectiveParams = params;
+    if (agentResolver && params && typeof params === "object") {
+      const injected = params;
+      const agent = injected.agent;
+      const hasExplicitAgent = agent !== void 0 && agent !== null && !(typeof agent === "string" && agent.length === 0);
+      if (!hasExplicitAgent && typeof injected.sessionID === "string" && injected.sessionID.length > 0) {
+        const resolved = agentResolver(injected.sessionID);
+        if (resolved) effectiveParams = { ...params, agent: resolved };
+      }
+    }
+    const result = await fn(effectiveParams, ...rest);
+    if (result && typeof result === "object" && "error" in result && result.error !== void 0) {
+      throw new Error(extractError(result.error));
+    }
+    return result;
+  };
+}
+function wrapThrowingClient(raw, agentResolver) {
+  const r = raw;
+  return {
+    session: {
+      create: throwing(r.session.create.bind(r.session)),
+      promptAsync: throwingPromptAsync(r.session.promptAsync.bind(r.session), agentResolver),
+      abort: throwing(r.session.abort.bind(r.session)),
+      status: throwing(r.session.status.bind(r.session)),
+      messages: throwing(r.session.messages.bind(r.session)),
+      get: throwing(r.session.get.bind(r.session))
+    },
+    tui: {
+      showToast: throwing(r.tui.showToast.bind(r.tui)),
+      selectSession: throwing(r.tui.selectSession.bind(r.tui))
+    },
+    worktree: {
+      create: throwing(r.worktree.create.bind(r.worktree)),
+      remove: throwing(r.worktree.remove.bind(r.worktree)),
+      list: throwing(r.worktree.list.bind(r.worktree)),
+      reset: throwing(r.worktree.reset.bind(r.worktree))
+    },
+    workspace: {
+      create: throwing(r.experimental.workspace.create.bind(r.experimental.workspace)),
+      remove: throwing(r.experimental.workspace.remove.bind(r.experimental.workspace)),
+      list: throwing(r.experimental.workspace.list.bind(r.experimental.workspace))
+    }
+  };
+}
+
 // src/index.ts
 init_log();
 var DEFAULT_RATE_LIMIT_REFILL = 2;
@@ -7782,26 +7835,31 @@ var plugin = async (input) => {
     refillRate: DEFAULT_RATE_LIMIT_REFILL,
     refillIntervalMs: DEFAULT_RATE_LIMIT_INTERVAL_MS
   });
-  const watchdog = new Watchdog({
-    db,
-    client,
-    registry,
-    ttlMs: config.timeoutMs,
-    checkIntervalMs: DEFAULT_WATCHDOG_CHECK_MS,
-    progressTracker,
-    stallThresholdMs: config.stallThresholdMs,
-    stallMinSteps: config.stallMinSteps,
-    stallTokenThreshold: config.stallTokenThreshold,
-    cwd: input.directory,
-    peerMessageLimit: config.peerMessageLimit,
-    peerMessageWindowMs: config.peerMessageWindowMs,
-    roomInactivityThresholdMs: config.roomInactivityThresholdMs,
-    roomInactivityCheckMs: config.roomInactivityCheckMs,
-    // F2: thread config so watchdog notifyLead wakes use the model-aware
-    // ladder (agent + fallback chain step-down) instead of a modelless wake.
-    config
-  });
-  watchdog.start();
+  let watchdog;
+  if (!isWorktreeInstance(input.directory)) {
+    watchdog = new Watchdog({
+      db,
+      client,
+      registry,
+      ttlMs: config.timeoutMs,
+      checkIntervalMs: DEFAULT_WATCHDOG_CHECK_MS,
+      progressTracker,
+      stallThresholdMs: config.stallThresholdMs,
+      stallMinSteps: config.stallMinSteps,
+      stallTokenThreshold: config.stallTokenThreshold,
+      cwd: input.directory,
+      peerMessageLimit: config.peerMessageLimit,
+      peerMessageWindowMs: config.peerMessageWindowMs,
+      roomInactivityThresholdMs: config.roomInactivityThresholdMs,
+      roomInactivityCheckMs: config.roomInactivityCheckMs,
+      // F2: thread config so watchdog notifyLead wakes use the model-aware
+      // ladder (agent + fallback chain step-down) instead of a modelless wake.
+      config
+    });
+    watchdog.start();
+  } else {
+    log(`init:skip-watchdog (worktree instance: ${input.directory})`);
+  }
   return {
     // Event hook — drives state machine transitions + descendant tracking + toasts
     async event({ event }) {
@@ -7989,7 +8047,7 @@ var plugin = async (input) => {
               const peerAgent = sessionID === member.lead_session_id ? member.lead_agent : member.member_agent;
               client.session.promptAsync({
                 sessionID,
-                parts: [{ type: "text", text: `[System: ${peerMsgs.c} new message(s) from teammates]` }],
+                parts: [{ type: "text", text: resolveStandbyWake(db, member.team_id, member.name, `[System: ${peerMsgs.c} new message(s) from teammates]`).text }],
                 ...peerAgent ? { agent: peerAgent } : {},
                 ...peerModel ? { model: peerModel } : {}
               }).catch((err) => {

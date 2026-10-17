@@ -52,11 +52,15 @@ export function getMemberModel(db: Database, teamId: string, memberName: string)
 export function resolveAgentForSession(db: Database, sessionID: string): string | undefined {
   if (!sessionID) return undefined
 
-  const member = db.query("SELECT agent FROM team_member WHERE session_id = ?")
-    .get(sessionID) as { agent: string | null } | null
+  const member = db.query(
+    `SELECT tm.agent AS agent
+     FROM team_member tm
+     JOIN team t ON tm.team_id = t.id
+     WHERE tm.session_id = ? AND t.status = 'active'`
+  ).get(sessionID) as { agent: string | null } | null
   if (member?.agent) return member.agent
 
-  const lead = db.query("SELECT lead_agent FROM team WHERE lead_session_id = ?")
+  const lead = db.query("SELECT lead_agent FROM team WHERE lead_session_id = ? AND status = 'active'")
     .get(sessionID) as { lead_agent: string | null } | null
   if (lead) return lead.lead_agent ?? "dante"
 

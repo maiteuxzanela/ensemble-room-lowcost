@@ -22,6 +22,7 @@ import { buildLeadSystemPrompt, buildTeammateSystemPrompt, buildTeamCompactionCo
 import { startDashboard, type DashboardServer } from "./dashboard"
 import { EnsembleRpc, emitMemberEvent, emitNoticeEvent } from "./v2-rpc"
 import { isWorktreeInstance } from "./util"
+import { Watchdog } from "./watchdog"
 import { vlog } from "./log"
 
 /** V2 setup context subset (structural, mock-friendly). */
@@ -375,6 +376,35 @@ export async function setupEnsemble(
   }
   await registerV2Tools(ctx.tool, deps)
 
+  // TICKET-HARNESS-36 (A7): host V2 parity with the V1 plugin entry point. The
+  // Watchdog is created and started ONLY on the main project instance — a
+  // teammate worktree instance shares the same global SQLite and would otherwise
+  // run a concurrent TTL/stall/chatty sweep over identical rows. Stopped in
+  // dispose() so the timers never outlive the plugin lifetime.
+  let watchdog: Watchdog | undefined
+  if (!isWorktreeInstance(ctx.location.directory)) {
+    watchdog = new Watchdog({
+      db,
+      client,
+      registry,
+      ttlMs: config.timeoutMs,
+      checkIntervalMs: 60 * 1000,
+      progressTracker,
+      stallThresholdMs: config.stallThresholdMs,
+      stallMinSteps: config.stallMinSteps,
+      stallTokenThreshold: config.stallTokenThreshold,
+      cwd: ctx.location.directory,
+      peerMessageLimit: config.peerMessageLimit,
+      peerMessageWindowMs: config.peerMessageWindowMs,
+      roomInactivityThresholdMs: config.roomInactivityThresholdMs,
+      roomInactivityCheckMs: config.roomInactivityCheckMs,
+      config,
+    })
+    watchdog.start()
+  } else {
+    vlog(`init:skip-watchdog (worktree instance: ${ctx.location.directory})`)
+  }
+
   // Dashboard mirrors V1: main instance only, skipped when port is 0.
   let dashboard: DashboardServer | null = null
   const dashboardPort = options.dashboardPort ?? config.dashboardPort
@@ -392,6 +422,7 @@ export async function setupEnsemble(
     dispatch,
     dispose: async () => {
       controller.abort()
+      watchdog?.stop()
       dashboard?.stop()
     },
   }

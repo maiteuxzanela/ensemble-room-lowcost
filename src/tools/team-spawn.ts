@@ -273,7 +273,13 @@ export async function executeTeamSpawn(
   // Standby mode: the member is registered and its session is created, but no
   // prompt is sent at birth (zero tokens). The full init prompt is persisted in
   // spawn_context and prepended by the first team_message/team_broadcast.
-  const useStandby = (args.standby === true || autoStandby) && args.standby !== false
+  // `let` — TICKET-HARNESS-36 (P5) may revert a task-blocked auto-standby when
+  // the pre-claim of the blocked task loses the race (see below).
+  let useStandby = (args.standby === true || autoStandby) && args.standby !== false
+  // TICKET-HARNESS-36 (P5): set when a task-blocked auto-standby is reverted
+  // because the pre-claim failed — the member runs normally instead of sleeping
+  // forever in standby without any assigned work.
+  let standbyReverted = false
 
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`)
 
@@ -507,6 +513,23 @@ export async function executeTeamSpawn(
       if (updateResult.changes === 0) {
         claimWarning = `Task "${args.claim_task}" is already claimed or missing`
         log(`spawn:claim-blocked:failed name=${args.name} task=${args.claim_task} err=${claimWarning}`)
+        // TICKET-HARNESS-36 (P5): the blocked pre-claim lost the race. The
+        // standby was caused ONLY by the blocked task (not by the QA/SDET
+        // semantic standby nor an explicit args.standby), so leaving the member
+        // in standby would strand it forever — no task is assigned and no
+        // dependency will ever wake it. Revert to the normal path: back to
+        // busy/starting, record the progress baseline, and let the standard
+        // promptAsync below run so the member starts with its spawn context.
+        if (useStandby && claimedTaskBlocked && !spawnIsQA && !spawnIsSDET && args.standby !== true) {
+          useStandby = false
+          standbyReverted = true
+          deps.db.run(
+            "UPDATE team_member SET status = 'busy', execution_status = 'starting', time_updated = ? WHERE team_id = ? AND name = ?",
+            [Date.now(), teamInfo.teamId, args.name],
+          )
+          deps.progressTracker.recordBusyStart(childSessionId)
+          log(`spawn:claim-blocked:standby-reverted name=${args.name} task=${args.claim_task}`)
+        }
       } else {
         const taskRow = deps.db.query("SELECT content FROM team_task WHERE id = ? AND team_id = ?")
           .get(args.claim_task, teamInfo.teamId) as { content: string } | null
@@ -598,6 +621,7 @@ export async function executeTeamSpawn(
       "- team_broadcast: send a message to all team members",
       "- team_tasks_list: view the shared team task board",
       "- team_standby: yield execution and enter standby mode until unblocked or messaged",
+      "- decision_lead: escalate an emergency decision to the team lead and pause until they deliberate",
     )
   } else {
     context.push(
@@ -609,6 +633,7 @@ export async function executeTeamSpawn(
       "- team_tasks_complete: mark a task complete on the shared board",
       "- team_claim: claim a pending task from the shared board",
       "- team_standby: yield execution and enter standby mode until unblocked or messaged",
+      "- decision_lead: escalate an emergency decision to the team lead and pause until they deliberate",
     )
   }
 
@@ -821,9 +846,11 @@ export async function executeTeamSpawn(
   }
 
   const branchInfo = worktreeBranch ? ` (branch: ${worktreeBranch})` : ""
-  const standbyInfo = autoStandby 
-    ? ` (auto-standby: ${claimedTaskBlocked ? `claimed task ${args.claim_task} is blocked` : autoStandbyReason})` 
-    : useStandby ? " [standby — no prompt sent; wakes on first team_message]" : ""
+  const standbyInfo = standbyReverted
+    ? ` (standby reverted: claimed task ${args.claim_task} was already claimed — member started normally)`
+    : autoStandby
+      ? ` (auto-standby: ${claimedTaskBlocked ? `claimed task ${args.claim_task} is blocked` : autoStandbyReason})`
+      : useStandby ? " [standby — no prompt sent; wakes on first team_message]" : ""
   const planInfo = usePlanApproval ? " [plan mode — will send plan for approval]" : ""
   const claimInfo = claimedTaskContent
     ? ` (claimed task: ${args.claim_task})`

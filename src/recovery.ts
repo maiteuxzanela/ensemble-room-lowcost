@@ -4,6 +4,7 @@ import type { MemberRegistry } from "./state"
 import { getUndeliveredMessages, markDelivered, hasReportedCompletion } from "./messaging"
 import { releaseMemberTasks } from "./tasks"
 import { getMemberModel } from "./member-model"
+import { resolveStandbyWake } from "./tools/shared"
 import { preserveBranch, preservedBranchName, teamResourceSegment } from "./tools/merge-helper"
 import { log } from "./log"
 import { runCommand } from "./process"
@@ -235,9 +236,22 @@ export async function recoverUndeliveredMessages(
 
       try {
         const recipientModel = getMemberModel(db, team.id, msg.to_name)
+        // TICKET-HARNESS-36 (P3): a recovered message must be able to wake a
+        // member that is still in standby WITHOUT amnesia. resolveStandbyWake
+        // prepends the member's spawn_context and atomically flips
+        // execution_status 'standby' -> 'starting' (returning the member's own
+        // agent) — a bare promptAsync would otherwise deliver the recovered text
+        // as the member's first prompt, losing its role/peers context.
+        const wake = resolveStandbyWake(
+          db,
+          team.id,
+          msg.to_name!,
+          `[Recovered team message from ${msg.from_name}]: ${msg.content}`,
+        )
         await client.session.promptAsync({
           sessionID: recipientSessionId,
-          parts: [{ type: "text", text: `[Recovered team message from ${msg.from_name}]: ${msg.content}` }],
+          parts: [{ type: "text", text: wake.text }],
+          ...(wake.agent ? { agent: wake.agent } : {}),
           ...(recipientModel ? { model: recipientModel } : {}),
         })
         markDelivered(db, msg.id)

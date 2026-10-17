@@ -61,6 +61,7 @@ const SUITES = [
   { file: "test_ticket_harness_33_board_and_messaging.mjs", label: "HARNESS-33A/33B (Action estrita fail-fast + schema V1↔V2; isolamento de team_results & fan-out resiliente de team_broadcast + injeção no prompt; git real + prova de mutação)" },
   { file: "test_ticket_harness_34_quality_gate_and_silent_lead.mjs", label: "HARNESS-34 (A6 trava anti-bypass do Quality Gate + A2 filtro de abort + A1 coerência do silentLead; git real + prova de mutação)" },
   { file: "test_ticket_harness_35.mjs", label: "HARNESS-35 (A4 bind 127.0.0.1 + gate Host/Origin global + A5 chat do lead com modelo/persona/standby/delivered; prova de mutação)" },
+  { file: "test_ticket_harness_36.mjs", label: "HARNESS-36 (A3/A7 unificação de Watchdogs V1/V2 + P3 anti-amnésia recovery/wake-peer + P4 releaseMemberTasks + P5 revert de standby no spawn + P6 resolveAgentForSession só times active + P7 decision_lead no spawn_context; prova de mutação)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 
