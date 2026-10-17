@@ -1070,6 +1070,20 @@ function broadcastMessage(db, input) {
   );
   return id;
 }
+function broadcastMessageFanout(db, input) {
+  if (new TextEncoder().encode(input.content).length > MAX_CONTENT_BYTES) {
+    throw new Error("Message content exceeds 10KB limit");
+  }
+  const now = Date.now();
+  return input.recipients.map((recipient) => {
+    const id = generateId("msg");
+    db.run(
+      "INSERT INTO team_message (id, team_id, from_name, to_name, content, delivered, time_created) VALUES (?, ?, ?, ?, ?, 0, ?)",
+      [id, input.teamId, input.from, recipient, input.content, now]
+    );
+    return { recipient, id };
+  });
+}
 function getUndeliveredMessages(db, teamId) {
   return db.query(
     "SELECT * FROM team_message WHERE team_id = ? AND delivered = 0 ORDER BY time_created ASC"
@@ -3152,48 +3166,46 @@ init_log();
 async function executeTeamBroadcast(deps, args, sessionId) {
   const teamInfo = requireTeamMember(deps, sessionId);
   const senderName = teamInfo.role === "lead" ? "lead" : teamInfo.memberName ?? "unknown";
-  const msgId = broadcastMessage(deps.db, {
-    teamId: teamInfo.teamId,
-    from: senderName,
-    content: args.text
-  });
   const recipients = [];
   if (teamInfo.role !== "lead") {
-    if (!deps.config?.silentLead) {
-      const leadSession = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?").get(teamInfo.teamId);
-      if (leadSession) recipients.push({ name: "lead", sessionId: leadSession.lead_session_id });
-    } else {
-      log(`team_broadcast:lead-silenced from=${senderName}`);
+    const leadSession = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?").get(teamInfo.teamId);
+    if (leadSession?.lead_session_id) {
+      const prompt = !deps.config?.silentLead;
+      recipients.push({ name: "lead", sessionId: leadSession.lead_session_id, prompt });
+      if (!prompt) log(`team_broadcast:lead-silenced from=${senderName}`);
     }
   }
   const members = deps.registry.listByTeam(teamInfo.teamId);
   for (const member of members) {
-    if (member.sessionId !== sessionId) {
-      recipients.push({ name: member.memberName, sessionId: member.sessionId });
-    }
+    if (member.sessionId === sessionId) continue;
+    if (hasReportedCompletion(deps.db, teamInfo.teamId, member.memberName)) continue;
+    recipients.push({ name: member.memberName, sessionId: member.sessionId, prompt: true });
   }
+  if (recipients.length === 0) return "Broadcast sent to 0 recipients.";
+  const rows = broadcastMessageFanout(deps.db, {
+    teamId: teamInfo.teamId,
+    from: senderName,
+    content: args.text,
+    recipients: recipients.map((r) => r.name)
+  });
+  const idByRecipient = new Map(rows.map((r) => [r.recipient, r.id]));
   const baseText = `[Team broadcast from ${senderName}]: ${args.text}`;
-  let delivered = 0;
   let skipped = 0;
   for (const recipient of recipients) {
-    if (recipient.name === "lead" && deps.config?.silentLead) {
-      skipped++;
-      continue;
-    }
-    if (recipient.name !== "lead" && hasReportedCompletion(deps.db, teamInfo.teamId, recipient.name)) {
+    if (!recipient.prompt) {
       skipped++;
       continue;
     }
     const wake = recipient.name !== "lead" ? resolveStandbyWake(deps.db, teamInfo.teamId, recipient.name, baseText) : { text: baseText, woke: false };
     const memberModel = recipient.name !== "lead" ? getMemberModel(deps.db, teamInfo.teamId, recipient.name) : void 0;
+    const msgId = idByRecipient.get(recipient.name);
     deps.client.session.promptAsync({
       sessionID: recipient.sessionId,
       parts: [{ type: "text", text: wake.text }],
       ...wake.agent ? { agent: wake.agent } : {},
       ...memberModel ? { model: memberModel } : {}
     }).then(() => {
-      delivered++;
-      if (delivered === 1) markDelivered(deps.db, msgId);
+      if (msgId) markDelivered(deps.db, msgId);
     }).catch((err) => {
       log(`team_broadcast:deliver:failed to=${recipient.name} err=${err instanceof Error ? err.message : String(err)}`);
       if (wake.woke) {
@@ -3976,11 +3988,12 @@ function formatTaskResult(from, result) {
 // src/tools/team-results.ts
 async function executeTeamResults(deps, args, sessionId) {
   const team = requireTeamMember(deps, sessionId);
+  const callerName = team.role === "lead" ? "lead" : team.memberName ?? "";
   const rows = args.from ? deps.db.query(
-    "SELECT id, from_name, content, time_created FROM team_message WHERE team_id = ? AND read = 0 AND from_name = ? ORDER BY time_created ASC"
-  ).all(team.teamId, args.from) : deps.db.query(
-    "SELECT id, from_name, content, time_created FROM team_message WHERE team_id = ? AND read = 0 ORDER BY time_created ASC"
-  ).all(team.teamId);
+    "SELECT id, from_name, content, time_created FROM team_message WHERE team_id = ? AND read = 0 AND (to_name = ? OR to_name IS NULL) AND from_name = ? ORDER BY time_created ASC"
+  ).all(team.teamId, callerName, args.from) : deps.db.query(
+    "SELECT id, from_name, content, time_created FROM team_message WHERE team_id = ? AND read = 0 AND (to_name = ? OR to_name IS NULL) ORDER BY time_created ASC"
+  ).all(team.teamId, callerName);
   if (rows.length === 0) return "No unread messages.";
   const ids = rows.map((r) => r.id);
   const placeholders = ids.map(() => "?").join(", ");
@@ -5321,7 +5334,7 @@ function buildLeadSystemPrompt(db, teamId, config) {
   const memberList = members.map((m) => `${m.name} [${STATUS_DISPLAY[m.status] ?? m.status}]`).join(", ");
   const teammateLine = members.length > 0 ? `Teammates: ${memberList}` : "Teammates: none";
   const pendingMessages = db.query(
-    "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND to_name = 'lead' AND delivered = 0 ORDER BY time_created ASC"
+    "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND (to_name = 'lead' OR to_name IS NULL) AND delivered = 0 ORDER BY time_created ASC"
   ).all(teamId);
   const lines = [
     `You are leading team "${team.name}" with ${members.length} active teammates.`,
@@ -5464,7 +5477,7 @@ function buildTeammateSystemPrompt(db, teamId, memberName, config) {
     );
   }
   const pendingMessages = db.query(
-    "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND to_name = ? AND delivered = 0 ORDER BY time_created ASC"
+    "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND (to_name = ? OR to_name IS NULL) AND delivered = 0 ORDER BY time_created ASC"
   ).all(teamId, memberName);
   if (pendingMessages.length > 0) {
     lines.push("", "--- Messages for you ---");
