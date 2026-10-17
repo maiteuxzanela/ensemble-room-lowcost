@@ -1,45 +1,71 @@
 #!/usr/bin/env node
 /**
- * QUALITY GATE DETERMINÍSTICO — Auto-commit local nativo pós-QA (TICKET-HARNESS-26A)
+ * QUALITY GATE DETERMINÍSTICO — Auto-commit local nativo pós-QA, GATEADO PELO
+ * LEDGER e CIRÚRGICO (TICKET-HARNESS-26A + TICKET-32A)
  * @maiteuxzanela/ensemble-room-lowcost
  *
  * Engenheiro de Testes (SDET): Hugo. Guardiã do Quality Gate: Clara.
  *
  * Sob teste (src/ e dist/ REAIS, SQLite real via node:sqlite, git REAL em
  * sandbox — SEM MOCKS):
+ *   - src/modified-files.ts: ledger `team_modified_file` por sala, gravado no
+ *     hook `tool.execute.after` (recordFileFromToolCall, V1 index.ts + V2
+ *     v2-setup.ts) para tools de escrita (edit/write/patch/multiedit/...).
+ *     `recordModifiedFile`/`listModifiedFiles`/`modifiedFilesUnderRepo` são
+ *     exportados do dist e dirigidos diretamente pelos testes (seed do ledger
+ *     = simulação determinística do hook — seams reais, zero mocks).
  *   - executeTeamTasksComplete -> src/tools/team-tasks-complete.ts
  *       Flow 3 (complete): quando o Quality Gate reviewer (isQAMember) ou o
  *       team lead aprova o card, o hook `autoCommitApprovedTask` comita o
- *       workspace LOCALMENTE (Portão 1) via resolveCommitTargets:
- *       `sh -c 'git -C "$1" add -A && git -C "$1" commit -m "$2"'` atômico por
- *       repo, mensagem posicional `feat(runtime): <task.content>`, nunca
- *       empurra para o remoto.
+ *       workspace LOCALMENTE (Portão 1) — e SOMENTE o que o ledger da sala
+ *       registrou:
+ *         • ledger VAZIO → NENHUM commit (fail-closed, retorna "");
+ *         • staging `git add -- <arquivo1> <arquivo2> ...` (argv, sem shell)
+ *           — NUNCA `git add -A`;
+ *         • cada arquivo atribuído ao repo MAIS FUNDO que o contém;
+ *         • gitlink aninhado preservado (os dois status terminam limpos);
+ *         • sujo FORA do ledger NUNCA entra no commit (cirúrgico).
+ *       Mensagem posicional `feat(runtime): <task.content>`, nunca push.
  *       Contratos: guarda "o dir precisa SER o toplevel do repo" (caminho
- *       aninhado é pulado), árvore limpa → sem commit vazio, qualquer falha de
+ *       aninhado é pulado), árvore limpa → "already clean", qualquer falha de
  *       git é engolida (nunca quebra a transição SQLite), gating estrito a
  *       QA/lead.
  *
  * Cobertura:
- *   AC1  Clara (is_qa) aprova card in_review em repo SUJO → commit criado,
- *        hash no sufixo casa com HEAD, mensagem exata, árvore limpa, +1 commit.
- *   AC2  Árvore limpa → mensagem "already clean (no commit needed)", HEAD e
- *        contagem de commits inalterados (nenhum commit falso).
+ *   AC1  Clara (is_qa) aprova card in_review em repo SUJO com feature.txt NO
+ *        ledger → commit criado, hash no sufixo casa com HEAD, mensagem
+ *        exata, árvore limpa, +1 commit.
+ *   AC2  Ledger não-vazio com arquivo JÁ commitado (árvore limpa) → mensagem
+ *        "already clean (no commit needed)", HEAD e contagem inalterados.
  *   AC3  Membro NÃO autorizado (implementador) tentando completar card
- *        in_review → erro, board permanece in_review, zero commit.
- *   AC4  Implementador completa o PRÓPRIO card in_progress (permitido) → o hook
- *        NÃO dispara (sem sufixo, sem commit), árvore segue suja.
- *   AC5  Lead completa card in_review → hook dispara (caminho `role === lead`).
- *   AC6  Diretório não-repo → sem throw, board completa, sem sufixo de commit.
- *   AC7  Caminho aninhado dentro de um repo maior SUJO → guarda pula, HEAD do
- *        pai intacto (nunca comita árvore de terceiro).
+ *        in_review → erro, board permanece in_review, zero commit (mesmo com
+ *        ledger populado: a autorização precede o hook).
+ *   AC4  Implementador completa o PRÓPRIO card in_progress (permitido) com
+ *        ledger populado → o gate QA/lead NÃO dispara (sem sufixo, sem
+ *        commit), árvore segue suja.
+ *   AC5  Lead completa card in_review (ledger populado) → hook dispara.
+ *   AC6  Diretório não-repo com ledger populado → sem throw, board completa,
+ *        sem sufixo (sem candidato a repo → nada a comitar).
+ *   AC7  Caminho aninhado dentro de um repo maior SUJO com ledger apontando
+ *        para o repo pai → guarda de toplevel pula, HEAD do pai intacto.
  *   AC8  git commit falha (sem identidade user.email/user.name) → sem throw,
  *        board completa, sem sufixo (fail-graceful).
  *   AC9  Injeção de shell no task.content (`$(...)`, backticks, aspas, `&`) →
  *        mensagem exata via argumento posicional, ZERO efeito colateral.
  *   AC10 Promessa de governança: `action: "reject"` volta o card a in_progress
  *        e NÃO comita (o commit é exclusivo do complete QA/lead).
- *   Estáticos: paridade src↔dist dos literais + gate único + anti-mock.
- *   PROVA DE MUTAÇÃO: 5 mutantes determinísticos patcheados no bundle dist.
+ *   AC11 NOVO (TICKET-32A): ledger VAZIO → fail-closed: NENHUM commit e NENHUM
+ *        sufixo (nem "already clean"), árvore segue suja.
+ *   AC12 NOVO (TICKET-32A): arquivo sujo FORA do ledger NÃO é comitado — o
+ *        commit contém SÓ o arquivo registrado; stray.txt permanece `??`.
+ *   AC13 NOVO (TICKET-32A): hook de produção recordFileFromToolCall — edit
+ *        grava, read não grava, sessão desconhecida não grava, args inválidos
+ *        não lançam, paths relativos colapsam no absoluto (PK normalizada).
+ *   Estáticos: paridade src↔dist dos literais NOVOS do ledger cirúrgico,
+ *        wiring dos hooks V1/V2, tabela team_modified_file, remoção comprovada
+ *        do literal `add -A` e da janela de frescor + gate único + anti-mock.
+ *   PROVA DE MUTAÇÃO: 6 mutantes determinísticos patcheados no bundle dist
+ *        (M6 reintroduz o staging cego `git add -A` e é capturado por AC12).
  *
  * Único seam: cliente SDK do OpenCode (fronteira externa), reduzido a um
  * recorder determinístico de promptAsync — mesmo padrão das demais suítes do
@@ -75,7 +101,7 @@ process.on("unhandledRejection", (e) => unhandled.push(e));
 // ---------------------------------------------------------------------------
 // 0. Harness: dist real + exportação dos símbolos sob teste (sem mocks).
 // ---------------------------------------------------------------------------
-const REQUIRED_SYMBOLS = ["createDb", "executeTeamTasksComplete", "DEFAULT_CONFIG", "MemberRegistry", "ProgressTracker"];
+const REQUIRED_SYMBOLS = ["createDb", "executeTeamTasksComplete", "DEFAULT_CONFIG", "MemberRegistry", "ProgressTracker", "recordModifiedFile", "recordFileFromToolCall", "listModifiedFiles"];
 const distRaw = readFileSync(DIST, "utf8");
 
 const buildHarnessCode = (raw) => {
@@ -194,6 +220,8 @@ async function runBehavior(mod) {
     addMember(env.db, env.registry, "ac1", "clara", "ses_clara_ac1", "clara", { isQa: 1, role: "qa" });
     const content = "Feat N26A auto-commit";
     addTask(env.db, "ac1", "T1", "tales", "in_review", content);
+    // Seed do ledger = o hook tool.execute.after teria gravado feature.txt.
+    mod.recordModifiedFile(env.db, "ac1", path.join(env.dir, "feature.txt"));
     const before = headHash(env.dir);
     const beforeCount = headCount(env.dir);
     const { res, err } = await env.doComplete("ses_clara_ac1", { task_id: "T1", action: "complete" });
@@ -217,6 +245,9 @@ async function runBehavior(mod) {
     addMember(env.db, env.registry, "ac2", "clara", "ses_clara_ac2", "clara", { isQa: 1 });
     const content = "Feat tree already clean";
     addTask(env.db, "ac2", "T2", "tales", "in_review", content);
+    // Ledger não-vazio apontando para arquivo JÁ commitado → status limpo →
+    // "already clean" (ledger vazio retornaria "" — coberto por AC11).
+    mod.recordModifiedFile(env.db, "ac2", path.join(env.dir, "README.md"));
     const before = headHash(env.dir);
     const beforeCount = headCount(env.dir);
     const { res, err } = await env.doComplete("ses_clara_ac2", { task_id: "T2", action: "complete" });
@@ -236,6 +267,8 @@ async function runBehavior(mod) {
     addMember(env.db, env.registry, "ac3", "tales", "ses_tales_ac3", "build");
     addMember(env.db, env.registry, "ac3", "clara", "ses_clara_ac3", "clara", { isQa: 1 });
     addTask(env.db, "ac3", "T3", "tales", "in_review", "Feat unauthorized complete");
+    // Ledger populado de propósito: a autorização deve bloquear ANTES do hook.
+    mod.recordModifiedFile(env.db, "ac3", path.join(env.dir, "feature.txt"));
     const before = headHash(env.dir);
     const beforeCount = headCount(env.dir);
     const { res, err } = await env.doComplete("ses_tales_ac3", { task_id: "T3", action: "complete" });
@@ -252,6 +285,9 @@ async function runBehavior(mod) {
     seedTeam(env.db, "ac4", "ses_lead_ac4");
     addMember(env.db, env.registry, "ac4", "tales", "ses_tales_ac4", "build");
     addTask(env.db, "ac4", "T4", "tales", "in_progress", "Feat owned by implementer");
+    // Ledger populado de propósito: só o gate QA/lead (nunca o ledger) deve
+    // impedir o commit — se o gate cair, o commit acontece e o teste falha.
+    mod.recordModifiedFile(env.db, "ac4", path.join(env.dir, "feature.txt"));
     const beforeCount = headCount(env.dir);
     const { res, err } = await env.doComplete("ses_tales_ac4", { task_id: "T4", action: "complete" });
     R("AC4.no-error", err === null, err);
@@ -269,6 +305,7 @@ async function runBehavior(mod) {
     addMember(env.db, env.registry, "ac5", "tales", "ses_tales_ac5", "build");
     const content = "Feat approved by lead";
     addTask(env.db, "ac5", "T5", "tales", "in_review", content);
+    mod.recordModifiedFile(env.db, "ac5", path.join(env.dir, "feature.txt"));
     const { res, err } = await env.doComplete("ses_lead_ac5", { task_id: "T5", action: "complete" });
     const msg = git(env.dir, ["log", "-1", "--format=%s"]).out;
     const status = git(env.dir, ["status", "--porcelain"]).out;
@@ -285,6 +322,9 @@ async function runBehavior(mod) {
     seedTeam(env.db, "ac6", "ses_lead_ac6");
     addMember(env.db, env.registry, "ac6", "clara", "ses_clara_ac6", "clara", { isQa: 1 });
     addTask(env.db, "ac6", "T6", "tales", "in_review", "Feat outside a repo");
+    // Ledger populado, mas o diretório não é repo → zero candidatos → "".
+    writeFileSync(path.join(env.dir, "scratch.txt"), "fora de repo\n");
+    mod.recordModifiedFile(env.db, "ac6", path.join(env.dir, "scratch.txt"));
     const { res, err } = await env.doComplete("ses_clara_ac6", { task_id: "T6", action: "complete" });
     R("AC6.no-error", err === null, err);
     R("AC6.board-completed", taskStatus(env.db, "T6") === "completed");
@@ -312,6 +352,9 @@ async function runBehavior(mod) {
     seedTeam(env.db, "ac7", "ses_lead_ac7");
     addMember(env.db, env.registry, "ac7", "clara", "ses_clara_ac7", "clara", { isQa: 1 });
     addTask(env.db, "ac7", "T7", "tales", "in_review", "Feat nested dir");
+    // Ledger aponta para o repo PAI (onde o arquivo sujo vive): mesmo assim a
+    // guarda de toplevel deve segurar — dir interno não É o toplevel do repo.
+    mod.recordModifiedFile(env.db, "ac7", path.join(outer, "outer-dirty.txt"));
     const outerBefore = headHash(outer);
     const outerCountBefore = headCount(outer);
     const { res, err } = await env.doComplete("ses_clara_ac7", { task_id: "T7", action: "complete" });
@@ -329,6 +372,7 @@ async function runBehavior(mod) {
     seedTeam(env.db, "ac8", "ses_lead_ac8");
     addMember(env.db, env.registry, "ac8", "clara", "ses_clara_ac8", "clara", { isQa: 1 });
     addTask(env.db, "ac8", "T8", "tales", "in_review", "Feat commit must fail");
+    mod.recordModifiedFile(env.db, "ac8", path.join(env.dir, "feature.txt"));
     const emptyHome = path.join(env.base, "emptyhome");
     mkdirSync(emptyHome, { recursive: true });
     const KEYS = ["HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_SYSTEM"];
@@ -360,6 +404,7 @@ async function runBehavior(mod) {
     addMember(env.db, env.registry, "ac9", "clara", "ses_clara_ac9", "clara", { isQa: 1 });
     const content = 'Injeta "$(touch PWNED)" & `id` aspas';
     addTask(env.db, "ac9", "T9", "tales", "in_review", content);
+    mod.recordModifiedFile(env.db, "ac9", path.join(env.dir, "feature.txt"));
     const { err } = await env.doComplete("ses_clara_ac9", { task_id: "T9", action: "complete" });
     const msg = git(env.dir, ["log", "-1", "--format=%s"]).out;
     const sideEffect = existsSync(path.join(env.dir, "PWNED")) || existsSync(path.join(TMP, "PWNED")) || existsSync(path.join(REPO, "PWNED"));
@@ -376,11 +421,55 @@ async function runBehavior(mod) {
     addMember(env.db, env.registry, "ac10", "tales", "ses_tales_ac10", "build");
     addMember(env.db, env.registry, "ac10", "clara", "ses_clara_ac10", "clara", { isQa: 1 });
     addTask(env.db, "ac10", "T10", "tales", "in_review", "Feat rejected by QA");
+    // Ledger populado: mesmo assim o reject NÃO pode comitar.
+    mod.recordModifiedFile(env.db, "ac10", path.join(env.dir, "feature.txt"));
     const beforeCount = headCount(env.dir);
     const { res, err } = await env.doComplete("ses_clara_ac10", { task_id: "T10", action: "reject", notes: "suite falhou" });
     R("AC10.no-error", err === null, err);
     R("AC10.status-in-progress", taskStatus(env.db, "T10") === "in_progress", taskStatus(env.db, "T10"));
     R("AC10.reject-no-commit", headCount(env.dir) === beforeCount && git(env.dir, ["status", "--porcelain"]).out !== "", `count=${headCount(env.dir)}`);
+    env.cleanup();
+  }
+
+  // ==== AC11: ledger VAZIO → fail-closed: NENHUM commit (TICKET-32A) ======
+  {
+    const env = newEnv(mod, (base) => makeGitRepo(base, { dirty: true }));
+    seedTeam(env.db, "ac11", "ses_lead_ac11");
+    addMember(env.db, env.registry, "ac11", "clara", "ses_clara_ac11", "clara", { isQa: 1 });
+    addTask(env.db, "ac11", "T11", "tales", "in_review", "Feat touched nothing");
+    // Ledger deliberadamente VAZIO: a sala não registrou nenhuma escrita.
+    const beforeCount = headCount(env.dir);
+    const beforeHash = headHash(env.dir);
+    const { res, err } = await env.doComplete("ses_clara_ac11", { task_id: "T11", action: "complete" });
+    R("AC11.no-error", err === null, err);
+    R("AC11.board-completed", taskStatus(env.db, "T11") === "completed", taskStatus(env.db, "T11"));
+    R("AC11.no-commit-suffix", !/locally committed|already clean/.test(res), res);
+    R("AC11.no-new-commit", headCount(env.dir) === beforeCount && headHash(env.dir) === beforeHash, `${beforeCount}->${headCount(env.dir)}`);
+    R("AC11.tree-still-dirty", git(env.dir, ["status", "--porcelain"]).out !== "", `status="${git(env.dir, ["status", "--porcelain"]).out}"`);
+    env.cleanup();
+  }
+
+  // ==== AC12: cirurgia — sujo FORA do ledger NÃO é comitado (TICKET-32A) ===
+  {
+    const env = newEnv(mod, (base) => makeGitRepo(base, { dirty: true })); // feature.txt sujo
+    writeFileSync(path.join(env.dir, "stray.txt"), "sujo e nao registrado no ledger\n");
+    seedTeam(env.db, "ac12", "ses_lead_ac12");
+    addMember(env.db, env.registry, "ac12", "clara", "ses_clara_ac12", "clara", { isQa: 1 });
+    const content = "Feat surgical staging";
+    addTask(env.db, "ac12", "T12", "tales", "in_review", content);
+    // Ledger registra SÓ feature.txt — stray.txt é sujo alheio à sala.
+    mod.recordModifiedFile(env.db, "ac12", path.join(env.dir, "feature.txt"));
+    const beforeCount = headCount(env.dir);
+    const { res, err } = await env.doComplete("ses_clara_ac12", { task_id: "T12", action: "complete" });
+    const names = git(env.dir, ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]).out.split("\n").filter(Boolean).sort();
+    const status = git(env.dir, ["status", "--porcelain"]).out;
+    R("AC12.no-error", err === null, err);
+    R("AC12.commit-suffix-present", /Task completed and locally committed: .*\([0-9a-f]{7,}\)/.test(res), res);
+    R("AC12.commit-message-exact", git(env.dir, ["log", "-1", "--format=%s"]).out === `feat(runtime): ${content}`, `msg="${git(env.dir, ["log", "-1", "--format=%s"]).out}"`);
+    R("AC12.commit-only-ledger-file", names.length === 1 && names[0] === "feature.txt", `names=${names.join(",")}`);
+    R("AC12.stray-still-untracked", status.includes("?? stray.txt"), `status="${status}"`);
+    R("AC12.tree-not-clean", status !== "", `status="${status}"`);
+    R("AC12.exactly-one-new-commit", headCount(env.dir) === beforeCount + 1, `${beforeCount}->${headCount(env.dir)}`);
     env.cleanup();
   }
 
@@ -394,9 +483,57 @@ const realFlow = await runBehavior(REAL);
 for (const [name, { ok, detail }] of realFlow) check(`[real] ${name}`, ok, detail);
 
 // ---------------------------------------------------------------------------
-// 4. Estáticos: paridade src↔dist + gate único + anti-mock.
+// 3b. AC13 — hook de produção do ledger (tool.execute.after → recordFileFromToolCall).
+//     Diretamente contra o dist real: SQLite + registry reais, zero mocks.
+// ---------------------------------------------------------------------------
+{
+  const env = newEnv(REAL, () => null);
+  seedTeam(env.db, "ac13", "ses_lead_ac13");
+  addMember(env.db, env.registry, "ac13", "tales", "ses_tales_ac13", "build");
+  const abs = path.join(env.dir, "hooked.ts");
+  writeFileSync(abs, "export {};\n");
+  const rows = () => REAL.listModifiedFiles(env.db, "ac13");
+
+  REAL.recordFileFromToolCall(env.db, env.registry, "ses_tales_ac13", "edit", { filePath: abs });
+  check("AC13.edit-registra-ledger", rows().length === 1 && rows()[0] === abs, JSON.stringify(rows()));
+
+  // Grafia redundante (/. ) do MESMO arquivo → PK normalizada, sem duplicata.
+  REAL.recordFileFromToolCall(env.db, env.registry, "ses_tales_ac13", "write", { filePath: `${env.dir}/./hooked.ts` });
+  check("AC13.normalizacao-sem-duplicata", rows().length === 1 && rows()[0] === abs, JSON.stringify(rows()));
+
+  REAL.recordFileFromToolCall(env.db, env.registry, "ses_tales_ac13", "read", { filePath: abs });
+  check("AC13.read-nao-registra", rows().length === 1, `rows=${rows().length}`);
+
+  REAL.recordFileFromToolCall(env.db, env.registry, "ses_desconhecida", "edit", { filePath: abs });
+  check("AC13.sessao-desconhecida-nao-registra", rows().length === 1, `rows=${rows().length}`);
+
+  let threw = null;
+  try {
+    REAL.recordFileFromToolCall(env.db, env.registry, "ses_tales_ac13", "edit", { nota: "sem filePath" });
+    REAL.recordFileFromToolCall(env.db, env.registry, "ses_tales_ac13", "multiedit", { edits: [] });
+    REAL.recordFileFromToolCall(env.db, env.registry, "ses_tales_ac13", "edit", null);
+    REAL.recordFileFromToolCall(env.db, env.registry, "ses_tales_ac13", "team_tasks_complete", { task_id: "X", filePath: abs });
+  } catch (e) {
+    threw = e instanceof Error ? e.message : String(e);
+  }
+  check("AC13.args-invalidos-e-team-tools-nao-lancam-nao-registram", threw === null && rows().length === 1, `threw=${threw} rows=${rows().length}`);
+
+  // Fluxo reverso: team não ativo → findTeamBySession não resolve → não grava.
+  env.db.run("UPDATE team SET status = 'archived' WHERE id = 'ac13'");
+  REAL.recordFileFromToolCall(env.db, env.registry, "ses_tales_ac13", "edit", { filePath: abs });
+  check("AC13-time-archived-nao-registra", rows().length === 1, `rows=${rows().length}`);
+  env.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// 4. Estáticos: paridade src↔dist (ledger cirúrgico TICKET-32A) + remoções
+//    comprovadas + wiring do hook + gate único + anti-mock.
 // ---------------------------------------------------------------------------
 const SRC_TC = readFileSync(path.join(SRC, "tools", "team-tasks-complete.ts"), "utf8");
+const SRC_MF = readFileSync(path.join(SRC, "modified-files.ts"), "utf8");
+const SRC_IDX = readFileSync(path.join(SRC, "index.ts"), "utf8");
+const SRC_V2 = readFileSync(path.join(SRC, "v2-setup.ts"), "utf8");
+const SRC_SCHEMA = readFileSync(path.join(SRC, "schema.ts"), "utf8");
 const GUARD = 'if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {';
 const STATIC_LITERALS = [
   "autoCommitApprovedTask",
@@ -407,12 +544,53 @@ const STATIC_LITERALS = [
   "Task completed; working tree already clean (no commit needed)",
   "Task completed and locally committed",
   "feat(runtime): ",
-  'git -C "$1" add -A && git -C "$1" commit -m "$2"',
 ];
 const countOcc = (hay, needle) => hay.split(needle).length - 1;
 for (const lit of STATIC_LITERALS) {
   check(`paridade src↔dist: literal "${lit.slice(0, 42)}"`, SRC_TC.includes(lit) && distRaw.includes(lit));
 }
+
+// Literais NOVOS do contrato TICKET-32A (ledger + staging cirúrgico). A fonte
+// src pode viver em team-tasks-complete.ts OU em modified-files.ts.
+const LEDGER_LITERALS = [
+  "recordModifiedFile",
+  "recordFileFromToolCall",
+  "listModifiedFiles",
+  "modifiedFilesUnderRepo",
+  '"add", "--"',
+  "team_modified_file",
+];
+for (const lit of LEDGER_LITERALS) {
+  check(
+    `paridade src↔dist (ledger cirúrgico): literal "${lit.slice(0, 46)}"`,
+    distRaw.includes(lit) && (SRC_TC.includes(lit) || SRC_MF.includes(lit)),
+  );
+}
+
+// Remoções comprovadas do contrato antigo (add -A cego + janela de mtime).
+check(
+  "remoção: literal sh -c 'add -A && commit' AUSENTE de src e dist",
+  !SRC_TC.includes('git -C "$1" add -A') && !distRaw.includes('git -C "$1" add -A'),
+);
+check(
+  "remoção: janela de frescor por mtime (resolveFreshnessSince/hasFreshDirt) AUSENTE de src e dist",
+  !SRC_TC.includes("resolveFreshnessSince") && !distRaw.includes("resolveFreshnessSince") && !SRC_TC.includes("hasFreshDirt") && !distRaw.includes("hasFreshDirt"),
+);
+check(
+  "staging cirúrgico: o comando executável usa argv ['add', '--', ...] em src e dist",
+  SRC_TC.includes('["git", "-C", target.path, "add", "--", ...addList]') && distRaw.includes('["git", "-C", target.path, "add", "--", ...addList]'),
+);
+
+// Wiring do hook de produção: tool.execute.after popula o ledger (V1 + V2).
+check(
+  "hook de ledger: recordFileFromToolCall ligado em index.ts (V1) e v2-setup.ts (V2) e presente no dist",
+  SRC_IDX.includes("recordFileFromToolCall") && SRC_V2.includes("recordFileFromToolCall") && distRaw.includes("recordFileFromToolCall"),
+);
+check(
+  "schema: tabela team_modified_file em src/schema.ts e no dist",
+  SRC_SCHEMA.includes("team_modified_file") && distRaw.includes("team_modified_file"),
+);
+
 check("gate único em src (QA/lead)", countOcc(SRC_TC, GUARD) === 1, `n=${countOcc(SRC_TC, GUARD)}`);
 check("gate único em dist (QA/lead)", countOcc(distRaw, GUARD) === 1, `n=${countOcc(distRaw, GUARD)}`);
 check("guarda de toplevel presente em src e dist", SRC_TC.includes("if (primary && primary === normalizeDir(dir)) {") && distRaw.includes("if (primary && primary === normalizeDir(dir)) {"));
@@ -476,6 +654,14 @@ const MUTATIONS = [
     to: "const message = `feat(runtime): TAMPERED`;",
     detect: ["AC1.commit-message-exact", "AC5.lead-commit-message", "AC9.injection-message-exact"],
     unaffected: ["AC1.commit-suffix-hash-matches-head", "AC2.already-clean-message", "AC4.implementer-no-commit-suffix", "AC6.no-commit-suffix"],
+  },
+  {
+    id: "M6",
+    desc: "staging cego 'git add -A' reintroduzido no lugar do staging cirúrgico do ledger (TICKET-32A)",
+    from: '["git", "-C", target.path, "add", "--", ...addList]',
+    to: '["git", "-C", target.path, "add", "-A"]',
+    detect: ["AC12.commit-only-ledger-file", "AC12.stray-still-untracked", "AC12.tree-not-clean"],
+    unaffected: ["AC1.commit-message-exact", "AC5.lead-commit-created", "AC2.already-clean-message", "AC11.no-commit-suffix"],
   },
 ];
 

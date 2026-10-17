@@ -17,6 +17,7 @@ import { findTeamBySession } from "./types"
 import { loadConfig, type EnsembleConfig } from "./config"
 import { TokenBucket } from "./rate-limit"
 import { ActivityBuffer, recordFromToolBefore, recordFromToolAfter } from "./activity"
+import { recordFileFromToolCall } from "./modified-files"
 import { buildLeadSystemPrompt, buildTeammateSystemPrompt, buildTeamCompactionContext } from "./system-prompt"
 import { startDashboard, type DashboardServer } from "./dashboard"
 import { EnsembleRpc, emitMemberEvent, emitNoticeEvent } from "./v2-rpc"
@@ -303,6 +304,10 @@ export async function setupEnsemble(
         event.input,
       )
     }
+    // TICKET-32A: ledger every file this room's session mutates
+    // (edit/write/patch/...) so the Portão 1 auto-commit can commit a repo
+    // strictly with the room-touched files — never a blind `git add -A`.
+    recordFileFromToolCall(db, registry, event.sessionID, event.tool, event.input)
     recordFromToolAfter(
       { sessionID: event.sessionID, tool: event.tool },
       {},

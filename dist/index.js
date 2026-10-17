@@ -486,7 +486,34 @@ var MIGRATIONS = [
   // (isSDETMEmber / getTeamSDETMember) read this column first and fall back to
   // agent / base-persona === 'hugo' detection, so existing databases and rows
   // created before this migration keep working unchanged.
-  `ALTER TABLE team_member ADD COLUMN role TEXT;`
+  `ALTER TABLE team_member ADD COLUMN role TEXT;`,
+  // Migration 17 (TICKET-HARNESS-32A): atomic per-room modified-file ledger.
+  //
+  // Each row is one file the room (any member session, or the lead session)
+  // touched via a file-mutating tool (edit/write/patch/multiedit/...). The
+  // ledger is the source of truth that replaces the old blind `git add -A`
+  // in the Portão 1 auto-commit: on QA/lead `complete`, the runtime commits a
+  // repository ONLY with the exact files this room registered under it —
+  // never a repo-wide sweep. A sibling repo with zero registered files is
+  // NEVER committed, so unrelated working trees living next to the room dir
+  // stay untouched (the Maiteux/lead directive: do not block sibling repos,
+  // but never commit what the room did not touch).
+  //
+  // PRIMARY KEY (team_id, file_path) makes the ledger idempotent: re-editing
+  // the same file UPDATEs time_created in place (see recordModifiedFile).
+  // file_path stores the NORMALIZED ABSOLUTE path (path.resolve + separators
+  // unified) so the commit filter can prefix-match against each discovered
+  // repo root without ambiguity. FK cascade: deleting a team purges its ledger.
+  //
+  // Additive-only (same non-negotiable as Migrations 9-11/14/15/16): brand-new
+  // table, no CHECK constraint, no rebuild of existing tables.
+  `CREATE TABLE IF NOT EXISTS team_modified_file (
+     team_id      TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     file_path    TEXT NOT NULL,
+     time_created INTEGER NOT NULL,
+     PRIMARY KEY (team_id, file_path)
+   );
+   CREATE INDEX IF NOT EXISTS team_modified_file_team_idx ON team_modified_file(team_id);`
 ];
 function applyMigrations(db) {
   const { user_version: current } = db.query("PRAGMA user_version").get();
@@ -558,8 +585,8 @@ function getDbPath(env = process.env) {
   const home = env.HOME ?? env.USERPROFILE ?? "~";
   return path.join(home, ".config", "opencode", "ensemble.db");
 }
-function createDb(path7) {
-  const db = openDatabase(path7);
+function createDb(path8) {
+  const db = openDatabase(path8);
   db.exec("PRAGMA journal_mode=WAL");
   db.exec("PRAGMA foreign_keys=ON");
   applyMigrations(db);
@@ -1126,22 +1153,20 @@ function resolveLeadWakeContext(db, teamId) {
 }
 function promptModelAwareWake(client, params) {
   const { sessionID, text, logTag, agent, config, primaryModel, synthetic = true } = params;
-  const ladder = [];
-  const seen = /* @__PURE__ */ new Set();
-  const pushSelector = (selector) => {
-    if (selector && !seen.has(selector)) {
-      seen.add(selector);
-      ladder.push(selector);
-    }
-  };
-  if (primaryModel) pushSelector(primaryModel);
+  const ladder = [primaryModel || void 0];
+  const seen = new Set(primaryModel ? [primaryModel] : []);
   if (config) {
     for (const entry of resolveFallbackChainForAgent(config, agent)) {
-      pushSelector(formatModelSelector(entry));
+      const selector = formatModelSelector(entry);
+      if (selector && !seen.has(selector)) {
+        seen.add(selector);
+        ladder.push(selector);
+      }
     }
   }
   const attempt = (index) => {
     const selector = ladder[index];
+    const rung = selector ?? "session-native";
     const parsed = selector ? parseModelSelector(selector) : void 0;
     client.session.promptAsync({
       sessionID,
@@ -1150,15 +1175,15 @@ function promptModelAwareWake(client, params) {
       ...parsed ? { model: parsed } : {},
       ...synthetic ? { synthetic: true } : {}
     }).then(() => {
-      if (selector) log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${selector}`);
+      log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${rung}`);
     }).catch((err) => {
       const errMsg = err instanceof Error ? err.message : String(err);
-      const next = ladder[index + 1];
+      const next = index + 1 < ladder.length ? ladder[index + 1] : void 0;
       if (next) {
-        log(`${logTag}:retry session=${sessionID} from=${selector ?? "session-default"} to=${next} err=${errMsg}`);
+        log(`${logTag}:retry session=${sessionID} from=${rung} to=${next} err=${errMsg}`);
         attempt(index + 1);
       } else {
-        log(`${logTag}:failed session=${sessionID} model=${selector ?? "session-default"} err=${errMsg}`);
+        log(`${logTag}:failed session=${sessionID} model=${rung} err=${errMsg}`);
       }
     });
   };
@@ -3234,8 +3259,85 @@ async function executeTeamTasksAdd(deps, args, sessionId) {
 
 // src/tools/team-tasks-complete.ts
 init_process();
+
+// src/modified-files.ts
 init_log();
 import path4 from "node:path";
+var FILE_MUTATING_TOOLS = /* @__PURE__ */ new Set([
+  "edit",
+  "write",
+  "patch",
+  "multiedit",
+  "apply_patch",
+  "notebookEdit",
+  "insert"
+]);
+function normalizeModifiedPath(filePath) {
+  return path4.resolve(filePath);
+}
+function recordModifiedFile(db, teamId, filePath) {
+  const normalized = normalizeModifiedPath(filePath);
+  db.run(
+    `INSERT INTO team_modified_file (team_id, file_path, time_created) VALUES (?, ?, ?)
+     ON CONFLICT(team_id, file_path) DO UPDATE SET time_created = excluded.time_created`,
+    [teamId, normalized, Date.now()]
+  );
+}
+function extractFilePath(tool2, args) {
+  if (!args || typeof args !== "object") return null;
+  const a = args;
+  for (const key of ["filePath", "file_path", "path", "filename"]) {
+    const v = a[key];
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  if (tool2 === "notebookEdit" && Array.isArray(a.notes)) {
+    for (const note of a.notes) {
+      if (note && typeof note === "object") {
+        const p = note.path;
+        if (typeof p === "string" && p.length > 0) return p;
+      }
+    }
+  }
+  return null;
+}
+function recordFileFromToolCall(db, registry, sessionId, tool2, args) {
+  try {
+    if (!FILE_MUTATING_TOOLS.has(tool2)) return;
+    const filePath = extractFilePath(tool2, args);
+    if (!filePath) return;
+    const teamInfo = findTeamBySession(db, registry, sessionId);
+    if (!teamInfo) return;
+    recordModifiedFile(db, teamInfo.teamId, filePath);
+    log(`modified-file:recorded team=${teamInfo.teamId} tool=${tool2} file=${normalizeModifiedPath(filePath)}`);
+  } catch (err) {
+    log(`modified-file:record-failed tool=${tool2} err=${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+function listModifiedFiles(db, teamId) {
+  const rows = db.query(
+    "SELECT file_path FROM team_modified_file WHERE team_id = ? ORDER BY time_created DESC"
+  ).all(teamId);
+  return rows.map((r) => r.file_path);
+}
+function modifiedFilesUnderRepo(ledger, repoRoot) {
+  const root = normalizeModifiedPath(repoRoot);
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const file of ledger) {
+    const abs = normalizeModifiedPath(file);
+    if (seen.has(abs)) continue;
+    const rel = path4.relative(root, abs);
+    if (rel.length > 0 && !rel.startsWith("..") && !path4.isAbsolute(rel)) {
+      seen.add(abs);
+      out.push(abs);
+    }
+  }
+  return out;
+}
+
+// src/tools/team-tasks-complete.ts
+init_log();
+import path5 from "node:path";
 import { existsSync as existsSync2, readdirSync, statSync } from "node:fs";
 function wakeReviewTarget(deps, teamId, taskId, caller, target, notes, kind) {
   if (!target.sessionId) return false;
@@ -3453,14 +3555,6 @@ function normalizeDir(dir) {
   return dir.replace(/\/+$/, "");
 }
 var NESTED_REPO_SCAN_DEPTH = 2;
-function resolveFreshnessSince(deps, teamId, taskTimeCreated) {
-  const row = deps.db.query("SELECT time_created FROM team WHERE id = ?").get(teamId);
-  const stamps = [row?.time_created, taskTimeCreated].filter(
-    (v) => typeof v === "number" && Number.isFinite(v)
-  );
-  if (stamps.length === 0) return Number.POSITIVE_INFINITY;
-  return Math.min(...stamps);
-}
 async function gitToplevel(cwd) {
   const res = await runCommand(["git", "rev-parse", "--show-toplevel"], { cwd });
   if (res.exitCode !== 0) return null;
@@ -3468,7 +3562,7 @@ async function gitToplevel(cwd) {
   return top.length > 0 ? normalizeDir(top) : null;
 }
 function isRepoRoot(dir) {
-  return existsSync2(path4.join(dir, ".git"));
+  return existsSync2(path5.join(dir, ".git"));
 }
 function findNestedRepoRoots(root, maxDepth) {
   const found = [];
@@ -3482,7 +3576,7 @@ function findNestedRepoRoots(root, maxDepth) {
     }
     for (const entry of entries) {
       if (entry.startsWith(".") || entry === "node_modules") continue;
-      const child = path4.join(dir, entry);
+      const child = path5.join(dir, entry);
       let isDir = false;
       try {
         isDir = statSync(child).isDirectory();
@@ -3502,8 +3596,8 @@ function findNestedRepoRoots(root, maxDepth) {
 }
 function findSiblingRepoRoots(dir) {
   const normalized = normalizeDir(dir);
-  const parent = path4.dirname(normalized);
-  const self = path4.basename(normalized);
+  const parent = path5.dirname(normalized);
+  const self = path5.basename(normalized);
   const found = [];
   let entries;
   try {
@@ -3513,7 +3607,7 @@ function findSiblingRepoRoots(dir) {
   }
   for (const entry of entries) {
     if (entry === self || entry.startsWith(".")) continue;
-    const child = path4.join(parent, entry);
+    const child = path5.join(parent, entry);
     try {
       if (!statSync(child).isDirectory()) continue;
     } catch {
@@ -3523,39 +3617,19 @@ function findSiblingRepoRoots(dir) {
   }
   return found;
 }
-async function hasFreshDirt(repo, sinceMs) {
-  const status = await runCommand(["git", "status", "--porcelain"], { cwd: repo });
-  if (status.exitCode !== 0) return false;
-  const lines = status.stdout.split("\n").map((l) => l.replace(/\s+$/, "")).filter((l) => l.length > 0);
-  if (lines.length === 0) return false;
-  const threshold = sinceMs;
-  for (const line of lines) {
-    let rel = line.slice(3);
-    const arrow = rel.indexOf(" -> ");
-    if (arrow !== -1) rel = rel.slice(arrow + 4);
-    rel = rel.replace(/^"|"$/g, "").trim();
-    if (rel.length === 0) continue;
-    try {
-      if (statSync(path4.join(repo, rel)).mtimeMs >= threshold) return true;
-    } catch {
-      return true;
-    }
-  }
-  return false;
-}
 function extraRepoRoots() {
   const raw = process.env.ENSEMBLE_AUTOCOMMIT_REPOS;
   if (!raw) return [];
   return raw.split(/[\n,;:]+/).map((p) => p.trim()).filter((p) => p.length > 0);
 }
-async function resolveCommitTargets(dir, sinceMs) {
-  const targets = [];
+async function discoverCandidateRepos(dir) {
+  const candidates = [];
   const seen = /* @__PURE__ */ new Set();
   const add = (rawPath) => {
     const p = normalizeDir(rawPath);
     if (seen.has(p)) return;
     seen.add(p);
-    targets.push({ path: p, name: path4.basename(p) });
+    candidates.push(p);
   };
   const primary = await gitToplevel(dir);
   if (primary && primary === normalizeDir(dir)) {
@@ -3567,25 +3641,65 @@ async function resolveCommitTargets(dir, sinceMs) {
     if (nested !== normalizeDir(dir)) add(nested);
   }
   for (const sibling of findSiblingRepoRoots(dir)) {
-    if (await hasFreshDirt(sibling, sinceMs)) add(sibling);
+    add(sibling);
   }
   for (const extra of extraRepoRoots()) {
     if (extra !== normalizeDir(dir) && isRepoRoot(extra)) add(extra);
   }
-  const depth = (p) => p.split(path4.sep).filter(Boolean).length;
-  targets.sort((a, b) => depth(b.path) - depth(a.path));
+  return candidates;
+}
+function resolveCommitTargets(candidates, ledger) {
+  const depth = (p) => p.split(path5.sep).filter(Boolean).length;
+  const sorted = [...candidates].sort((a, b) => depth(b) - depth(a));
+  const owned = /* @__PURE__ */ new Map();
+  const claimed = /* @__PURE__ */ new Set();
+  for (const rawFile of ledger) {
+    const abs = normalizeModifiedPath(rawFile);
+    if (abs === "" || claimed.has(abs)) continue;
+    for (const repo of sorted) {
+      if (modifiedFilesUnderRepo([abs], repo).length === 0) continue;
+      const list = owned.get(repo) ?? [];
+      list.push(abs);
+      owned.set(repo, list);
+      claimed.add(abs);
+      break;
+    }
+  }
+  const targets = [];
+  for (const repo of sorted) {
+    const files = owned.get(repo);
+    if (files && files.length > 0) {
+      targets.push({ path: repo, name: path5.basename(repo), files });
+    }
+  }
   return targets;
 }
-async function autoCommitApprovedTask(deps, taskContent, sinceMs) {
+async function autoCommitApprovedTask(deps, teamId, taskContent) {
   const dir = deps.directory;
   try {
-    const targets = await resolveCommitTargets(dir, sinceMs);
+    const ledger = listModifiedFiles(deps.db, teamId);
+    if (ledger.length === 0) return "";
+    const candidates = await discoverCandidateRepos(dir);
+    const targets = resolveCommitTargets(candidates, ledger);
     if (targets.length === 0) return "";
     const message = `feat(runtime): ${taskContent}`;
     const committed = [];
+    const committedPaths = [];
     let sawDirty = false;
     for (const target of targets) {
       try {
+        const addSet = /* @__PURE__ */ new Set();
+        for (const f of target.files) {
+          const rel = path5.relative(target.path, f);
+          if (rel.length > 0 && !rel.startsWith("..") && !path5.isAbsolute(rel)) addSet.add(rel);
+        }
+        for (const nested of committedPaths) {
+          const rel = path5.relative(target.path, nested);
+          if (rel.length > 0 && !rel.startsWith("..") && !path5.isAbsolute(rel) && !rel.includes(path5.sep)) {
+            addSet.add(rel);
+          }
+        }
+        if (addSet.size === 0) continue;
         const status = await runCommand(["git", "status", "--porcelain"], { cwd: target.path });
         if (status.exitCode !== 0) {
           log(`tasks-complete:autocommit:status-failed dir=${target.path} err=${status.stderr.trim()}`);
@@ -3593,8 +3707,17 @@ async function autoCommitApprovedTask(deps, taskContent, sinceMs) {
         }
         if (status.stdout.trim().length === 0) continue;
         sawDirty = true;
+        const addList = [...addSet].sort();
+        const add = await runCommand(
+          ["git", "-C", target.path, "add", "--", ...addList],
+          { cwd: target.path }
+        );
+        if (add.exitCode !== 0) {
+          log(`tasks-complete:autocommit:add-failed dir=${target.path} err=${add.stderr.trim()}`);
+          continue;
+        }
         const commit = await runCommand(
-          ["sh", "-c", 'git -C "$1" add -A && git -C "$1" commit -m "$2"', "ensemble-autocommit", target.path, message],
+          ["git", "-C", target.path, "commit", "-m", message],
           { cwd: target.path }
         );
         if (commit.exitCode !== 0) {
@@ -3604,9 +3727,36 @@ async function autoCommitApprovedTask(deps, taskContent, sinceMs) {
         const rev = await runCommand(["git", "rev-parse", "--short", "HEAD"], { cwd: target.path });
         const hash = rev.exitCode === 0 ? rev.stdout.trim() : "";
         committed.push({ name: target.name, hash, path: target.path });
-        log(`tasks-complete:autocommit:committed dir=${target.path} repo=${target.name} hash=${hash || "?"} task="${taskContent}"`);
+        committedPaths.push(normalizeDir(target.path));
+        log(`tasks-complete:autocommit:committed dir=${target.path} repo=${target.name} hash=${hash || "?"} files=${addList.length} task="${taskContent}"`);
       } catch (err) {
         log(`tasks-complete:autocommit:error dir=${target.path} err=${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    for (const repo of candidates) {
+      if (committedPaths.includes(normalizeDir(repo))) continue;
+      const gitlinks = committedPaths.filter((c) => normalizeDir(c) !== normalizeDir(repo)).map((c) => path5.relative(repo, c)).filter((rel) => rel.length > 0 && !rel.startsWith("..") && !path5.isAbsolute(rel) && !rel.includes(path5.sep));
+      if (gitlinks.length === 0) continue;
+      try {
+        const status = await runCommand(["git", "status", "--porcelain"], { cwd: repo });
+        if (status.exitCode !== 0 || status.stdout.trim().length === 0) continue;
+        const addList = [...new Set(gitlinks)].sort();
+        const add = await runCommand(["git", "-C", repo, "add", "--", ...addList], { cwd: repo });
+        if (add.exitCode !== 0) {
+          log(`tasks-complete:autocommit:add-failed dir=${repo} err=${add.stderr.trim()}`);
+          continue;
+        }
+        const commit = await runCommand(["git", "-C", repo, "commit", "-m", message], { cwd: repo });
+        if (commit.exitCode !== 0) {
+          log(`tasks-complete:autocommit:commit-failed dir=${repo} err=${commit.stderr.trim()}`);
+          continue;
+        }
+        const rev = await runCommand(["git", "rev-parse", "--short", "HEAD"], { cwd: repo });
+        const hash = rev.exitCode === 0 ? rev.stdout.trim() : "";
+        committed.push({ name: path5.basename(repo), hash, path: normalizeDir(repo) });
+        log(`tasks-complete:autocommit:committed dir=${repo} repo=${path5.basename(repo)} hash=${hash || "?"} files=${addList.length} (gitlink) task="${taskContent}"`);
+      } catch (err) {
+        log(`tasks-complete:autocommit:error dir=${repo} err=${err instanceof Error ? err.message : String(err)}`);
       }
     }
     if (committed.length === 0) {
@@ -3784,8 +3934,7 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
   }
   let commitSuffix = "";
   if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {
-    const sinceMs = resolveFreshnessSince(deps, teamInfo.teamId, task.time_created);
-    commitSuffix = await autoCommitApprovedTask(deps, task.content, sinceMs);
+    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content);
   }
   return `Completed task: ${task.content}${formatUnblockedSuffix(unblocked, wokeMembers)}${commitSuffix}`;
 }
@@ -6961,6 +7110,7 @@ async function setupEnsemble(ctx, options = {}) {
         event.input
       );
     }
+    recordFileFromToolCall(db, registry, event.sessionID, event.tool, event.input);
     recordFromToolAfter(
       { sessionID: event.sessionID, tool: event.tool },
       {},
@@ -7028,7 +7178,7 @@ async function setupEnsemble(ctx, options = {}) {
 // src/index.ts
 import { tool } from "@opencode-ai/plugin";
 import { OpencodeClient } from "@opencode-ai/sdk/v2";
-import path6 from "node:path";
+import path7 from "node:path";
 import { mkdirSync } from "node:fs";
 
 // src/client.ts
@@ -7097,12 +7247,12 @@ function wrapThrowingClient(raw, agentResolver) {
 // src/watchdog.ts
 init_merge_helper();
 import { createRequire as createRequire2 } from "node:module";
-import path5 from "node:path";
+import path6 from "node:path";
 init_log();
 var requireSessionModule = createRequire2(import.meta.url);
 function sessionStorePath(env = process.env) {
   const home = env.HOME ?? env.USERPROFILE ?? "~";
-  return path5.join(home, ".local", "share", "opencode", "opencode.db");
+  return path6.join(home, ".local", "share", "opencode", "opencode.db");
 }
 function openSessionStore(dbPath) {
   if (typeof process.versions.bun === "string") {
@@ -7478,7 +7628,7 @@ var DEFAULT_RATE_LIMIT_INTERVAL_MS = 1e3;
 var DEFAULT_WATCHDOG_CHECK_MS = 60 * 1e3;
 var plugin = async (input) => {
   const dbPath = getDbPath();
-  mkdirSync(path6.dirname(dbPath), { recursive: true });
+  mkdirSync(path7.dirname(dbPath), { recursive: true });
   const db = createDb(dbPath);
   const config = loadConfig(input.directory);
   const registry = new MemberRegistry();
@@ -7785,6 +7935,7 @@ var plugin = async (input) => {
       if (input2.tool === "question") {
         purgeApprovals.recordQuestionAnswer(input2.sessionID, output.output, input2.args);
       }
+      recordFileFromToolCall(db, registry, input2.sessionID, input2.tool, input2.args);
       recordFromToolAfter(input2, output, registry, activityBuffer);
     },
     // System prompt injection — keeps lead aware of team state, reminds teammates of role

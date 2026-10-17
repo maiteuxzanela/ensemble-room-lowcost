@@ -5,17 +5,27 @@
  *
  * Sob teste (código REAL, sem mocks de decisão):
  *   - [F1] src/tools/team-tasks-complete.ts — o wake 'board-complete' (sob
- *     silentLead:true é o ÚNICO caminho que acorda o lead) agora é
- *     model-aware: `promptModelAwareWake` com agent explícito de
- *     `team.lead_agent` + escada `resolveFallbackChainForAgent(config,
- *     leadAgent)` com STEP-DOWN em rejeição. Prova de causalidade: com
- *     config → payload COM `model`; sem config (contraste legado) → payload
- *     SEM `model` (assinatura retrocompatível, nunca quebrada).
+ *     silentLead:true é o ÚNICO caminho que acorda o lead) permanece
+ *     SOBERANO: promptAsync neutro, sem `model` e sem `agent`.
+ *   - [TICKET-32B] src/notify.ts — `promptModelAwareWake` preserva o MODELO
+ *     NATIVO da sessão no degrau 0 (payload SEM a chave `model`) quando
+ *     nenhum `primaryModel` explícito é passado; a escada
+ *     `resolveFallbackChainForAgent(config, leadAgent)` só é percorrida após
+ *     REJEIÇÃO do degrau anterior (STEP-DOWN). Prova de causalidade: com
+ *     config + transporte rejeitado → 2 tentativas (nativo → cadeia dante);
+ *     sem config + mesma rejeição → 1 tentativa nativa (fallback reativo
+ *     desativado, assinatura retrocompatível nunca quebrada). Um
+ *     `primaryModel` explícito segue respeitado como degrau 0
+ *     (tests/test_fallback_hardening.mjs g2).
  *   - [F2] src/watchdog.ts — o wrapper `notifyLead` repassa `{ config }`
  *     (stall / chatty / timeout acordam o lead na escada model-aware);
  *     Watchdog construído SEM config degrada para o wake legado modelless.
  *   - [F2] src/tools/team-spawn.ts — o rollback de spawn falho chama
  *     `notifyLead(..., { config: deps.config })`.
+ *   - [TICKET-32B item 2] call sites de notifyLead repassam `options.config`
+ *     (watchdog.ts, hooks.ts handleSessionErrorEvent, index.ts fast-idle,
+ *     team-spawn.ts rollback) — paridade estática src↔dist + prova
+ *     comportamental: SEM config a escada não existe (1 tentativa).
  *   - src/notify.ts — `promptModelAwareWake` (escada deduplicada +
  *     step-down) e `notifyLead` (persistência prévia + agent de
  *     team.lead_agent).
@@ -28,12 +38,14 @@
  * Bancos são SQLite REAIS (node:sqlite) com TODAS as migrations; o config é
  * DEFAULT_CONFIG espelhado em disco em memória (nenhum arquivo lido).
  *
- * Cobertura do ticket T8:
- *   (a) wake 'board-complete' recebe `agent` do lead + `model` da cadeia
- *       (fallbackModelsByAgent.dante) com step-down — NÃO é mais modelless;
- *   (b) call sites notifyLead de watchdog.ts e team-spawn.ts passam
- *       `config` (escada ativa) — paridade estática src↔dist + provas
- *       comportamentais com e sem config.
+ * Cobertura do ticket T8 + TICKET-32B:
+ *   (a) wake 'board-complete' segue SOBERANO (sem `model`/`agent`);
+ *   (b) degrau 0 de todo wake com config preserva o MODELO NATIVO da sessão
+ *       (payload SEM `model`) e a rejeição do transporte dispara STEP-DOWN
+ *       para a cadeia (fallbackModelsByAgent.dante) — prova com fail-once;
+ *   (c) call sites notifyLead (watchdog.ts, hooks.ts, index.ts, team-spawn.ts)
+ *       passam `config` (escada reativa ativa) — paridade estática src↔dist
+ *       + provas comportamentais com e sem config.
  *
  * Uso:  node tests/test_model_aware_wakes.mjs
  * Exit: 0 = todos os checks PASS; 1 = há FAIL.
@@ -169,6 +181,8 @@ const srcComplete = readSrc("tools/team-tasks-complete.ts");
 const srcWatchdog = readSrc("watchdog.ts");
 const srcSpawn = readSrc("tools/team-spawn.ts");
 const srcNotify = readSrc("notify.ts");
+const srcHooks = readSrc("hooks.ts");
+const srcIndex = readSrc("index.ts");
 
 function marker(label, needle, { src = true, dist = true } = {}) {
   const hit = (text) => (needle instanceof RegExp ? needle.test(text) : text.includes(needle));
@@ -194,6 +208,30 @@ const srcAll = () => [srcComplete, srcWatchdog, srcSpawn, srcNotify].join("\n");
   marker("notify: promptModelAwareWake usa resolveFallbackChainForAgent(config, agent)", "resolveFallbackChainForAgent(config, agent)");
   marker("notify: notifyLead lê agent de team.lead_agent (resolveLeadWakeContext)", "SELECT lead_session_id, lead_agent FROM team WHERE id = ?");
   marker("notify: texto de wake do notifyLead", "[System: New team message from system]");
+}
+
+/* --- TICKET-32B: degrau 0 nativo + threading de options.config ---------- */
+{
+  // (1) rung 0 = primaryModel explícito OU nativo da sessão — NUNCA a cabeça
+  // da cadeia. Sem isso o wake do notifyLead começava em chain[0] e baixava o
+  // Lead para um modelo de fallback barato logo no primeiro promptAsync.
+  marker(
+    "32B: ladder do promptModelAwareWake tem rung 0 = [primaryModel || undefined] (nativo)",
+    /const ladder(:\s*Array<string\s*\|\s*undefined>)?\s*=\s*\[primaryModel \|\| (undefined|void 0)\]/,
+  );
+  // (2) notifyLead repassa options.config/options.primaryModel VERBATIM
+  // (o esbuild remove a vírgula final — o marcador é tolerante a isso).
+  marker("32B: notifyLead repassa config: options?.config", /config: options\?\.config,?/);
+  marker("32B: notifyLead repassa primaryModel: options?.primaryModel", /primaryModel: options\?\.primaryModel,?/);
+
+  // (3) Call sites de notifyLead — hooks.ts (session.error) e index.ts
+  // (fast-idle) precisam entregar o config, senão a escada reativa não existe.
+  const hooksCfg = /had a session error[\s\S]{0,900}?config \? \{ config \} : (undefined|void 0)/;
+  check("paridade 32B (src): hooks.ts handleSessionErrorEvent repassa { config }", hooksCfg.test(srcHooks), srcHooks.match(hooksCfg)?.[0].slice(-60) ?? "ausente");
+  check("paridade 32B (dist): hooks.ts handleSessionErrorEvent repassa { config }", hooksCfg.test(distRaw), distRaw.match(hooksCfg)?.[0].slice(-60) ?? "ausente");
+  const idxCfg = /went idle immediately after spawning[\s\S]{0,1400}?\{ config \}/;
+  check("paridade 32B (src): index.ts fast-idle repassa { config }", idxCfg.test(srcIndex), srcIndex.match(idxCfg)?.[0].slice(-40) ?? "ausente");
+  check("paridade 32B (dist): index.ts fast-idle repassa { config }", idxCfg.test(distRaw), distRaw.match(idxCfg)?.[0].slice(-40) ?? "ausente");
 }
 
 /* --- F2: watchdog.ts threads config no wrapper --- */
@@ -419,7 +457,7 @@ async function runBehavior(label, mods) {
    * B) [F2] watchdog.ts — wrapper notifyLead com config               *
    * ================================================================ */
 
-  /* --- B1: timeout COM config → escada ativa --- */
+  /* --- B1: timeout COM config → degrau 0 nativo + STEP-DOWN na rejeição --- */
   {
     const f = scenario("f2_wd_timeout_cfg");
     const LEAD = "ses_wd1_lead";
@@ -433,13 +471,33 @@ async function runBehavior(label, mods) {
       config: CFG,
       // cwd omitido → preserveBranch fora de jogo (nenhum worktree no fixture)
     });
+    // TICKET-32B: a 1ª tentativa (nativa) do LEAD é rejeitada pelo transporte
+    // (ex.: 429) — é a REJEIÇÃO, e não o wake, que caminha a escada.
+    f.failOnce.add(LEAD);
     const base = f.calls.promptAsync.length;
     await withHome(f.root, () => wd.check());
     await tick();
     const wakes = f.leadWakes(LEAD, base);
-    check(`[${label}] B1 timeout COM config: wake do lead EXATAMENTE 1x`, wakes.length === 1, `delta=${wakes.length}`);
-    check(`[${label}] B2 timeout: agent 'dante' explícito`, wakes[0]?.agent === "dante", String(wakes[0]?.agent));
-    check(`[${label}] B3 timeout: model da cadeia dante (escada ativa)`, eq(wakes[0]?.model, DANTE1), JSON.stringify(wakes[0]?.model));
+    check(
+      `[${label}] B1 timeout COM config + rejeição: EXATAMENTE 2 tentativas (nativo → cadeia)`,
+      wakes.length === 2,
+      `delta=${wakes.length}`,
+    );
+    check(
+      `[${label}] B2 timeout: agent 'dante' explícito em TODOS os degraus`,
+      wakes.length === 2 && wakes.every((w) => w.agent === "dante"),
+      JSON.stringify(wakes.map((w) => w.agent)),
+    );
+    check(
+      `[${label}] B3 degrau 0 preserva o modelo NATIVO da sessão (sem chave 'model')`,
+      !("model" in wakes[0]),
+      wakes[0] ? Object.keys(wakes[0]).join(",") : "sem wake",
+    );
+    check(
+      `[${label}] B3b STEP-DOWN: degrau 1 usa o 1º fallback da cadeia dante`,
+      eq(wakes[1]?.model, DANTE1),
+      JSON.stringify(wakes[1]?.model),
+    );
     check(
       `[${label}] B4 timeout: texto de wake do notifyLead + synthetic`,
       wakes[0]?.parts?.[0]?.text === "[System: New team message from system]" && wakes[0]?.synthetic === true,
@@ -458,7 +516,7 @@ async function runBehavior(label, mods) {
     f.close();
   }
 
-  /* --- B2: timeout SEM config → wake legado modelless (contraste) --- */
+  /* --- B2: timeout SEM config → 1 tentativa nativa (sem escada) --- */
   {
     const f = scenario("f2_wd_timeout_nocfg");
     const LEAD = "ses_wd2_lead";
@@ -471,11 +529,18 @@ async function runBehavior(label, mods) {
       stallThresholdMs: 0, peerMessageLimit: 0, roomInactivityThresholdMs: 0,
       // config OMITIDO — degrada para o wake legado (assinatura retrocompatível)
     });
+    // Mesma rejeição de transporte do B1 — SEM config não há degrau seguinte,
+    // então a escada reativa prova ser exatamente o `config` threading (32B-2).
+    f.failOnce.add(LEAD);
     const base = f.calls.promptAsync.length;
     await withHome(f.root, () => wd.check());
     await tick();
     const wakes = f.leadWakes(LEAD, base);
-    check(`[${label}] B9 timeout SEM config: wake do lead 1x`, wakes.length === 1, `delta=${wakes.length}`);
+    check(
+      `[${label}] B9 timeout SEM config + rejeição: EXATAMENTE 1 tentativa (nenhum retry sem config)`,
+      wakes.length === 1,
+      `delta=${wakes.length}`,
+    );
     check(
       `[${label}] B10 contraste: SEM config o wake é modelless (sem chave 'model'), agent segue explícito`,
       wakes.length === 1 && !("model" in wakes[0]) && wakes[0]?.agent === "dante",
@@ -504,7 +569,11 @@ async function runBehavior(label, mods) {
     await tick();
     const wakes = f.leadWakes(LEAD, base);
     check(`[${label}] B11 stall COM config: wake do lead 1x`, wakes.length === 1, `delta=${wakes.length}`);
-    check(`[${label}] B12 stall: agent 'dante' + model dante-1#low no wake`, wakes[0]?.agent === "dante" && eq(wakes[0]?.model, DANTE1), JSON.stringify({ agent: wakes[0]?.agent, model: wakes[0]?.model }));
+    check(
+      `[${label}] B12 stall: degrau 0 NATIVO (sem chave 'model') + agent 'dante'`,
+      wakes[0]?.agent === "dante" && !("model" in wakes[0]),
+      JSON.stringify({ agent: wakes[0]?.agent, model: "model" in (wakes[0] ?? {}) ? wakes[0].model : "(nativo)" }),
+    );
     const nudges = f.calls.promptAsync.slice(base).filter((c) => c.sessionID === "ses_st1_m1");
     check(`[${label}] B13 stall: nudge ao membro disparado 1x`, nudges.length === 1, `nudges=${nudges.length}`);
     const nudged = f.db.query("SELECT last_nudged_at FROM team_member WHERE team_id=? AND name=?").get("team_st1", "st1");
@@ -535,7 +604,11 @@ async function runBehavior(label, mods) {
     await tick();
     const wakes = f.leadWakes(LEAD, base);
     check(`[${label}] B16 chatty COM config: wake do lead 1x`, wakes.length === 1, `delta=${wakes.length}`);
-    check(`[${label}] B17 chatty: agent 'dante' + model dante-1#low no wake`, wakes[0]?.agent === "dante" && eq(wakes[0]?.model, DANTE1), JSON.stringify({ agent: wakes[0]?.agent, model: wakes[0]?.model }));
+    check(
+      `[${label}] B17 chatty: degrau 0 NATIVO (sem chave 'model') + agent 'dante'`,
+      wakes[0]?.agent === "dante" && !("model" in wakes[0]),
+      JSON.stringify({ agent: wakes[0]?.agent, model: "model" in (wakes[0] ?? {}) ? wakes[0].model : "(nativo)" }),
+    );
     const nudges = f.calls.promptAsync.slice(base).filter((c) => c.sessionID === "ses_ct1_m1");
     check(`[${label}] B18 chatty: nudge ao membro disparado 1x`, nudges.length === 1, `nudges=${nudges.length}`);
     const sys = f.db.query("SELECT content FROM team_message WHERE team_id=? AND from_name='system'").all("team_ct1");
@@ -556,6 +629,9 @@ async function runBehavior(label, mods) {
     const LEAD = "ses_sp1_lead";
     seedTeam(f.db, "team_sp1", LEAD, "dante");
     f.failOnce.add("ses_child_1"); // 1ª promptAsync da sessão filha rejeita → rollback
+    // 32B-2: a 1ª tentativa nativa do LEAD também é rejeitada — só o config
+    // threading ({ config: deps.config }) habilita o degrau de retry.
+    f.failOnce.add(LEAD);
 
     const base = f.calls.promptAsync.length;
     const baseSys = f.db.query("SELECT COUNT(*) c FROM team_message WHERE team_id=? AND from_name='system'").get("team_sp1").c;
@@ -575,11 +651,15 @@ async function runBehavior(label, mods) {
       String(f.registry.getBySession("ses_child_1")?.memberName),
     );
     const wakes = f.leadWakes(LEAD, base);
-    check(`[${label}] C4 rollback COM config: wake model-aware do lead 1x`, wakes.length === 1, `delta=${wakes.length}`);
     check(
-      `[${label}] C5 wake com agent 'dante' + model dante-1#low (escada ativa)`,
-      wakes[0]?.agent === "dante" && eq(wakes[0]?.model, DANTE1),
-      JSON.stringify({ agent: wakes[0]?.agent, model: wakes[0]?.model }),
+      `[${label}] C4 rollback COM config + rejeição: 2 tentativas do lead (nativo → cadeia)`,
+      wakes.length === 2,
+      `delta=${wakes.length}`,
+    );
+    check(
+      `[${label}] C5 degrau 0 NATIVO (sem chave 'model') + degrau 1 = dante-1#low, agent 'dante'`,
+      !("model" in wakes[0]) && eq(wakes[1]?.model, DANTE1) && wakes.every((w) => w.agent === "dante"),
+      JSON.stringify({ rung0: Object.keys(wakes[0] ?? {}), rung1: wakes[1]?.model }),
     );
     const sys = f.db.query("SELECT content FROM team_message WHERE team_id=? AND from_name='system'").all("team_sp1");
     check(

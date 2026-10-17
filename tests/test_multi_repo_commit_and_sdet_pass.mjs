@@ -9,14 +9,18 @@
  * Sob teste (src/ e dist/ REAIS, SQLite real via node:sqlite, git REAL em
  * sandbox — SEM MOCKS):
  *   - src/tools/team-tasks-complete.ts
- *       • Flow 3 (complete): `autoCommitApprovedTask` -> `resolveCommitTargets`
- *         descobre N repositórios (room dir quando É o toplevel, repos ANINHADOS
- *         dentro dele com scan bounded, IRMÃOS sujos E recentemente tocados com
- *         SIBLING_FRESHNESS_MS, override por ENSEMBLE_AUTOCOMMIT_REPOS) e comita
- *         cada um ATOMICAMENTE via `sh -c 'git -C "$1" add -A && git -C "$1"
- *         commit -m "$2"'` (path + mensagem posicionais → shell-inert). Ordenação
- *         deepest-first: o repo aninhado comita ANTES do pai para o `git add -A`
- *         do pai registrar o HEAD final (gitlink) e a árvore do pai ficar limpa.
+ *       • Flow 3 (complete): `autoCommitApprovedTask` é GATEADO PELO LEDGER e
+ *         CIRÚRGICO (TICKET-32A): lê `listModifiedFiles(db, teamId)` (ledger
+ *         `team_modified_file` da SALA — populado pelo hook tool.execute.after);
+ *         ledger VAZIO → NENHUM commit (fail-closed). `resolveCommitTargets`
+ *         descobre N candidatos (room dir quando É o toplevel, repos ANINHADOS
+ *         com scan bounded, IRMÃOS, override ENSEMBLE_AUTOCOMMIT_REPOS) e
+ *         mantém SÓ os que possuem arquivo do ledger — atribuição ao repo MAIS
+ *         FUNDO que o contém. Staging `git add -- <path1> <path2> ...` (argv,
+ *         sem shell) — NUNCA `git add -A`. Ordenação deepest-first: o repo
+ *         aninhado comita ANTES do pai, que stageia o gitlink do filho → as
+ *         duas árvores terminam limpas (27A) e o commit do pai contém SÓ
+ *         `nested` (gitlink), nunca `nested/<interno>`.
  *       • Flow 0 (`action: 'sdet_pass'`): SDET-exclusivo (isSDETMEmber). Só roda
  *         em card `in_review`; grava review_notes + timestamp, o card PERMANECE
  *         em in_review (só o Quality Gate o fecha) e acorda a Clara nativamente
@@ -26,38 +30,45 @@
  *         `synthetic: true`.
  *
  * Cobertura:
- *   MR1  Room (toplevel git) + repo ANINHADO, ambos sujos → complete da Clara
- *        comita AMBOS atomicamente, hashes DISTINTOS no sufixo, árvore limpa em
- *        ambos, mensagem exata, +1 commit por repo (prova da ordem deepest-first
- *        pelo pai terminar limpo).
- *   MR2  Room sujo + irmão sujo ANTES do nascimento da sala (mtime < sinceMs) →
- *        só o room comita; o irmão NÃO é comitado e segue sujo (guarda de frescor
- *        protege árvores alheias anteriores ao ciclo).
- *   MR3/MR4  Regressão HARNESS-27C (janela vinculada ao ciclo): sala/tarefa nascida
- *        há 3h (MR3) ou 5h (MR4) e um irmão tocado DURANTE a vida da sala mas já
- *        há > 1h (90min / 2h) → irmão DEVE ser comitado (o relógio estático de 1h
- *        o deixava órfão); contraprova: irmão tocado ANTES do nascimento
- *        (mtime < sinceMs) permanece excluído e sujo.
+ *   MR1  Room (toplevel git) + repo ANINHADO, ambos sujos e AMBOS no ledger →
+ *        complete da Clara comita AMBOS atomicamente, hashes DISTINTOS no
+ *        sufixo, árvore limpa em ambos, mensagem exata, +1 commit por repo; o
+ *        commit do room contém EXATAMENTE {feature.txt, nested} — gitlink
+ *        direto, NUNCA `nested/<interno>` (e o nested contém só o seu arquivo).
+ *   MR2  Room no ledger + irmão sujo FORA do ledger (mtime recente) → só o
+ *        room comita; o irmão NÃO é comitado e segue sujo (o LEDGER decide —
+ *        não a frescor do arquivo).
+ *   MR3/MR4  Inversão TICKET-32A: irmão REGISTRADO no ledger com mtime VELHO
+ *        (bem além da antiga janela de 1h) → DEVE ser comitado (prova que a
+ *        janela de frescor por mtime foi removida); contraprova: irmão NÃO
+ *        registrado com mtime RECENTE → permanece excluído e sujo (mtime novo
+ *        não se infiltra — o ledger é o único gate).
+ *   MR5  NOVO (TICKET-32A): staging cirúrgico — room com feature.txt NO ledger
+ *        e stray.txt FORA → commit contém SÓ feature.txt; stray permanece `??`.
  *   SP1  Implementador chama `sdet_pass` → "Only SDET can invoke sdet_pass";
  *        board intacto; ZERO wake.
  *   SP2  Hugo chama `sdet_pass` em card `in_progress` → erro de estado; ZERO wake.
  *   SP3  Hugo chama `sdet_pass` em card `completed` → erro de estado; ZERO wake.
- *   SP4  Hugo chama `sdet_pass` em card `in_review` → card PERMANECE in_review,
- *        review_notes gravadas, EXATAMENTE 1 wake para a sessão da Clara com
- *        texto canônico + agent explícito dinâmico (qa.agent da revisora) +
- *        synthetic; NENHUM commit (Portão 1 é exclusivo do complete do Quality
- *        Gate).
+ *   SP4  Hugo chama `sdet_pass` em card `in_review` (com ledger POPULADO da
+ *        sala) → card PERMANECE in_review, review_notes gravadas, EXATAMENTE 1
+ *        wake para a sessão da Clara com texto canônico + agent explícito
+ *        dinâmico (qa.agent da revisora) + synthetic; NENHUM commit (Portão 1 é
+ *        exclusivo do complete do Quality Gate — o ledger não muda isso).
  *   SP5  Sala sem Quality Gate → `sdet_pass` não lança, notas gravadas, ZERO wake.
  *   SP6  Quality Gate CUSTOM (is_qa=1, agent != "clara", ex.: 'gate-custom') →
  *        o wake do sdet_pass DEVE carregar `agent === 'gate-custom'` (A2: persona
  *        dinâmica da revisora; nunca "clara" hardcoded).
  *   SP7  Quality Gate LEGADO com `agent` VAZIO (is_qa=1) → fallback "clara";
  *        SP7b retrocompat por NOME (is_qa=0, nome "clara", agent vazio) → "clara".
- *   Estáticos: paridade src↔dist dos literais 27A/27B/27C + anti-mock.
+ *   Estáticos: paridade src↔dist dos literais NOVOS do ledger cirúrgico (e
+ *        remoção comprovada dos antigos `resolveFreshnessSince`/`hasFreshDirt`/
+ *        `add -A`) + anti-mock.
  *   PROVA DE MUTAÇÃO: 9 mutantes determinísticos patcheados no bundle dist
- *        (M8 re-endurece o agent hardcoded "clara"; M9 adultera o fallback de
- *        agent vazio). A guarda A1 anti-auto-review foi revertida por decisão de
- *        produto (Maiteux/lead) — o card tem escopo exclusivamente A2.
+ *        (M6 reintroduz o staging cego `git add -A` → capturado por MR5; M7
+ *        inverte a atribuição mais-fundo-primeiro → capturado por MR1; M8
+ *        re-endurece o agent hardcoded "clara"; M9 adultera o fallback de
+ *        agent vazio). A guarda A1 anti-auto-review foi revertida por decisão
+ *        de produto (Maiteux/lead) — o card tem escopo exclusivamente A2.
  *
  * Único seam: cliente SDK do OpenCode (fronteira externa), reduzido a um
  * recorder determinístico de promptAsync — mesmo padrão das demais suítes do
@@ -93,7 +104,7 @@ process.on("unhandledRejection", (e) => unhandled.push(e));
 // ---------------------------------------------------------------------------
 // 0. Harness: dist real + exportação dos símbolos sob teste (sem mocks).
 // ---------------------------------------------------------------------------
-const REQUIRED_SYMBOLS = ["createDb", "executeTeamTasksComplete", "DEFAULT_CONFIG", "MemberRegistry", "ProgressTracker"];
+const REQUIRED_SYMBOLS = ["createDb", "executeTeamTasksComplete", "DEFAULT_CONFIG", "MemberRegistry", "ProgressTracker", "recordModifiedFile", "listModifiedFiles"];
 const distRaw = readFileSync(DIST, "utf8");
 
 const buildHarnessCode = (raw) => {
@@ -144,7 +155,7 @@ function makeRepo(dir) {
 // ---------------------------------------------------------------------------
 let flowSeq = 0;
 async function runFlow(mod) {
-  const { createDb, executeTeamTasksComplete, DEFAULT_CONFIG, MemberRegistry, ProgressTracker } = mod;
+  const { createDb, executeTeamTasksComplete, DEFAULT_CONFIG, MemberRegistry, ProgressTracker, recordModifiedFile } = mod;
 
   const sandbox = mkdtempSync(path.join(os.tmpdir(), "ensemble-mrsdet-"));
   const db = createDb(path.join(sandbox, "ensemble.db"));
@@ -209,6 +220,9 @@ async function runFlow(mod) {
     member("mr1", "clara", "ses_clara_mr1", "clara", 1, "qa");
     const content = "Feat multi-repo";
     task("mr1", "TMR1", "tales", "in_review", content);
+    // Seed do ledger (o hook tool.execute.after gravaria estes 2 arquivos).
+    recordModifiedFile(db, "mr1", path.join(room, "feature.txt"));
+    recordModifiedFile(db, "mr1", path.join(nested, "feature.txt"));
 
     const roomBefore = headHash(room), roomCountBefore = headCount(room);
     const nestedBefore = headHash(nested), nestedCountBefore = headCount(nested);
@@ -230,9 +244,20 @@ async function runFlow(mod) {
     R("MR1.room-message-exact", lastMsg(room) === `feat(runtime): ${content}`, `msg="${lastMsg(room)}"`);
     R("MR1.nested-message-exact", lastMsg(nested) === `feat(runtime): ${content}`, `msg="${lastMsg(nested)}"`);
     R("MR1.board-completed", taskStatus("TMR1") === "completed", taskStatus("TMR1"));
+
+    // TICKET-32A/27A — conteúdo EXATO dos commits (staging cirúrgico):
+    // o commit do room contém o gitlink `nested` (e o seu feature.txt),
+    // NUNCA um caminho `nested/<interno>`; o nested contém só o seu arquivo.
+    const roomNames = git(room, ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]).out.split("\n").filter(Boolean).sort();
+    R("MR1.room-commit-file-set", roomNames.join(",") === "feature.txt,nested", `names=${roomNames.join(",")}`);
+    R("MR1.room-never-stages-nested-internals", !roomNames.some((n) => n.startsWith("nested/")), `names=${roomNames.join(",")}`);
+    const nestedNames = git(nested, ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]).out.split("\n").filter(Boolean).sort();
+    R("MR1.nested-commit-file-set", nestedNames.join(",") === "feature.txt", `names=${nestedNames.join(",")}`);
   }
 
-  // === MR2: irmão sujo ANTES do nascimento da sala (mtime < sinceMs) → excluído =
+  // === MR2: irmão sujo FORA do ledger (com mtime RECENTE) → excluído ======
+  //   TICKET-32A: o LEDGER decide quem comita — um irmão sujo com mtime novo
+  //   mas nunca registrado pela sala NÃO entra no commit.
   {
     const base = path.join(sandbox, "mr2");
     const room = path.join(base, "room");
@@ -241,16 +266,13 @@ async function runFlow(mod) {
     makeRepo(sibling);
     writeFileSync(path.join(room, "feature.txt"), "room dirty\n");
     const sibDirty = path.join(sibling, "feature.txt");
-    writeFileSync(sibDirty, "sibling stale dirty\n");
-    // Sala/tarefa nascem agora (seedTeam/task default now); o arquivo irmão tem
-    // mtime 2h no PASSADO → anterior ao nascimento → precisa ficar excluído.
-    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
-    utimesSync(sibDirty, old, old);
+    writeFileSync(sibDirty, "sibling dirty fora do ledger\n"); // mtime = agora
 
     seedTeam("mr2", "squad-stale-sibling", "ses_lead_mr2");
     member("mr2", "tales", "ses_tales_mr2", "build");
     member("mr2", "clara", "ses_clara_mr2", "clara", 1, "qa");
     task("mr2", "TMR2", "tales", "in_review", "Feat room only");
+    recordModifiedFile(db, "mr2", path.join(room, "feature.txt")); // SÓ o room
 
     const sibBefore = headHash(sibling), sibCountBefore = headCount(sibling);
     const hashes = hashesOf((await execute(depsFor(room), "ses_clara_mr2", { task_id: "TMR2", action: "complete" })).res);
@@ -262,13 +284,13 @@ async function runFlow(mod) {
     R("MR2.room-tree-clean", porcelain(room) === "", `status="${porcelain(room)}"`);
   }
 
-  // ====== MR3/MR4: janela de frescor VINCULADA ao ciclo da sala/tarefa ======
-  //   Regressão do ticket HARNESS-27C: a sala/tarefa nasce > 1h atrás; um arquivo
-  //   irmão tocado DURANTE a vida da sala mas já há > 1h (mtime pós-nascimento)
-  //   DEVE ser comitado — o antigo relógio estático de 1h o deixava órfão.
-  //   Contraprova: arquivo tocado ANTES do nascimento (mtime < sinceMs) fica
-  //   excluído e segue sujo.
-  const freshnessScenario = async (tag, bornAgoMs, freshFileAgeMs) => {
+  // ====== MR3/MR4: o LEDGER decide; mtime é IRRELEVANTE (TICKET-32A) =======
+  //   Inversão da antiga janela de frescor (HARNESS-27C/27A removidos):
+  //   • irmão REGISTRADO no ledger com mtime VELHO (2h — muito além da antiga
+  //     janela de 1h) → DEVE ser comitado (a janela de mtime acabou);
+  //   • irmão NÃO registrado com mtime RECENTE (agora) → NÃO pode entrar
+  //     (mtime novo não se infiltra; o ledger é o único gate).
+  const freshnessScenario = async (tag, bornAgoMs) => {
     const base = path.join(sandbox, tag);
     const room = path.join(base, "room");
     const freshSibling = path.join(base, "fresh-sibling");
@@ -278,18 +300,15 @@ async function runFlow(mod) {
     makeRepo(staleSibling);
     writeFileSync(path.join(room, "feature.txt"), `${tag} room dirty\n`);
 
-    // Irmão "fresco": tocado DURANTE o ciclo (mtime >= sinceMs), embora já faça
-    // mais de 1h em relação a agora (freshFileAgeMs > 1h) → DEVE ser comitado.
+    // Irmão registrado: NO ledger, porém mtime VELHO (2h atrás) → comitado.
     const freshFile = path.join(freshSibling, "feature.txt");
-    writeFileSync(freshFile, `${tag} fresh sibling dirty\n`);
-    const freshDate = new Date(now - freshFileAgeMs);
-    utimesSync(freshFile, freshDate, freshDate);
+    writeFileSync(freshFile, `${tag} registered sibling dirty\n`);
+    const oldDate = new Date(now - 2 * HOUR);
+    utimesSync(freshFile, oldDate, oldDate);
 
-    // Irmão "estragado": tocado ANTES do nascimento (mtime < sinceMs) → excluído.
+    // Irmão não registrado: FORA do ledger, mtime RECENTE (agora) → excluído.
     const staleFile = path.join(staleSibling, "feature.txt");
-    writeFileSync(staleFile, `${tag} stale sibling dirty\n`);
-    const staleDate = new Date(now - (bornAgoMs + HOUR));
-    utimesSync(staleFile, staleDate, staleDate);
+    writeFileSync(staleFile, `${tag} unregistered sibling dirty\n`);
 
     const born = now - bornAgoMs;
     const taskId = `T${tag.toUpperCase()}`;
@@ -298,6 +317,9 @@ async function runFlow(mod) {
     member(tag, "clara", `ses_clara_${tag}`, "clara", 1, "qa");
     const content = `Feat ${tag}`;
     task(tag, taskId, "tales", "in_review", content, born);
+    recordModifiedFile(db, tag, path.join(room, "feature.txt"));
+    recordModifiedFile(db, tag, freshFile); // registrado → comita
+    // staleFile deliberadamente FORA do ledger.
 
     const freshBefore = headHash(freshSibling), freshCountBefore = headCount(freshSibling);
     const staleBefore = headHash(staleSibling), staleCountBefore = headCount(staleSibling);
@@ -305,9 +327,9 @@ async function runFlow(mod) {
     return { room, freshSibling, staleSibling, content, hashes: hashesOf(res), freshBefore, freshCountBefore, staleBefore, staleCountBefore };
   };
 
-  const freshnessRegression = async (tag, bornAgoMs, freshFileAgeMs) => {
+  const freshnessRegression = async (tag, bornAgoMs) => {
     const P = tag.toUpperCase();
-    const s = await freshnessScenario(tag, bornAgoMs, freshFileAgeMs);
+    const s = await freshnessScenario(tag, bornAgoMs);
     R(`${P}.fresh-sibling-committed`, headHash(s.freshSibling) !== s.freshBefore && headCount(s.freshSibling) === s.freshCountBefore + 1, `${s.freshCountBefore}->${headCount(s.freshSibling)}`);
     R(`${P}.fresh-sibling-tree-clean`, porcelain(s.freshSibling) === "", `status="${porcelain(s.freshSibling)}"`);
     R(`${P}.fresh-sibling-message-exact`, lastMsg(s.freshSibling) === `feat(runtime): ${s.content}`, `msg="${lastMsg(s.freshSibling)}"`);
@@ -317,8 +339,34 @@ async function runFlow(mod) {
     R(`${P}.two-repos-committed`, s.hashes.length === 2, `hashes=${s.hashes.join(",")}`);
   };
 
-  await freshnessRegression("mr3", 3 * HOUR, 90 * MINUTE); // sala 3h; irmão tocado há 90min → comitado
-  await freshnessRegression("mr4", 5 * HOUR, 2 * HOUR);    // sala 5h; irmão tocado há 2h → comitado
+  await freshnessRegression("mr3", 3 * HOUR); // sala 3h; registrado+mtime 2h → comitado
+  await freshnessRegression("mr4", 5 * HOUR); // sala 5h; não registrado+mtime novo → excluído
+
+  // ==== MR5: staging cirúrgico — sujo FORA do ledger NÃO é comitado =======
+  {
+    const base = path.join(sandbox, "mr5");
+    const room = path.join(base, "room");
+    makeRepo(room);
+    writeFileSync(path.join(room, "feature.txt"), "mr5 room dirty\n");
+    writeFileSync(path.join(room, "stray.txt"), "mr5 stray nao registrado\n");
+
+    seedTeam("mr5", "squad-surgical", "ses_lead_mr5");
+    member("mr5", "tales", "ses_tales_mr5", "build");
+    member("mr5", "clara", "ses_clara_mr5", "clara", 1, "qa");
+    const content = "Feat surgical sem stray";
+    task("mr5", "TMR5", "tales", "in_review", content);
+    recordModifiedFile(db, "mr5", path.join(room, "feature.txt")); // SÓ feature.txt
+
+    const before = headCount(room);
+    const r = await execute(depsFor(room), "ses_clara_mr5", { task_id: "TMR5", action: "complete" });
+    const names = git(room, ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]).out.split("\n").filter(Boolean).sort();
+    R("MR5.no-error", r.err === null, r.err);
+    R("MR5.commit-suffix-present", /Task completed and locally committed: .*\([0-9a-f]{7,}\)/.test(r.res), `res="${r.res}"`);
+    R("MR5.commit-only-ledger-file", names.join(",") === "feature.txt", `names=${names.join(",")}`);
+    R("MR5.stray-still-untracked", porcelain(room).includes("?? stray.txt"), `status="${porcelain(room)}"`);
+    R("MR5.tree-not-clean", porcelain(room) !== "", `status="${porcelain(room)}"`);
+    R("MR5.exactly-one-new-commit", headCount(room) === before + 1, `${before}->${headCount(room)}`);
+  }
 
   // =================== SP: ação nativa 'sdet_pass' (27B) ===================
   const spRoom = path.join(sandbox, "sp");
@@ -375,6 +423,9 @@ async function runFlow(mod) {
     member("sp4", "hugo", "ses_hugo_sp4", "hugo");
     member("sp4", "clara", "ses_clara_sp4", "clara", 1, "qa");
     task("sp4", "TSP4", "tales", "in_review", "Feat ready for QA after SDET");
+    // Ledger POPULADO da sala: mesmo assim o sdet_pass NÃO comita — o Portão 1
+    // é exclusivo do `complete` do Quality Gate (ação, não ledger).
+    recordModifiedFile(db, "sp4", path.join(spRoom, "feature.txt"));
     const note = "Suíte determinística verde: 44/44 checks (multi-repo + sdet_pass)";
     const spCountBefore = headCount(spRoom);
     calls.length = 0;
@@ -489,16 +540,14 @@ for (const [name, { ok, detail }] of realFlow) check(`[real] ${name}`, ok, detai
 // 4. Estáticos: paridade src↔dist (27A/27B) + anti-mock.
 // ---------------------------------------------------------------------------
 const SRC_TC = readFileSync(path.join(SRC, "tools", "team-tasks-complete.ts"), "utf8");
+const SRC_MF = readFileSync(path.join(SRC, "modified-files.ts"), "utf8");
 const STATIC_LITERALS = [
   "resolveCommitTargets",
   "findNestedRepoRoots",
   "findSiblingRepoRoots",
-  "resolveFreshnessSince",
-  "hasFreshDirt(sibling, sinceMs)",
   "ENSEMBLE_AUTOCOMMIT_REPOS",
   "Task completed and locally committed: ",
   "Task completed; working tree already clean (no commit needed)",
-  'git -C "$1" add -A && git -C "$1" commit -m "$2"',
   "tasks-complete:autocommit:committed",
   "tasks-complete:autocommit:skip-non-root",
   "Only SDET can invoke sdet_pass",
@@ -510,6 +559,35 @@ const STATIC_LITERALS = [
 for (const lit of STATIC_LITERALS) {
   check(`paridade src↔dist: literal "${lit.slice(0, 46)}"`, SRC_TC.includes(lit) && distRaw.includes(lit));
 }
+
+// Literais NOVOS do contrato TICKET-32A (ledger + staging cirúrgico).
+const LEDGER_LITERALS = [
+  "recordModifiedFile",
+  "listModifiedFiles",
+  "modifiedFilesUnderRepo",
+  '"add", "--"',
+  "team_modified_file",
+];
+for (const lit of LEDGER_LITERALS) {
+  check(
+    `paridade src↔dist (ledger cirúrgico): literal "${lit.slice(0, 46)}"`,
+    distRaw.includes(lit) && (SRC_TC.includes(lit) || SRC_MF.includes(lit)),
+  );
+}
+
+// Remoções comprovadas do contrato antigo (add -A cego + janela de mtime).
+check(
+  "remoção: literal sh -c 'add -A && commit' AUSENTE de src e dist",
+  !SRC_TC.includes('git -C "$1" add -A') && !distRaw.includes('git -C "$1" add -A'),
+);
+check(
+  "remoção: janela de frescor por mtime (resolveFreshnessSince/hasFreshDirt) AUSENTE de src e dist",
+  !SRC_TC.includes("resolveFreshnessSince") && !distRaw.includes("resolveFreshnessSince") && !SRC_TC.includes("hasFreshDirt") && !distRaw.includes("hasFreshDirt"),
+);
+check(
+  "staging cirúrgico: comando executável ['add', '--', ...] em src e dist (nunca '-A')",
+  SRC_TC.includes('["git", "-C", target.path, "add", "--", ...addList]') && distRaw.includes('["git", "-C", target.path, "add", "--", ...addList]'),
+);
 check(
   "guarda anti-árvore-de-terceiro presente em src e dist (toplevel === dir)",
   SRC_TC.includes("if (primary && primary === normalizeDir(dir)) {") && distRaw.includes("if (primary && primary === normalizeDir(dir)) {"),
@@ -587,19 +665,28 @@ const MUTATIONS = [
   },
   {
     id: "M6",
-    desc: "janela de frescor dos irmãos desabilitada (comita árvore alheia antiga)",
-    from: "if (await hasFreshDirt(sibling, sinceMs)) add(sibling)",
-    to: "add(sibling)",
-    detect: ["MR2.only-room-committed", "MR2.stale-sibling-not-committed", "MR2.stale-sibling-still-dirty", "MR3.stale-sibling-not-committed", "MR3.stale-sibling-still-dirty"],
-    unaffected: ["MR1.room-tree-clean", "MR1.room-message-exact", "SP4.wake-text-canonical"],
+    desc: "staging cego 'git add -A' reintroduzido no lugar do staging cirúrgico do ledger (TICKET-32A)",
+    from: '["git", "-C", target.path, "add", "--", ...addList]',
+    to: '["git", "-C", target.path, "add", "-A"]',
+    detect: ["MR5.commit-only-ledger-file", "MR5.stray-still-untracked", "MR5.tree-not-clean"],
+    unaffected: ["MR1.room-message-exact", "MR2.only-room-committed", "SP4.wake-text-canonical"],
   },
   {
     id: "M7",
-    desc: "relógio estático de 1h reintroduzido no lugar da janela vinculada ao ciclo (regressão HARNESS-27C)",
-    from: "const threshold = sinceMs",
-    to: "const threshold = Date.now() - 60 * 60 * 1000",
-    detect: ["MR3.fresh-sibling-committed", "MR4.fresh-sibling-committed"],
-    unaffected: ["MR3.stale-sibling-not-committed", "MR4.stale-sibling-not-committed", "MR2.stale-sibling-not-committed", "SP4.wake-text-canonical"],
+    desc: "atribuição invertida (mais raso primeiro): arquivo aninhado stageado no pai, gitlink perdido",
+    from: "depth(b) - depth(a)",
+    to: "depth(a) - depth(b)",
+    detect: [
+      "MR1.suffix-lists-two-repos",
+      "MR1.two-distinct-hashes",
+      "MR1.nested-head-in-suffix",
+      "MR1.nested-advances-one-commit",
+      "MR1.nested-tree-clean",
+      "MR1.room-tree-clean",
+      "MR1.room-commit-file-set",
+      "MR1.nested-commit-file-set",
+    ],
+    unaffected: ["MR1.room-message-exact", "MR1.room-head-in-suffix", "MR2.only-room-committed", "MR3.fresh-sibling-committed", "MR3.stale-sibling-not-committed", "SP4.wake-text-canonical"],
   },
   {
     id: "M8",

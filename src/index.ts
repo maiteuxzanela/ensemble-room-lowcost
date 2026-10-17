@@ -40,6 +40,7 @@ import { findTeamBySession } from "./types"
 import { loadConfig } from "./config"
 import { ProgressTracker } from "./progress"
 import { ActivityBuffer, recordFromV2Event, recordFromToolBefore, recordFromToolAfter } from "./activity"
+import { recordFileFromToolCall } from "./modified-files"
 import { startDashboard } from "./dashboard"
 import { executeTeamCreate } from "./tools/team-create"
 import { executeTeamSpawn } from "./tools/team-spawn"
@@ -510,6 +511,10 @@ const plugin: Plugin = async (input) => {
       if (input.tool === "question") {
         purgeApprovals.recordQuestionAnswer(input.sessionID, output.output, input.args)
       }
+      // TICKET-32A: ledger every file this room's session mutates
+      // (edit/write/patch/...) so the Portão 1 auto-commit can commit a repo
+      // strictly with the room-touched files — never a blind `git add -A`.
+      recordFileFromToolCall(db, registry, input.sessionID, input.tool, input.args)
       // Record tool result activity for team member sessions
       recordFromToolAfter(input, output, registry, activityBuffer)
     },

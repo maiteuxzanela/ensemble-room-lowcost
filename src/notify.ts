@@ -102,18 +102,23 @@ export interface NotifyLeadWakeOptions {
   agent?: string
   /**
    * Plugin config. Together with the resolved lead agent it turns the wake
-   * model-aware: the model ladder is built from
-   * `resolveFallbackChainForAgent(config, leadAgent)` so a rate-limited
-   * primary never strands the message at delivered=0 (the 2026-10 incident:
-   * a modelless wake landed on the rate-limited gemini primary and the
-   * system message was never delivered).
+   * model-aware: when the FIRST attempt is rejected (e.g. HTTP 429 on the
+   * lead's own model), the retry ladder walks
+   * `resolveFallbackChainForAgent(config, leadAgent)` rung by rung so a
+   * rate-limited primary never strands the message at delivered=0 (the
+   * 2026-10 incident: a modelless wake landed on the rate-limited gemini
+   * primary and the system message was never delivered). The chain is the
+   * REACTIVE fallback — it never displaces the session's native model as the
+   * first attempt (TICKET-32B).
    */
   config?: Required<EnsembleConfig>
   /**
-   * Optional PRIMARY model selector for the FIRST wake attempt (e.g. the
-   * lead's currently bound model). Defaults to the head of the resolved
-   * fallback chain. Never carries the "#default" sentinel — parseModelSelector
-   * normalizes it away.
+   * Optional EXPLICIT model selector for the FIRST wake attempt (e.g. the
+   * lead's currently bound model). When omitted, attempt 0 is the session's
+   * NATIVE model — the `model` key is omitted from promptAsync, so the
+   * OpenCode server keeps whatever the lead session is bound to (no premature
+   * downgrade to a cheap fallback chain entry). Never carries the "#default"
+   * sentinel — parseModelSelector normalizes it away.
    */
   primaryModel?: string
 }
@@ -139,22 +144,30 @@ export function resolveLeadWakeContext(db: Database, teamId: string): LeadWakeCo
 }
 
 /**
- * Fire a MODEL-AWARE wake (HARNESS-15 B / F1) — the shared step-down ladder
- * behind every lead wake that carries a config:
+ * Fire a MODEL-AWARE wake (HARNESS-15 B / F1 / TICKET-32B) — the shared
+ * step-down ladder behind every lead wake that carries a config:
  *
  *   - `agent` (when known) goes EXPLICITLY on every attempt — omitting it
  *     lets the server rebind the session to its default agent (persona
  *     sequester);
- *   - the model LADDER is `primaryModel?` first, then each distinct entry of
+ *   - rung 0 PRESERVES THE SESSION'S NATIVE MODEL: with no `primaryModel`
+ *     the `model` key is omitted from promptAsync, so the OpenCode server
+ *     keeps whatever model the lead session is bound to. Passing chain[0] as
+ *     attempt 0 (the pre-TICKET-32B shape) forced a premature downgrade of
+ *     the Lead to a cheap fallback the moment any system message woke it. An
+ *     EXPLICIT `primaryModel`, when handed in, is respected as rung 0;
+ *   - rungs 1..n are each distinct entry of
  *     `resolveFallbackChainForAgent(config, agent)` (agent optional: without
- *     one the resolver returns the global chain, which still beats a
- *     modelless wake under rate-limit);
+ *     one the resolver returns the global chain), walked ONLY after a
+ *     rejected attempt (e.g. rate-limit 429) — the reactive fallback that
+ *     still beats a stranded `delivered=0` message;
  *   - each rejected attempt steps to the next rung; the ladder exhausted →
  *     log only. The caller must persist any message BEFORE calling: the wake
  *     is fire-and-forget (never awaited, per the promptAsync invariant).
  *
- * Shared by notifyLead (system messages) and the board-complete wake in
- * team-tasks-complete — the ONLY lead wake under silentLead:true.
+ * Shared by notifyLead (system messages), the watchdog/spawn wake wrappers
+ * (indirect, via notifyLead) and the unconditional member wake in
+ * team-tasks-complete.
  */
 export function promptModelAwareWake(
   client: PluginClient,
@@ -167,7 +180,11 @@ export function promptModelAwareWake(
     agent?: string
     /** Enables the model ladder via resolveFallbackChainForAgent(config, agent). */
     config?: Required<EnsembleConfig>
-    /** First-attempt model selector; defaults to the chain head. */
+    /**
+     * Explicit first-attempt selector (TICKET-32B). PRESENT → respected as
+     * rung 0; ABSENT → rung 0 is the session's NATIVE model (`model` omitted,
+     * never the fallback-chain head).
+     */
     primaryModel?: string
     /** Synthetic system entry (default: true). */
     synthetic?: boolean
@@ -175,25 +192,28 @@ export function promptModelAwareWake(
 ): void {
   const { sessionID, text, logTag, agent, config, primaryModel, synthetic = true } = params
 
-  // Ladder: optional primary first, then each DISTINCT chain entry, deduped
-  // by formatted selector. "#default" never survives parse/format (config.ts).
-  const ladder: string[] = []
-  const seen = new Set<string>()
-  const pushSelector = (selector: string): void => {
-    if (selector && !seen.has(selector)) {
-      seen.add(selector)
-      ladder.push(selector)
-    }
-  }
-  if (primaryModel) pushSelector(primaryModel)
+  // TICKET-32B — ladder rungs. Rung 0 being `undefined` IS the session's
+  // NATIVE model: `model` is omitted from the payload and the server keeps
+  // the lead session's bound model. An explicit primaryModel replaces that
+  // native rung. Rungs 1..n = each DISTINCT chain entry, deduped by
+  // formatted selector, pushed ONLY for the reactive fallback walk.
+  // "#default" never survives parse/format (config.ts).
+  const ladder: Array<string | undefined> = [primaryModel || undefined]
+  const seen = new Set<string>(primaryModel ? [primaryModel] : [])
   if (config) {
     for (const entry of resolveFallbackChainForAgent(config, agent)) {
-      pushSelector(formatModelSelector(entry))
+      const selector = formatModelSelector(entry)
+      if (selector && !seen.has(selector)) {
+        seen.add(selector)
+        ladder.push(selector)
+      }
     }
   }
 
   const attempt = (index: number): void => {
     const selector = ladder[index]
+    // Log label only — the native rung is never parsed as a selector.
+    const rung = selector ?? "session-native"
     const parsed = selector ? parseModelSelector(selector) : undefined
     client.session.promptAsync({
       sessionID,
@@ -202,15 +222,15 @@ export function promptModelAwareWake(
       ...(parsed ? { model: parsed } : {}),
       ...(synthetic ? { synthetic: true } : {}),
     }).then(() => {
-      if (selector) log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${selector}`)
+      log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${rung}`)
     }).catch((err) => {
       const errMsg = err instanceof Error ? err.message : String(err)
-      const next = ladder[index + 1]
+      const next = index + 1 < ladder.length ? ladder[index + 1] : undefined
       if (next) {
-        log(`${logTag}:retry session=${sessionID} from=${selector ?? "session-default"} to=${next} err=${errMsg}`)
+        log(`${logTag}:retry session=${sessionID} from=${rung} to=${next} err=${errMsg}`)
         attempt(index + 1)
       } else {
-        log(`${logTag}:failed session=${sessionID} model=${selector ?? "session-default"} err=${errMsg}`)
+        log(`${logTag}:failed session=${sessionID} model=${rung} err=${errMsg}`)
       }
     })
   }
@@ -228,12 +248,13 @@ export function promptModelAwareWake(
  * "all teammates done" gate would otherwise suppress the wake and strand the
  * message in the DB with delivered=0.
  *
- * HARNESS-15 B — MODEL-AWARE WAKE: when wake options carry the config (and
- * an agent resolves — options.agent, else team.lead_agent), the wake becomes
- * a RETRY LADDER delegated to promptModelAwareWake: the primary model first,
- * then each distinct entry of the agent's fallback chain, in order. Each
- * failed attempt (rejected promptAsync) steps to the next rung; the message
- * row is persisted up front so a fully failed ladder still leaves the passive
+ * HARNESS-15 B / TICKET-32B — MODEL-AWARE WAKE: when wake options carry the
+ * config (and an agent resolves — options.agent, else team.lead_agent), the
+ * wake becomes a RETRY LADDER delegated to promptModelAwareWake: the SESSION'S
+ * NATIVE model first (or the explicit options.primaryModel, when given), then
+ * each distinct entry of the agent's fallback chain, in order. Each failed
+ * attempt (rejected promptAsync) steps to the next rung; the message row is
+ * persisted up front so a fully failed ladder still leaves the passive
  * backstop / recovery paths available.
  *
  * The message is persisted first; the promptAsync wake is fire-and-forget
@@ -256,6 +277,12 @@ export function notifyLead(
   // (team.lead_agent). Absent → wake without the agent param (legacy shape).
   const leadAgent = options?.agent ?? ctx.leadAgent
 
+  // options.config (and options.primaryModel) are threaded VERBATIM into the
+  // shared ladder — every call site MUST hand its config through here
+  // (hooks.ts, index.ts fast-idle, watchdog.ts wrapper, team-spawn rollback)
+  // or the wake degrades to a single native attempt with no reactive
+  // fallback on rate-limit (TICKET-32B invariant, locked by the parity
+  // markers in tests/test_model_aware_wakes.mjs).
   promptModelAwareWake(client, {
     sessionID: ctx.leadSessionId,
     text: "[System: New team message from system]",

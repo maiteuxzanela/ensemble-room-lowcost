@@ -629,7 +629,9 @@ check(
 );
 
 /* ------------------------------------------------------------------ *
- * 12. (extra) HARNESS-15 B — notifyLead ciente do modelo + retrocompat *
+ * 12. (extra) HARNESS-15 B + TICKET-32B — notifyLead ciente do modelo      *
+ *     (degrau 0 nativo, primaryModel explícito respeitado, cadeia só       *
+ *     após rejeição) + retrocompat                                        *
  * ------------------------------------------------------------------ */
 {
   const db = makeDb();
@@ -691,6 +693,8 @@ check(
   );
 
   // g4: TODOS os degraus falham → mensagem continua persistida (backstop).
+  // TICKET-32B: sem primaryModel explícito o degrau 0 é o MODELO NATIVO da
+  // sessão (payload SEM `model`) e a cadeia global só entra como retry.
   seedLead("team-g-allfail", "lead-g-allfail", null);
   const failCalls = [];
   const failClient = {
@@ -700,10 +704,33 @@ check(
   notifyLead(failClient, db, "team-g-allfail", "nunca entregue", { agent: "cris", config: CFG });
   await tick();
   check(
-    "g4: ladder inteiro rejeitado → 2 tentativas (cadeia global) + mensagem ainda persistida",
-    failCalls.length === 2
+    "g4: ladder inteiro rejeitado → 3 tentativas (nativo → global-1#low → global-2) + mensagem ainda persistida",
+    failCalls.length === 3
+      && !("model" in failCalls[0])
+      && failCalls[1].model?.modelID === "global-1" && failCalls[1].model?.variant === "low"
+      && failCalls[2].model?.modelID === "global-2"
+      && failCalls.every((c) => c.agent === "cris" && c.sessionID === "lead-g-allfail")
       && db.query("SELECT content FROM team_message WHERE team_id = 'team-g-allfail'").all().length === 1,
-    `attempts=${failCalls.length}`,
+    `attempts=${failCalls.length} models=${JSON.stringify(failCalls.map((c) => c.model ?? "(nativo)"))}`,
+  );
+
+  // g5: MESMA rejeição SEM config → degrau único nativo (threading de
+  // options.config é o que habilita o fallback reativo — TICKET-32B item 2).
+  seedLead("team-g-nocfg", "lead-g-nocfg", null);
+  const nocfgCalls = [];
+  const nocfgClient = {
+    session: { promptAsync: async (opts) => { nocfgCalls.push(opts); throw new Error("429 always"); } },
+    tui: { showToast: async () => undefined },
+  };
+  notifyLead(nocfgClient, db, "team-g-nocfg", "sem config", { agent: "cris" });
+  await tick();
+  check(
+    "g5: SEM config a escada não existe → 1 tentativa nativa (sem chave 'model')",
+    nocfgCalls.length === 1
+      && !("model" in nocfgCalls[0])
+      && nocfgCalls[0]?.agent === "cris"
+      && db.query("SELECT content FROM team_message WHERE team_id = 'team-g-nocfg'").all().length === 1,
+    `attempts=${nocfgCalls.length}`,
   );
 
   db.close();

@@ -5,6 +5,7 @@ import { inReviewNudges } from "../hooks"
 import { isQAMember, getTeamQAMember, isSDETMEmber, getTeamSDETMember, type QAMemberInfo } from "../qa-role"
 import { promptModelAwareWake } from "../notify"
 import { runCommand } from "../process"
+import { listModifiedFiles, modifiedFilesUnderRepo, normalizeModifiedPath } from "../modified-files"
 import { log } from "../log"
 import path from "node:path"
 import { existsSync, readdirSync, statSync } from "node:fs"
@@ -429,39 +430,42 @@ function normalizeDir(dir: string): string {
 }
 
 /**
- * HARNESS-26A / HARNESS-27A — native post-QA auto-commit (Portão 1), multi-repo.
+ * HARNESS-26A / HARNESS-27A / TICKET-32A — native post-QA auto-commit (Portão 1),
+ * multi-repo, LEDGER-GATED and SURGICAL.
  *
  * When the Quality Gate reviewer (Clara — `isQAMember`) or the team lead
  * approves a functional card via `team_tasks_complete(action: 'complete')`, the
- * runtime commits EVERY affected repository LOCALLY so no manual `git add`/
+ * runtime commits the affected repositories LOCALLY so no manual `git add`/
  * `git commit` is ever required from the terminal. Commits are strictly local —
  * pushing stays reserved for the pre-push batch gate (Portão 2 / Diana).
  *
- * Affected repositories (HARNESS-27A) are discovered dynamically around the
- * room directory (`deps.directory`), never hardcoded:
- *   1. The room directory itself — committed ONLY when it IS the git toplevel;
- *      a path nested inside a larger repository is deliberately left untouched
- *      (26A safety: the runtime never commits an ancestor's tree).
- *   2. Nested repositories living INSIDE the room directory (bounded scan),
- *      e.g. submodules or sibling repos mounted in the workspace.
- *   3. Known ecosystem sibling repositories (directories next to the room dir)
- *      that are dirty AND touched during the room/task cycle (mtime >= the
- *      cycle's birth — earlier of team/task `time_created`, see
- *      `resolveFreshnessSince`). This window keeps unrelated working trees from
- *      other projects under the same parent out of the commit while never
- *      orphaning legitimate edits on long-running demands. Set
- *      `ENSEMBLE_AUTOCOMMIT_REPOS` (colon/comma/semicolon separated list of
- *      extra repo roots) to force-include repos regardless of freshness.
+ * TICKET-32A — WHAT may be committed is decided by the room's modified-file
+ * ledger (`team_modified_file`), NOT by an mtime freshness window and NOT by a
+ * blind `git add -A`:
+ *   - Every file edit the room performed is registered in SQLite by the
+ *     `tool.execute.after` hooks (`src/modified-files.ts`).
+ *   - On `complete`, the ledger rows for this `team_id` are read; only those
+ *     files can be staged. Each ledger file is assigned to the DEEPEST
+ *     candidate repository that contains it (so a nested repo's files are
+ *     staged in the nested repo, never in its parent).
+ *   - A repository with ZERO room-touched files gets NO commit — unrelated
+ *     dirty sibling trees are never swept (the old mtime window is gone).
+ *     Sibling/nested discovery is unconditional, but the ledger gates whether
+ *     a discovered repo actually commits: discovery can never BLOCK a sibling
+ *     the room did touch (Maiteux directive — never orphan legitimate edits).
+ *   - Staging is `git add <path1> <path2> ...` with the exact ledger files —
+ *     never `git add -A`. Paths travel as argv (no shell), so spaces, quotes
+ *     and metacharacters in filenames are inert.
  *
- * Each affected repo with a non-empty `git status --porcelain` is committed
- * atomically via `sh -c 'git -C "$1" add -A && git -C "$1" commit -m "$2"'` —
- * `$1` (repo path) and `$2` (message) travel positionally, so task content with
- * quotes, backticks or `$()` is never interpreted by the shell.
+ * Nested-repo gitlink guarantee (27A): when a nested target repo commits, its
+ * parent (e.g. the room repo) stages the nested repo's path so the parent tree
+ * ends clean and records the nested repo's FINAL HEAD.
  *
  * Returns the suffix appended to the completion message:
  *   - " Task completed and locally committed: <repo> (<hash>), <repo2> (<hash2>)"
  *   - " Task completed; working tree already clean (no commit needed)"
- *   - "" when no repository is affected, or when git failed (fail-graceful).
+ *   - "" when the room touched nothing, no repository is affected, or git
+ *     failed (fail-graceful).
  * Every per-repo git failure is caught and logged; the SQLite board transition
  * has already happened and must never be rolled back by a git error.
  */
@@ -469,38 +473,11 @@ function normalizeDir(dir: string): string {
 /** Max directory depth scanned for nested repositories inside the room dir. */
 const NESTED_REPO_SCAN_DEPTH = 2
 
-/**
- * Reference instant (epoch ms) bounding the freshness window for sibling
- * repositories: the birth of the current room/task cycle — the EARLIER of the
- * room and the task `time_created`.
- *
- * The former static one-hour clock (`Date.now() - 60*60*1000`) orphaned every
- * legitimate edit whenever a task ran longer than 1h between the first file
- * edit and the Quality Gate approval: the sibling repos' mtimes fell behind the
- * moving threshold and were never committed. Binding the window to the cycle's
- * own birth makes "fresh" mean "touched at any point during the life of the
- * demand" — 10 minutes, 2 hours or all day — while files dirtied BEFORE the room
- * was born stay safely excluded (no committing of unrelated trees).
- *
- * Defensive only: the schema marks both `team.time_created` and
- * `team_task.time_created` as NOT NULL, so the fallback is unreachable in
- * practice. If no finite reference exists, it accepts nothing rather than
- * everything, so an unknown cycle can never sweep an unrelated working tree.
- */
-function resolveFreshnessSince(deps: ToolDeps, teamId: string, taskTimeCreated: number): number {
-  const row = deps.db.query("SELECT time_created FROM team WHERE id = ?").get(teamId) as
-    | { time_created?: number }
-    | null
-  const stamps = [row?.time_created, taskTimeCreated].filter(
-    (v): v is number => typeof v === "number" && Number.isFinite(v),
-  )
-  if (stamps.length === 0) return Number.POSITIVE_INFINITY
-  return Math.min(...stamps)
-}
-
 interface CommitTarget {
   path: string
   name: string
+  /** Normalized absolute paths of room-ledger files owned by this repo. */
+  files: string[]
 }
 
 /** Resolve the git toplevel of `cwd`, normalized — or null when not in a repo. */
@@ -573,32 +550,6 @@ function findSiblingRepoRoots(dir: string): string[] {
   return found
 }
 
-/** True when `repo` has dirty entries AND at least one was modified at/after `sinceMs`. */
-async function hasFreshDirt(repo: string, sinceMs: number): Promise<boolean> {
-  const status = await runCommand(["git", "status", "--porcelain"], { cwd: repo })
-  if (status.exitCode !== 0) return false
-  const lines = status.stdout.split("\n").map((l) => l.replace(/\s+$/, "")).filter((l) => l.length > 0)
-  if (lines.length === 0) return false
-  const threshold = sinceMs
-  for (const line of lines) {
-    // Porcelain v1: "XY <path>" or "XY <old> -> <new>". Strip the status field
-    // and any rename arrow, then honor git's C-style quoting for exotic names.
-    let rel = line.slice(3)
-    const arrow = rel.indexOf(" -> ")
-    if (arrow !== -1) rel = rel.slice(arrow + 4)
-    rel = rel.replace(/^"|"$/g, "").trim()
-    if (rel.length === 0) continue
-    try {
-      if (statSync(path.join(repo, rel)).mtimeMs >= threshold) return true
-    } catch {
-      // Deleted/renamed target: no stat — treat the intentional deletion as
-      // activity so it still gets committed.
-      return true
-    }
-  }
-  return false
-}
-
 /** Parse the optional `ENSEMBLE_AUTOCOMMIT_REPOS` force-include override. */
 function extraRepoRoots(): string[] {
   const raw = process.env.ENSEMBLE_AUTOCOMMIT_REPOS
@@ -609,15 +560,23 @@ function extraRepoRoots(): string[] {
     .filter((p) => p.length > 0)
 }
 
-/** Discover every repository affected by the demand, in commit order, deduped. */
-async function resolveCommitTargets(dir: string, sinceMs: number): Promise<CommitTarget[]> {
-  const targets: CommitTarget[] = []
+/**
+ * Discover every candidate repository around the room dir (room toplevel,
+ * nested, siblings, explicit overrides) — UNCONDITIONAL discovery.
+ *
+ * TICKET-32A: discovery no longer filters by mtime freshness (that window could
+ * BLOCK a sibling the room legitimately touched). Instead, discovery only
+ * produces candidates; the ledger gate lives in `resolveCommitTargets`, which
+ * keeps a repo only when the room actually touched files under it.
+ */
+async function discoverCandidateRepos(dir: string): Promise<string[]> {
+  const candidates: string[] = []
   const seen = new Set<string>()
   const add = (rawPath: string) => {
     const p = normalizeDir(rawPath)
     if (seen.has(p)) return
     seen.add(p)
-    targets.push({ path: p, name: path.basename(p) })
+    candidates.push(p)
   }
 
   // 1) Room dir — only when it IS the git toplevel (26A nested-tree guard).
@@ -633,52 +592,122 @@ async function resolveCommitTargets(dir: string, sinceMs: number): Promise<Commi
     if (nested !== normalizeDir(dir)) add(nested)
   }
 
-  // 3) Known ecosystem siblings: dirty + touched during the room/task cycle.
+  // 3) Sibling repositories next to the room dir — always discovered (never
+  //    blocked by freshness); the ledger decides whether they commit.
   for (const sibling of findSiblingRepoRoots(dir)) {
-    if (await hasFreshDirt(sibling, sinceMs)) add(sibling)
+    add(sibling)
   }
 
-  // 4) Explicit overrides — force-included regardless of freshness.
+  // 4) Explicit overrides — force-candidates regardless of layout.
   for (const extra of extraRepoRoots()) {
     if (extra !== normalizeDir(dir) && isRepoRoot(extra)) add(extra)
   }
 
-  // Deepest paths commit FIRST so that when a nested repo lives inside the room
-  // repo, the outer `git add -A` records the nested repo's FINAL HEAD (gitlink)
-  // and the outer tree ends clean. Stable sort keeps the discovery order as the
-  // tie-breaker (siblings and the room dir share depth).
-  const depth = (p: string) => p.split(path.sep).filter(Boolean).length
-  targets.sort((a, b) => depth(b.path) - depth(a.path))
+  return candidates
+}
 
+/**
+ * Ledger gate: assign each room-touched file to the DEEPEST candidate repo that
+ * contains it, and return only the repos owning ≥1 file, DEEPEST-FIRST.
+ *
+ * A repo with zero room-touched files is dropped entirely (no commit there —
+ * unrelated dirty trees are never swept). Deepest-first assignment guarantees a
+ * file inside a nested repo is staged in the nested repo, not in its parent.
+ */
+function resolveCommitTargets(candidates: string[], ledger: string[]): CommitTarget[] {
+  const depth = (p: string) => p.split(path.sep).filter(Boolean).length
+  const sorted = [...candidates].sort((a, b) => depth(b) - depth(a))
+
+  const owned = new Map<string, string[]>()
+  const claimed = new Set<string>()
+  for (const rawFile of ledger) {
+    const abs = normalizeModifiedPath(rawFile)
+    if (abs === "" || claimed.has(abs)) continue
+    for (const repo of sorted) {
+      if (modifiedFilesUnderRepo([abs], repo).length === 0) continue
+      const list = owned.get(repo) ?? []
+      list.push(abs)
+      owned.set(repo, list)
+      claimed.add(abs)
+      break // deepest-first: first (deepest) match wins
+    }
+  }
+
+  const targets: CommitTarget[] = []
+  for (const repo of sorted) {
+    const files = owned.get(repo)
+    if (files && files.length > 0) {
+      targets.push({ path: repo, name: path.basename(repo), files })
+    }
+  }
   return targets
 }
 
-async function autoCommitApprovedTask(deps: ToolDeps, taskContent: string, sinceMs: number): Promise<string> {
+async function autoCommitApprovedTask(deps: ToolDeps, teamId: string, taskContent: string): Promise<string> {
   const dir = deps.directory
   try {
-    const targets = await resolveCommitTargets(dir, sinceMs)
-    if (targets.length === 0) return "" // no affected repository — nothing to commit
+    // TICKET-32A — ledger gate. No room-touched file → no commit anywhere
+    // (fail-closed; never sweeps an unrelated tree, never false-success).
+    const ledger = listModifiedFiles(deps.db, teamId)
+    if (ledger.length === 0) return ""
+
+    const candidates = await discoverCandidateRepos(dir)
+    const targets = resolveCommitTargets(candidates, ledger)
+    if (targets.length === 0) return ""
 
     const message = `feat(runtime): ${taskContent}`
     const committed: Array<{ name: string; hash: string; path: string }> = []
+    // Nested target repos already committed this run — their parents must stage
+    // the gitlink so the parent tree ends clean (27A guarantee).
+    const committedPaths: string[] = []
     let sawDirty = false
 
+    // targets are deepest-first (resolveCommitTargets sorts by depth desc).
     for (const target of targets) {
       try {
+        // SURGICAL add list: (a) the room-ledger files owned by this repo, as
+        // repo-relative paths, plus (b) the gitlink of any already-committed
+        // nested target repo that is a DIRECT child of this repo.
+        const addSet = new Set<string>()
+        for (const f of target.files) {
+          const rel = path.relative(target.path, f)
+          if (rel.length > 0 && !rel.startsWith("..") && !path.isAbsolute(rel)) addSet.add(rel)
+        }
+        for (const nested of committedPaths) {
+          const rel = path.relative(target.path, nested)
+          if (rel.length > 0 && !rel.startsWith("..") && !path.isAbsolute(rel) && !rel.includes(path.sep)) {
+            addSet.add(rel) // direct-child gitlink only
+          }
+        }
+        if (addSet.size === 0) continue // no room-touched file → no commit here
+
+        // Per-repo status (kept only to distinguish "already clean" from a
+        // failed commit — it never decides WHAT is staged).
         const status = await runCommand(["git", "status", "--porcelain"], { cwd: target.path })
         if (status.exitCode !== 0) {
           log(`tasks-complete:autocommit:status-failed dir=${target.path} err=${status.stderr.trim()}`)
           continue
         }
-        if (status.stdout.trim().length === 0) continue
+        if (status.stdout.trim().length === 0) continue // already clean → no commit
         sawDirty = true
 
-        // Atomic add + commit in one shell so a partial `git add` never lands
-        // without its commit. $1 (repo path) and $2 (message) are positional —
-        // never interpolated — so task content containing quotes, backticks or
-        // `$()` is inert.
+        const addList = [...addSet].sort()
+
+        // SURGICAL `git add -- <paths...>` — NEVER `git add -A`. Paths travel as
+        // argv (no shell), so spaces/quotes/metacharacters are inert; task
+        // content never reaches this command at all.
+        const add = await runCommand(
+          ["git", "-C", target.path, "add", "--", ...addList],
+          { cwd: target.path },
+        )
+        if (add.exitCode !== 0) {
+          log(`tasks-complete:autocommit:add-failed dir=${target.path} err=${add.stderr.trim()}`)
+          continue
+        }
+
+        // Commit (argv only — message is one argument, never shell-interpreted).
         const commit = await runCommand(
-          ["sh", "-c", 'git -C "$1" add -A && git -C "$1" commit -m "$2"', "ensemble-autocommit", target.path, message],
+          ["git", "-C", target.path, "commit", "-m", message],
           { cwd: target.path },
         )
         if (commit.exitCode !== 0) {
@@ -688,15 +717,52 @@ async function autoCommitApprovedTask(deps: ToolDeps, taskContent: string, since
         const rev = await runCommand(["git", "rev-parse", "--short", "HEAD"], { cwd: target.path })
         const hash = rev.exitCode === 0 ? rev.stdout.trim() : ""
         committed.push({ name: target.name, hash, path: target.path })
-        log(`tasks-complete:autocommit:committed dir=${target.path} repo=${target.name} hash=${hash || "?"} task="${taskContent}"`)
+        committedPaths.push(normalizeDir(target.path))
+        log(`tasks-complete:autocommit:committed dir=${target.path} repo=${target.name} hash=${hash || "?"} files=${addList.length} task="${taskContent}"`)
       } catch (err) {
         // Fail-graceful per repo: one bad repo never aborts the others.
         log(`tasks-complete:autocommit:error dir=${target.path} err=${err instanceof Error ? err.message : String(err)}`)
       }
     }
 
+    // Gitlink propagation UP: any candidate that is the DIRECT parent of a
+    // committed repo but owns no ledger file of its own still stages the child
+    // gitlink so its tree ends clean (e.g. a room whose only touch was inside a
+    // nested repo). Siblings never match (they are not ancestors of each other
+    // in practice, and the path filter rejects non-direct-children).
+    for (const repo of candidates) {
+      if (committedPaths.includes(normalizeDir(repo))) continue
+      const gitlinks = committedPaths
+        .filter((c) => normalizeDir(c) !== normalizeDir(repo))
+        .map((c) => path.relative(repo, c))
+        .filter((rel) => rel.length > 0 && !rel.startsWith("..") && !path.isAbsolute(rel) && !rel.includes(path.sep))
+      if (gitlinks.length === 0) continue
+      try {
+        const status = await runCommand(["git", "status", "--porcelain"], { cwd: repo })
+        if (status.exitCode !== 0 || status.stdout.trim().length === 0) continue
+        const addList = [...new Set(gitlinks)].sort()
+        const add = await runCommand(["git", "-C", repo, "add", "--", ...addList], { cwd: repo })
+        if (add.exitCode !== 0) {
+          log(`tasks-complete:autocommit:add-failed dir=${repo} err=${add.stderr.trim()}`)
+          continue
+        }
+        const commit = await runCommand(["git", "-C", repo, "commit", "-m", message], { cwd: repo })
+        if (commit.exitCode !== 0) {
+          log(`tasks-complete:autocommit:commit-failed dir=${repo} err=${commit.stderr.trim()}`)
+          continue
+        }
+        const rev = await runCommand(["git", "rev-parse", "--short", "HEAD"], { cwd: repo })
+        const hash = rev.exitCode === 0 ? rev.stdout.trim() : ""
+        committed.push({ name: path.basename(repo), hash, path: normalizeDir(repo) })
+        log(`tasks-complete:autocommit:committed dir=${repo} repo=${path.basename(repo)} hash=${hash || "?"} files=${addList.length} (gitlink) task="${taskContent}"`)
+      } catch (err) {
+        log(`tasks-complete:autocommit:error dir=${repo} err=${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+
     if (committed.length === 0) {
-      // Dirty but every commit failed → no false-success suffix (fail-graceful).
+      // Ledger had files but every commit was skipped/failed → no false-success
+      // suffix (fail-graceful). "Already clean" only when nothing was dirty.
       return sawDirty ? "" : " Task completed; working tree already clean (no commit needed)"
     }
 
@@ -1007,10 +1073,9 @@ export async function executeTeamTasksComplete(
   // board transition above already happened.
   let commitSuffix = ""
   if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {
-    // TICKET freshness-window: bind the sibling-repo freshness window to the
-    // birth of the room/task cycle (earlier of the two), never a static clock.
-    const sinceMs = resolveFreshnessSince(deps, teamInfo.teamId, task.time_created)
-    commitSuffix = await autoCommitApprovedTask(deps, task.content, sinceMs)
+    // TICKET-32A — ledger-gated surgical auto-commit: staged from the room's
+    // `team_modified_file` rows for this team (no mtime freshness window).
+    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content)
   }
 
   return `Completed task: ${task.content}${formatUnblockedSuffix(unblocked, wokeMembers)}${commitSuffix}`

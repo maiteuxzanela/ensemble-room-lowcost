@@ -304,6 +304,33 @@ export const MIGRATIONS: string[] = [
   // agent / base-persona === 'hugo' detection, so existing databases and rows
   // created before this migration keep working unchanged.
   `ALTER TABLE team_member ADD COLUMN role TEXT;`,
+  // Migration 17 (TICKET-HARNESS-32A): atomic per-room modified-file ledger.
+  //
+  // Each row is one file the room (any member session, or the lead session)
+  // touched via a file-mutating tool (edit/write/patch/multiedit/...). The
+  // ledger is the source of truth that replaces the old blind `git add -A`
+  // in the Portão 1 auto-commit: on QA/lead `complete`, the runtime commits a
+  // repository ONLY with the exact files this room registered under it —
+  // never a repo-wide sweep. A sibling repo with zero registered files is
+  // NEVER committed, so unrelated working trees living next to the room dir
+  // stay untouched (the Maiteux/lead directive: do not block sibling repos,
+  // but never commit what the room did not touch).
+  //
+  // PRIMARY KEY (team_id, file_path) makes the ledger idempotent: re-editing
+  // the same file UPDATEs time_created in place (see recordModifiedFile).
+  // file_path stores the NORMALIZED ABSOLUTE path (path.resolve + separators
+  // unified) so the commit filter can prefix-match against each discovered
+  // repo root without ambiguity. FK cascade: deleting a team purges its ledger.
+  //
+  // Additive-only (same non-negotiable as Migrations 9-11/14/15/16): brand-new
+  // table, no CHECK constraint, no rebuild of existing tables.
+  `CREATE TABLE IF NOT EXISTS team_modified_file (
+     team_id      TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     file_path    TEXT NOT NULL,
+     time_created INTEGER NOT NULL,
+     PRIMARY KEY (team_id, file_path)
+   );
+   CREATE INDEX IF NOT EXISTS team_modified_file_team_idx ON team_modified_file(team_id);`,
 ]
 
 /**
