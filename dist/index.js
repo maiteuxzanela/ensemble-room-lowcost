@@ -513,7 +513,21 @@ var MIGRATIONS = [
      time_created INTEGER NOT NULL,
      PRIMARY KEY (team_id, file_path)
    );
-   CREATE INDEX IF NOT EXISTS team_modified_file_team_idx ON team_modified_file(team_id);`
+   CREATE INDEX IF NOT EXISTS team_modified_file_team_idx ON team_modified_file(team_id);`,
+  // Migration 18 (TICKET-HARNESS-37 / M4): per-member lead-decision queue.
+  //
+  // Migration 15 tracked at most ONE waiting member per team: every new
+  // decision_lead overwrote `awaiting_decision_member`, and the lead's reply
+  // cleared the whole flag — so with two members waiting on the lead, replying
+  // to one silently unpaused the watchdog AND dropped the other's pending
+  // decision. `awaiting_decision_members` holds a JSON array of
+  // `{ member, at, payload }` entries (one per waiting member) so the pause is
+  // lifted ONLY when no member is left pending. The legacy
+  // `awaiting_decision_member` / `awaiting_decision_at` columns stay in sync
+  // (latest raise) for observability and backward compatibility. Additive-only
+  // (same non-negotiable as Migrations 9-11/14/15/16/17): nullable TEXT, no
+  // CHECK constraint, no table rebuild.
+  `ALTER TABLE team ADD COLUMN awaiting_decision_members TEXT;`
 ];
 function applyMigrations(db) {
   const { user_version: current } = db.query("PRAGMA user_version").get();
@@ -2449,7 +2463,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     const existingSDET = getTeamSDETMember(deps.db, teamInfo.teamId);
     if (existingSDET) {
       throw new Error(
-        `Engenheiro de Testes 'hugo' j\xE1 est\xE1 ativo na equipe '${teamInfo.teamName}'. Pap\xE9is de engenharia de testes s\xE3o exclusivos e n\xE3o admitem inst\xE2ncias concorrentes.`
+        `Engenheiro de Testes '${existingSDET.name}' j\xE1 est\xE1 ativo na equipe '${teamInfo.teamName}'. Pap\xE9is de engenharia de testes s\xE3o exclusivos e n\xE3o admitem inst\xE2ncias concorrentes.`
       );
     }
   }
@@ -2803,7 +2817,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
       return `2. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) \u2014 the Quality Gate reviewer is woken automatically after your deterministic suite is submitted. Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. ${tail}`;
     }
     if (sdetPeerName) {
-      return `2. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes), then pass the baton exclusively to the SDET ${sdetPeerName} via team_message(to: '${sdetPeerName}') for the deterministic test suite. Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. ${tail}`;
+      return `2. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) \u2014 the runtime routes the card to the SDET ${sdetPeerName} automatically for the deterministic test suite (held until the functional batch is consolidated); do NOT message the SDET to hand off. Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. ${tail}`;
     }
     if (qaPeerName) {
       return claimScope === "a standalone task" ? `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) so ${qaPeerName} can validate and approve. Coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. Otherwise, if you claimed a standalone task not requiring review, mark it complete using team_tasks_complete.` : `2. If your task requires Quality Gate review, submit it using team_tasks_complete with action: 'submit_review' (plus review notes) and coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). Intermediate/partial work during development happens exclusively via team_message(to: '<colleague>'); submit_review is reserved for the final consolidation of the functionality. Otherwise, if you claimed a task, mark it complete using team_tasks_complete.`;
@@ -2821,7 +2835,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     context.push(
       "",
       "QUALITY GATE ORIENTATION:",
-      `Wait for the SDET's (${sdetPeerName}) deterministic test suite before auditing: implementers pass the baton to the SDET after submit_review, and only then is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`
+      `Wait for the SDET's (${sdetPeerName}) deterministic test suite before auditing: implementers submit via submit_review, the runtime routes the card to the SDET first, and only after the SDET verdict is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`
     );
   }
   context.push("", "When you finish your task:");
@@ -2841,7 +2855,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     );
   } else {
     context.push(
-      sdetPeerName && !spawnIsSDET ? `1. If your task requires review or peer feedback, pass the baton to the SDET ${sdetPeerName} via team_message(to: '${sdetPeerName}') for the deterministic test suite. If you claimed a task, mark it complete using team_tasks_complete.` : qaPeerName ? `1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). If you claimed a task, mark it complete using team_tasks_complete.` : `1. If your task requires Quality Gate review or peer feedback, coordinate with the team lead via team_message. If you claimed a task, mark it complete using team_tasks_complete.`
+      sdetPeerName && !spawnIsSDET ? `1. If your task requires review, submit it using team_tasks_complete with action: 'submit_review' \u2014 the runtime routes the card to the SDET ${sdetPeerName} automatically for the deterministic test suite (do NOT message the SDET to hand off). If you claimed a task, mark it complete using team_tasks_complete.` : qaPeerName ? `1. If your task requires Quality Gate review or peer feedback, coordinate peer-to-peer with ${qaPeerName} via team_message(to: '${qaPeerName}'). If you claimed a task, mark it complete using team_tasks_complete.` : `1. If your task requires Quality Gate review or peer feedback, coordinate with the team lead via team_message. If you claimed a task, mark it complete using team_tasks_complete.`
     );
     context.push(
       "2. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:"
@@ -2984,20 +2998,73 @@ async function executeTeamStandby(deps, args, sessionId) {
 
 // src/tools/decision-lead.ts
 init_log();
-function markAwaitingLeadDecision(db, teamId, memberName) {
-  const now = Date.now();
-  db.run(
-    "UPDATE team SET awaiting_lead_decision = 1, awaiting_decision_member = ?, awaiting_decision_at = ?, time_updated = ? WHERE id = ?",
-    [memberName, now, now, teamId]
-  );
-  log(`decision-lead:raised team=${teamId} member=${memberName}`);
+function readPendingDecisions(db, teamId) {
+  let raw = null;
+  try {
+    const row = db.query("SELECT awaiting_decision_members FROM team WHERE id = ?").get(teamId);
+    raw = row?.awaiting_decision_members ?? null;
+  } catch {
+    return [];
+  }
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((e) => !!e && typeof e === "object").filter((e) => typeof e.member === "string").map((e) => ({
+      member: String(e.member),
+      at: typeof e.at === "number" ? e.at : 0,
+      payload: typeof e.payload === "string" ? e.payload : ""
+    }));
+  } catch {
+    return [];
+  }
 }
-function clearAwaitingLeadDecision(db, teamId) {
-  const result = db.run(
-    "UPDATE team SET awaiting_lead_decision = 0, awaiting_decision_member = NULL, awaiting_decision_at = NULL, time_updated = ? WHERE id = ? AND awaiting_lead_decision = 1",
-    [Date.now(), teamId]
+function writePendingDecisions(db, teamId, entries) {
+  const now = Date.now();
+  if (entries.length === 0) {
+    db.run(
+      "UPDATE team SET awaiting_lead_decision = 0, awaiting_decision_members = NULL, awaiting_decision_member = NULL, awaiting_decision_at = NULL, time_updated = ? WHERE id = ?",
+      [now, teamId]
+    );
+    return;
+  }
+  const latest = entries[entries.length - 1];
+  db.run(
+    "UPDATE team SET awaiting_lead_decision = 1, awaiting_decision_members = ?, awaiting_decision_member = ?, awaiting_decision_at = ?, time_updated = ? WHERE id = ?",
+    [JSON.stringify(entries), latest.member, latest.at, now, teamId]
   );
-  if (result.changes > 0) log(`decision-lead:cleared team=${teamId}`);
+}
+function markAwaitingLeadDecision(db, teamId, memberName, payload) {
+  const now = Date.now();
+  const entries = readPendingDecisions(db, teamId);
+  const idx = entries.findIndex((e) => e.member === memberName);
+  const incomingPayload = payload ?? "";
+  let duplicate = false;
+  if (idx >= 0) {
+    const existing = entries[idx];
+    duplicate = incomingPayload.length > 0 && existing.payload === incomingPayload;
+    entries[idx] = { member: memberName, at: now, payload: incomingPayload || existing.payload };
+  } else {
+    entries.push({ member: memberName, at: now, payload: incomingPayload });
+  }
+  writePendingDecisions(db, teamId, entries);
+  log(`decision-lead:raised team=${teamId} member=${memberName} pending=${entries.length} duplicate=${duplicate}`);
+  return { duplicate, members: entries.map((e) => e.member) };
+}
+function clearAwaitingLeadDecision(db, teamId, memberName) {
+  const entries = readPendingDecisions(db, teamId);
+  const hadFlag = hasAwaitingLeadDecision(db, teamId);
+  let remaining;
+  if (memberName) {
+    const isPending = entries.some((e) => e.member === memberName);
+    remaining = isPending ? entries.filter((e) => e.member !== memberName) : [];
+  } else {
+    remaining = [];
+  }
+  if (remaining.length === entries.length && !hadFlag) return;
+  writePendingDecisions(db, teamId, remaining);
+  if (remaining.length === 0) log(`decision-lead:cleared team=${teamId}`);
+  else log(`decision-lead:partial-clear team=${teamId} member=${memberName} pending=${remaining.length}`);
 }
 function hasAwaitingLeadDecision(db, teamId) {
   const row = db.query("SELECT awaiting_lead_decision FROM team WHERE id = ?").get(teamId);
@@ -3026,8 +3093,12 @@ Options:
 ${options.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}` : "";
   const payload = `[System: EMERGENCY DECISION REQUIRED from ${memberName}]: ${question}
 ${context}${optionsBlock}`;
-  markAwaitingLeadDecision(deps.db, teamInfo.teamId, memberName);
+  const mark = markAwaitingLeadDecision(deps.db, teamInfo.teamId, memberName, payload);
   setMemberStandby(deps.db, teamInfo.teamId, memberName, "awaiting lead decision");
+  if (mark.duplicate) {
+    log(`decision-lead:duplicate team=${teamInfo.teamId} member=${memberName} \u2014 payload already pending; no re-send/re-wake`);
+    return `Emergency decision already pending with the lead for ${memberName}. You are now in standby until the lead responds.`;
+  }
   sendMessage(deps.db, {
     teamId: teamInfo.teamId,
     from: memberName,
@@ -3104,7 +3175,7 @@ async function executeTeamMessage(deps, args, sessionId) {
     });
     log(`team_message:queued from=${senderName} to=${args.to} (recipient not yet spawned)`);
     if (teamInfo.role === "lead") {
-      clearAwaitingLeadDecision(deps.db, teamInfo.teamId);
+      clearAwaitingLeadDecision(deps.db, teamInfo.teamId, args.to);
     }
     return `Message queued for ${args.to} \u2014 they haven't been spawned yet. It will be delivered when they join the team.`;
   }
@@ -3148,7 +3219,7 @@ async function executeTeamMessage(deps, args, sessionId) {
     content: messageText
   });
   if (teamInfo.role === "lead") {
-    clearAwaitingLeadDecision(deps.db, teamInfo.teamId);
+    clearAwaitingLeadDecision(deps.db, teamInfo.teamId, args.to);
   }
   const isToLead = args.to === "lead";
   if (isToLead) {
@@ -3855,14 +3926,20 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
     if (task.status !== "in_review") {
       throw new Error("Task must be in review to record sdet_pass");
     }
+    const existingNotes = task.review_notes?.trim() || null;
+    const sdetNotes = notes?.trim() || null;
+    const mergedNotes = existingNotes && sdetNotes ? `[Implementador]: ${existingNotes}
+[SDET]: ${sdetNotes}` : sdetNotes ?? existingNotes;
     deps.db.run(
       "UPDATE team_task SET review_notes = ?, time_updated = ? WHERE id = ?",
-      [notes, now, args.task_id]
+      [mergedNotes, now, args.task_id]
     );
     if (qaMember) {
-      wakeQualityGateForSdetPass(deps, teamInfo.teamId, args.task_id, notes, qaMember);
+      wakeQualityGateForSdetPass(deps, teamInfo.teamId, args.task_id, mergedNotes, qaMember);
     }
-    return `Task ${args.task_id} SDET verification recorded: ${notes ?? ""}. Quality Gate guardian notified.`;
+    const recorded = mergedNotes ? `SDET verification recorded: ${mergedNotes}.` : "SDET verification recorded.";
+    const qaStatus = qaMember ? `Quality Gate guardian (${qaMember.name}) notified.` : "No Quality Gate guardian present in the room \u2014 the verdict was recorded on the board.";
+    return `Task ${args.task_id} ${recorded} ${qaStatus}`;
   }
   const isSubmitReview = args.action === "submit_review" || args.action === "in_review" || args.status === "in_review";
   if (isSubmitReview) {
@@ -3987,6 +4064,10 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
   } catch {
     log(`tasks-complete:toast:failed`);
   }
+  let commitSuffix = "";
+  if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {
+    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content);
+  }
   if (total > 0 && completed === total && activeRemaining === 0) {
     const leadRow = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?").get(teamInfo.teamId);
     const leadSessionId = leadRow?.lead_session_id;
@@ -4004,10 +4085,6 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
         log(`tasks-complete:wake-lead:failed team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`);
       }
     }
-  }
-  let commitSuffix = "";
-  if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {
-    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content);
   }
   return `Completed task: ${task.content}${formatUnblockedSuffix(unblocked, wokeMembers)}${commitSuffix}`;
 }
@@ -4820,7 +4897,7 @@ async function registerV2Tools(domain, deps) {
     });
     editor.add({
       name: "team_spawn",
-      description: "Spawn a new teammate that works in parallel. The teammate starts immediately with the given prompt. Each teammate gets their own git worktree for file isolation. Teammates work asynchronously and will message you when done. Do not poll for their status. Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
+      description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). Each teammate gets their own git worktree for file isolation. Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
       input: {
         type: "object",
         properties: {
@@ -4834,8 +4911,8 @@ async function registerV2Tools(domain, deps) {
           standby: bool("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)", false),
           role: {
             type: "string",
-            description: "Teammate role: 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)",
-            enum: ["qa", "member"]
+            description: "Teammate role: 'sdet' marks the deterministic-test engineer (exclusive per room, persists role='sdet'; also auto-detected for agent 'hugo'), 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)",
+            enum: ["sdet", "qa", "member"]
           },
           is_qa: bool("Explicitly flag this teammate as the Quality Gate reviewer (stored in team_member.is_qa). Omitted = auto-detect (agent 'clara' or base persona 'clara' \u2192 QA)", false)
         },
@@ -4885,7 +4962,7 @@ async function registerV2Tools(domain, deps) {
     });
     editor.add({
       name: "team_tasks_list",
-      description: "View the shared team task board. Use this to check task status, not to wait for teammates. Teammates will message you when done.",
+      description: "View the shared team task board. Use this to check task status, not to wait for teammates. Under silentLead you are not woken for each individual completion \u2014 rely on the board and team_results.",
       input: { type: "object", properties: {}, additionalProperties: false },
       execute: runSession(executeTeamTasksList)
     });
@@ -5415,6 +5492,7 @@ function buildLeadSystemPrompt(db, teamId, config) {
       lines.push(`  [completed] ${truncate(t.content, 120)}${t.assignee ? ` \u2192 ${t.assignee}` : ""}`);
     }
   }
+  const deliveredMessageIds = [];
   if (pendingMessages.length > 0) {
     lines.push("", "--- Team Messages ---");
     const MAX_MSG = 500;
@@ -5428,7 +5506,7 @@ function buildLeadSystemPrompt(db, teamId, config) {
       } else {
         lines.push(`[From ${msg.from_name}]: ${msg.content}`);
       }
-      markDelivered(db, msg.id);
+      deliveredMessageIds.push(msg.id);
     }
     lines.push("--- End Messages ---");
   }
@@ -5460,6 +5538,20 @@ function buildLeadSystemPrompt(db, teamId, config) {
       "Pass the chosen model via the model parameter on each team_spawn call."
     );
   }
+  const silentLead = config?.silentLead !== false;
+  const coordinationLines = silentLead ? [
+    "Teammates work asynchronously; under silentLead you are NOT woken for each individual completion.",
+    "Progress lives on the shared board and in team_results \u2014 do not expect or demand a completion message per member.",
+    "Rest until the board closes (all tasks completed) or a teammate escalates an emergency with decision_lead.",
+    "Do NOT poll team_status or team_tasks_list repeatedly \u2014 wait for the board to close or an emergency escalation.",
+    "After spawning all teammates, tell the user what you've set up and wait.",
+    "When the board closes, inspect team_results / team_tasks_list, summarize results, and suggest next steps."
+  ] : [
+    "Teammates work asynchronously and message you when done.",
+    "Do NOT poll team_status or team_tasks_list repeatedly \u2014 wait for messages.",
+    "After spawning all teammates, tell the user what you've set up and wait.",
+    "When all teammates finish, summarize results and suggest next steps."
+  ];
   lines.push(
     "",
     "Spawn teammates ONE AT A TIME. Wait for each tool result before spawning the next.",
@@ -5467,10 +5559,7 @@ function buildLeadSystemPrompt(db, teamId, config) {
     "Read-only agents (explore, plan) automatically skip worktree creation.",
     "For other agents that only need to read, pass worktree: false to avoid unnecessary isolation.",
     "",
-    "Teammates work asynchronously and message you when done.",
-    "Do NOT poll team_status or team_tasks_list repeatedly \u2014 wait for messages.",
-    "After spawning all teammates, tell the user what you've set up and wait.",
-    "When all teammates finish, summarize results and suggest next steps.",
+    ...coordinationLines,
     "",
     "MERGE WORKFLOW:",
     "When teammates use isolated worktrees (worktree: true), use team_merge to merge their branch after they finish and you shut them down.",
@@ -5488,7 +5577,14 @@ function buildLeadSystemPrompt(db, teamId, config) {
     "The question must include the exact approval and denial option labels shown in the preview.",
     "Only if the user selects that exact approval option, call team_cleanup again with the same purge value, confirm_purge: true, and the confirm_token from the preview."
   );
-  return lines.join("\n");
+  const prompt = lines.join("\n");
+  for (const id of deliveredMessageIds) {
+    try {
+      markDelivered(db, id);
+    } catch {
+    }
+  }
+  return prompt;
 }
 function buildTeammateSystemPrompt(db, teamId, memberName, config) {
   const team = db.query("SELECT name FROM team WHERE id = ?").get(teamId);
@@ -5523,35 +5619,46 @@ function buildTeammateSystemPrompt(db, teamId, memberName, config) {
     lines.push(
       "",
       "SDET HANDOVER:",
-      `After submitting a task via submit_review, pass the baton exclusively to the SDET (${roomSdet.name}) via team_message(to: '${roomSdet.name}') for the deterministic test suite. The Quality Gate is NOT a direct peer for you \u2014 it only enters after the SDET verdict.`
+      "When your deliverable is complete, submit it via submit_review \u2014 the runtime wakes the SDET automatically for the deterministic test suite (the wake is held until the functional batch is consolidated). Do NOT message the SDET to hand off. The Quality Gate is NOT a direct peer for you \u2014 it only enters after the SDET verdict."
     );
   } else if (roomSdet) {
     lines.push(
       "",
       "QUALITY GATE ORDER:",
-      `Wait for the SDET's (${roomSdet.name}) deterministic test suite before auditing: implementers pass the baton to the SDET after submit_review, and only then is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`
+      `Wait for the SDET's (${roomSdet.name}) deterministic test suite before auditing: implementers submit via submit_review, the runtime routes the card to the SDET first, and only after the SDET verdict is the review routed to you. Do not audit deliveries that skipped the deterministic suite.`
     );
   }
   const pendingMessages = db.query(
     "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND (to_name = ? OR to_name IS NULL) AND delivered = 0 ORDER BY time_created ASC"
   ).all(teamId, memberName);
+  const deliveredMessageIds = [];
   if (pendingMessages.length > 0) {
     lines.push("", "--- Messages for you ---");
     const MAX_MSG = 500;
     for (const msg of pendingMessages) {
       const parsed = parseTaskResult(msg.content);
       if (parsed) {
-        lines.push(formatTaskResult(msg.from_name, { ...parsed, details: truncate(parsed.details, MAX_MSG) }));
+        const truncatedDetails = truncate(parsed.details, MAX_MSG);
+        const body = formatTaskResult(msg.from_name, { ...parsed, details: truncatedDetails });
+        lines.push(truncatedDetails.length > MAX_MSG ? `${body}
+  (use team_results to read the full message)` : body);
       } else if (msg.content.length > MAX_MSG) {
-        lines.push(`[From ${msg.from_name}]: ${msg.content.slice(0, MAX_MSG)}... (truncated)`);
+        lines.push(`[From ${msg.from_name}]: ${msg.content.slice(0, MAX_MSG)}... (truncated \u2014 use team_results to read the full message)`);
       } else {
         lines.push(`[From ${msg.from_name}]: ${msg.content}`);
       }
-      markDelivered(db, msg.id);
+      deliveredMessageIds.push(msg.id);
     }
     lines.push("--- End Messages ---");
   }
-  return lines.join("\n");
+  const prompt = lines.join("\n");
+  for (const id of deliveredMessageIds) {
+    try {
+      markDelivered(db, id);
+    } catch {
+    }
+  }
+  return prompt;
 }
 function buildTeamCompactionContext(db, teamId, role, memberName, config) {
   const team = db.query("SELECT name FROM team WHERE id = ?").get(teamId);
@@ -7233,7 +7340,10 @@ var Watchdog = class _Watchdog {
       const stallAgent = resolveWatchdogNudgeAgent(member);
       this.client.session.promptAsync({
         sessionID: member.session_id,
-        parts: [{ type: "text", text: "[System]: You appear stalled \u2014 no progress detected. Report your current status to the lead via team_message, or wrap up your work." }],
+        // M1 (TICKET-HARNESS-37): under silentLead (config.silentLead !== false)
+        // the nudge steers to the task / board instead of demanding a lead-bound
+        // report; the legacy phrasing is preserved for silentLead: false.
+        parts: [{ type: "text", text: this.config?.silentLead !== false ? "[System]: You appear stalled \u2014 no progress detected. Refocus on your current task and drive it forward; record progress on the shared board and coordinate with peers via team_message, or wrap up your work." : "[System]: You appear stalled \u2014 no progress detected. Report your current status to the lead via team_message, or wrap up your work." }],
         agent: stallAgent,
         ...stallModel ? { model: stallModel } : {}
       }).then(() => {
@@ -7277,7 +7387,9 @@ var Watchdog = class _Watchdog {
       const chattyAgent = resolveWatchdogNudgeAgent(member);
       this.client.session.promptAsync({
         sessionID: member.session_id,
-        parts: [{ type: "text", text: "[System]: You've sent several messages to teammates. Focus on completing your task and send your results to the lead via team_message." }],
+        // M1 (TICKET-HARNESS-37): silentLead-aware chatty nudge (legacy phrasing
+        // kept for silentLead: false).
+        parts: [{ type: "text", text: this.config?.silentLead !== false ? "[System]: You've sent several messages to teammates. Focus on completing your current task and advancing it on the shared board rather than over-coordinating." : "[System]: You've sent several messages to teammates. Focus on completing your task and send your results to the lead via team_message." }],
         agent: chattyAgent,
         ...chattyModel ? { model: chattyModel } : {}
       }).catch((err) => {
@@ -8148,7 +8260,7 @@ var plugin = async (input) => {
         }
       }),
       team_spawn: tool({
-        description: "Spawn a new teammate that works in parallel. The teammate starts immediately with the given prompt. Each teammate gets their own git worktree for file isolation. Teammates work asynchronously and will message you when done. Do not poll for their status. Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
+        description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). Each teammate gets their own git worktree for file isolation. Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
         args: {
           name: tool.schema.string().describe("Teammate name (lowercase alphanumeric with hyphens)"),
           agent: tool.schema.string().default("build").describe("Agent type (e.g. 'build', 'plan', 'explore')"),
@@ -8158,7 +8270,7 @@ var plugin = async (input) => {
           worktree: tool.schema.boolean().default(true).describe("Create a git worktree for file isolation (default: true, set false for read-only agents)"),
           plan_approval: tool.schema.boolean().default(false).describe("Require teammate to send a plan for approval before writing files (default: false)"),
           standby: tool.schema.boolean().default(false).describe("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)"),
-          role: tool.schema.enum(["qa", "member"]).optional().describe("Teammate role: 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)"),
+          role: tool.schema.enum(["sdet", "qa", "member"]).optional().describe("Teammate role: 'sdet' marks the deterministic-test engineer (exclusive per room, persists role='sdet'; also auto-detected for agent 'hugo'), 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)"),
           is_qa: tool.schema.boolean().optional().describe("Explicitly flag this teammate as the Quality Gate reviewer (stored in team_member.is_qa). Omitted = auto-detect (agent 'clara' or base persona 'clara' \u2192 QA)")
         },
         async execute(args, ctx) {
@@ -8199,7 +8311,7 @@ var plugin = async (input) => {
         }
       }),
       team_tasks_list: tool({
-        description: "View the shared team task board. Use this to check task status, not to wait for teammates. Teammates will message you when done.",
+        description: "View the shared team task board. Use this to check task status, not to wait for teammates. Under silentLead you are not woken for each individual completion \u2014 rely on the board and team_results.",
         args: {},
         async execute(_args, ctx) {
           const result = await executeTeamTasksList(deps, ctx.sessionID);
@@ -8279,10 +8391,15 @@ var plugin = async (input) => {
         },
         async execute(args, ctx) {
           const result = await executeTeamShutdown(deps, args, ctx.sessionID);
-          const member = deps.db.query("SELECT session_id FROM team_member WHERE name = ? AND status IN ('shutdown', 'shutdown_requested')").get(args.member);
-          if (member) {
-            progressTracker.remove(member.session_id);
-            activityBuffer.remove(member.session_id);
+          const callerTeam = findTeamBySession(db, registry, ctx.sessionID);
+          if (callerTeam) {
+            const member = deps.db.query(
+              "SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status IN ('shutdown', 'shutdown_requested')"
+            ).get(callerTeam.teamId, args.member);
+            if (member) {
+              progressTracker.remove(member.session_id);
+              activityBuffer.remove(member.session_id);
+            }
           }
           const hasWarning = result.includes("uncommitted");
           ctx.metadata({ title: hasWarning ? `${args.member} shut down \u2014 uncommitted changes` : `${args.member} shut down` });
