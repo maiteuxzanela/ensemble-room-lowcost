@@ -8,6 +8,7 @@ import { executeTeamTasksAdd } from "./tools/team-tasks-add"
 import { executeTeamTasksComplete } from "./tools/team-tasks-complete"
 import { executeTeamClaim } from "./tools/team-claim"
 import { executeTeamStandby } from "./tools/team-standby"
+import { executeTeamTaskHandover } from "./tools/team-task-handover"
 import { executeTeamResults } from "./tools/team-results"
 import { executeTeamShutdown } from "./tools/team-shutdown"
 import { executeTeamCleanup } from "./tools/team-cleanup"
@@ -56,7 +57,7 @@ export function normalizePriority(value: string | undefined): TaskPriority {
 }
 
 /**
- * Register all 14 team tools on a V2 context. Each execute delegates to the
+ * Register all 15 team tools on a V2 context. Each execute delegates to the
  * same implementation V1 uses (DRY) — only arg transport changes from Zod to
  * JSON Schema. V1 applied schema defaults before execute; V2 may not, so
  * priority is normalized here (team_tasks_add writes it straight to SQLite).
@@ -271,6 +272,25 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
         additionalProperties: false,
       },
       execute: run(executeTeamStandby),
+    })
+
+    editor.add({
+      name: "team_task_handover",
+      description:
+        "Hand over an in_progress task you own to another teammate (cooperative intra-card baton pass). " +
+        "The card's assignee becomes 'to', the runtime wakes them with your notes, and you enter standby with a clean context window. " +
+        "Use it to work sequentially on the SAME card without write contention instead of working outside your specialty.",
+      input: {
+        type: "object",
+        properties: {
+          task_id: str("ID of the in_progress task to hand over"),
+          to: str("Teammate name to receive the baton (must be in the room, not yourself)"),
+          notes: str("Context/notes passed to the receiver (stored on the card)"),
+        },
+        required: ["task_id", "to"],
+        additionalProperties: false,
+      },
+      execute: run(executeTeamTaskHandover),
     })
 
     editor.add({

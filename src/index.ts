@@ -21,6 +21,8 @@ export { trackPrompt, abortInflight, endTracked } from "./v2-session"
 export { executeTeamTasksReview, executeTeamTasksReject } from "./tools/team-tasks-complete"
 export { executeTeamStandby, setMemberStandby } from "./tools/team-standby"
 export { executeTeamClaim, claimTask } from "./tools/team-claim"
+// HARNESS-48 — intra-card cooperative handover (Parceria de Bancada Sequencial).
+export { executeTeamTaskHandover } from "./tools/team-task-handover"
 // HARNESS-22 — emergency lead-decision escalation + the pending-decision helpers
 // (mark/clear/has) the watchdog and message paths share.
 export { executeDecisionLead, markAwaitingLeadDecision, clearAwaitingLeadDecision, hasAwaitingLeadDecision } from "./tools/decision-lead"
@@ -54,6 +56,7 @@ import { executeTeamTasksAdd } from "./tools/team-tasks-add"
 import { executeTeamTasksComplete } from "./tools/team-tasks-complete"
 import { executeTeamClaim } from "./tools/team-claim"
 import { executeTeamStandby } from "./tools/team-standby"
+import { executeTeamTaskHandover } from "./tools/team-task-handover"
 import { executeTeamResults } from "./tools/team-results"
 import { executeTeamStatus } from "./tools/team-status"
 import { executeTeamView } from "./tools/team-view"
@@ -723,6 +726,22 @@ const plugin: Plugin = async (input) => {
         async execute(args, ctx) {
           const result = await executeTeamStandby(deps, args, ctx.sessionID)
           ctx.metadata({ title: "Entered standby" })
+          return result
+        },
+      }),
+
+      team_task_handover: tool({
+        description: "Hand over an in_progress task you own to another teammate (cooperative intra-card baton pass). " +
+          "The card's assignee becomes 'to', the runtime wakes them with your notes, and you enter standby with a clean context window. " +
+          "Use it to work sequentially on the SAME card without write contention instead of working outside your specialty.",
+        args: {
+          task_id: tool.schema.string().describe("ID of the in_progress task to hand over"),
+          to: tool.schema.string().describe("Teammate name to receive the baton (must be in the room, not yourself)"),
+          notes: tool.schema.string().optional().describe("Context/notes passed to the receiver (stored on the card)"),
+        },
+        async execute(args, ctx) {
+          const result = await executeTeamTaskHandover(deps, args, ctx.sessionID)
+          ctx.metadata({ title: `Handed over to ${args.to}` })
           return result
         },
       }),

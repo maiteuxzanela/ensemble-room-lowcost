@@ -353,6 +353,7 @@ export async function executeTeamSpawn(
     "team_tasks_complete",
     "team_claim",
     "team_standby",
+    "team_task_handover",
     "team_results",
     "team_status",
     "team_view",
@@ -636,6 +637,7 @@ export async function executeTeamSpawn(
       "- team_tasks_complete: mark a task complete on the shared board",
       "- team_claim: claim a pending task from the shared board",
       "- team_standby: yield execution and enter standby mode until unblocked or messaged",
+      "- team_task_handover: hand an in_progress task you own to another teammate (intra-card baton pass) and enter standby",
       "- decision_lead: escalate an emergency decision to the team lead and pause until they deliberate",
     )
   }

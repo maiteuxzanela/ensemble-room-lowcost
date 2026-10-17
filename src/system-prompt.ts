@@ -206,6 +206,19 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
     "Only if the user selects that exact approval option, call team_cleanup again with the same purge value, confirm_purge: true, and the confirm_token from the preview.",
   )
 
+  // HARNESS-48 — Sequential bench partnership (intra-card handover). Parallelism
+  // is for disjoint files, not a rule: summon exactly as many specialists as the
+  // task needs and keep each inside their specialty. Complementary specialists
+  // may be born together, pact interfaces, then take turns on the SAME card via
+  // team_task_handover (baton pass + auto-standby) with clean context windows and
+  // zero write contention — instead of one specialist grinding outside their domain.
+  lines.push(
+    "",
+    "SEQUENTIAL BENCH PARTNERSHIP (INTRA-CARD HANDOVER):",
+    "Parallelism is for disjoint files, not a rule: summon as many specialists as the task requires and avoid any specialist working outside their own expertise.",
+    "When multiple specialties must touch the SAME card (or the same files), spawn them together and let them take turns on one card with team_task_handover: the current assignee hands the card over (assignee -> receiver, woken with notes) and enters standby, releasing its context window. Sequential, zero write contention.",
+  )
+
   const prompt = lines.join("\n")
 
   // M6 (TICKET-HARNESS-37): flush delivery flags as the LAST step, best-effort.
@@ -248,6 +261,11 @@ export function buildTeammateSystemPrompt(db: Database, teamId: string, memberNa
     "submit_review is the SINGLE channel for the FINAL consolidation of the functionality: it moves the card in_progress -> in_review and wakes the reviewer. Use it ONLY when the deliverable is complete.",
     "Do NOT send a redundant team_message(to: 'lead') for partial work — report to the lead only when the task is fully complete.",
     "If a genuinely blocking decision requires the lead, escalate with decision_lead instead of a best-effort message.",
+    "",
+    "SEQUENTIAL BENCH PARTNERSHIP (INTRA-CARD HANDOVER):",
+    "Parallelism is for disjoint files, not a rule: summon as many specialists as the task requires and avoid any specialist working outside their own expertise.",
+    "When the SAME card needs a complementary specialty you do not own (or your context window gets crowded), do NOT grind through it alone: call team_task_handover(task_id, to, notes) to hand the card over to the right specialist.",
+    "The receiver becomes the assignee, is woken with your notes and gets a clean context window; you enter standby automatically. This sequences work on one card with zero write contention instead of forcing a single specialist out of their domain.",
   ]
 
   // HARNESS-23 (TASK-02) + HARNESS-37 (M2): SDET-first delivery order, resolved
