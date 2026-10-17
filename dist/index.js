@@ -2560,6 +2560,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     "team_tasks_complete",
     "team_claim",
     "team_standby",
+    "team_task_handover",
     "team_results",
     "team_status",
     "team_view",
@@ -2795,6 +2796,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
       "- team_tasks_complete: mark a task complete on the shared board",
       "- team_claim: claim a pending task from the shared board",
       "- team_standby: yield execution and enter standby mode until unblocked or messaged",
+      "- team_task_handover: hand an in_progress task you own to another teammate (intra-card baton pass) and enter standby",
       "- decision_lead: escalate an emergency decision to the team lead and pause until they deliberate"
     );
   }
@@ -3757,7 +3759,7 @@ function extraRepoRoots() {
   if (!raw) return [];
   return raw.split(/[\n,;:]+/).map((p) => p.trim()).filter((p) => p.length > 0);
 }
-async function discoverCandidateRepos(dir) {
+async function discoverCandidateRepos(dir, ledger = []) {
   const candidates = [];
   const seen = /* @__PURE__ */ new Set();
   const add = (rawPath) => {
@@ -3780,6 +3782,15 @@ async function discoverCandidateRepos(dir) {
   }
   for (const extra of extraRepoRoots()) {
     if (extra !== normalizeDir(dir) && isRepoRoot(extra)) add(extra);
+  }
+  for (const rawPath of ledger) {
+    const abs = normalizeModifiedPath(rawPath);
+    if (abs === "") continue;
+    try {
+      const top = await gitToplevel(path5.dirname(abs));
+      if (top) add(top);
+    } catch {
+    }
   }
   return candidates;
 }
@@ -3814,7 +3825,7 @@ async function autoCommitApprovedTask(deps, teamId, taskContent) {
   try {
     const ledger = listModifiedFiles(deps.db, teamId);
     if (ledger.length === 0) return "";
-    const candidates = await discoverCandidateRepos(dir);
+    const candidates = await discoverCandidateRepos(dir, ledger);
     const targets = resolveCommitTargets(candidates, ledger);
     if (targets.length === 0) return "";
     const message = `feat(runtime): ${taskContent}`;
@@ -4095,6 +4106,91 @@ async function executeTeamTasksReject(deps, args, sessionId) {
   return executeTeamTasksComplete(deps, { ...args, action: "reject" }, sessionId);
 }
 
+// src/tools/team-task-handover.ts
+init_log();
+async function executeTeamTaskHandover(deps, args, sessionId) {
+  const teamInfo = requireTeamMember(deps, sessionId);
+  const caller = teamInfo.role === "lead" ? "lead" : teamInfo.memberName ?? "unknown";
+  const taskId = args.task_id?.trim();
+  if (!taskId) throw new Error("task_id is required");
+  const to = args.to?.trim();
+  if (!to) throw new Error("A handover target member ('to') is required");
+  const task = deps.db.query(
+    "SELECT id, content, status, assignee FROM team_task WHERE id = ? AND team_id = ?"
+  ).get(taskId, teamInfo.teamId);
+  if (!task) throw new Error(`Task "${taskId}" not found`);
+  if (task.status !== "in_progress") {
+    throw new Error(`Task "${taskId}" cannot be handed over (status: ${task.status}); handover requires an in_progress card`);
+  }
+  if (teamInfo.role !== "lead" && task.assignee !== caller) {
+    throw new Error(`Only the current assignee of task "${taskId}" (${task.assignee ?? "unassigned"}) or the team lead can hand it over`);
+  }
+  if (to === caller) {
+    throw new Error(`Cannot hand over task "${taskId}" to yourself ("${caller}")`);
+  }
+  const target = deps.db.query(
+    "SELECT name, session_id, agent, status, execution_status FROM team_member WHERE team_id = ? AND name = ?"
+  ).get(teamInfo.teamId, to);
+  if (!target) throw new Error(`Member "${to}" not found in the room`);
+  if (target.status === "shutdown" || target.status === "error") {
+    throw new Error(`Member "${to}" is not available for a handover (status: ${target.status})`);
+  }
+  const notes = args.notes?.trim() || null;
+  const now = Date.now();
+  const updated = deps.db.run(
+    "UPDATE team_task SET assignee = ?, review_notes = COALESCE(?, review_notes), time_updated = ? WHERE id = ? AND team_id = ? AND status = 'in_progress'",
+    [to, notes, now, taskId, teamInfo.teamId]
+  );
+  if (updated.changes === 0) {
+    throw new Error(`Task "${taskId}" could not be handed over (its status changed concurrently)`);
+  }
+  let notified = false;
+  if (target.session_id) {
+    deps.db.run(
+      "UPDATE team_member SET reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
+      [now, teamInfo.teamId, to]
+    );
+    const baseText = `[System: Task "${taskId}" was handed over to you by ${caller}${notes ? ` (notes: ${notes})` : ""} \u2014 you are now the assignee; continue the work on this card.]`;
+    let promptText = baseText;
+    let promptAgent = target.agent;
+    if (target.execution_status === "standby") {
+      const wake = resolveStandbyWake(deps.db, teamInfo.teamId, to, baseText);
+      if (wake.woke) {
+        promptText = wake.text;
+        promptAgent = wake.agent ?? target.agent;
+      }
+    }
+    const model = getMemberModel(deps.db, teamInfo.teamId, to);
+    deps.client.session.promptAsync({
+      sessionID: target.session_id,
+      parts: [{ type: "text", text: promptText }],
+      agent: promptAgent,
+      synthetic: true,
+      ...model ? { model } : {}
+    }).catch((err) => {
+      if (target.execution_status === "standby") {
+        deps.db.run(
+          "UPDATE team_member SET execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'starting'",
+          [Date.now(), teamInfo.teamId, to]
+        );
+      }
+      log(`task-handover:wake-failed task=${taskId} to=${to} err=${String(err)}`);
+    });
+    notified = true;
+    log(`task-handover:wake-ok task=${taskId} from=${caller} to=${to} sessionID=${target.session_id}`);
+  } else {
+    log(`task-handover:wake-skipped task=${taskId} to=${to} reason=no-session`);
+  }
+  let standbySuffix = "";
+  if (teamInfo.role !== "lead" && teamInfo.memberName) {
+    setMemberStandby(deps.db, teamInfo.teamId, teamInfo.memberName, `handover of ${taskId} to ${to}`);
+    standbySuffix = " You have entered standby (execution suspended) with a clean context window until the baton returns.";
+  }
+  log(`task-handover:ok task=${taskId} from=${caller} to=${to} notified=${notified}`);
+  const notifiedSuffix = notified ? ` (notified ${to})` : ` (${to} has no active session \u2014 the baton is recorded on the board)`;
+  return `Handed over task "${taskId}" to ${to}${notifiedSuffix}.${standbySuffix}`;
+}
+
 // src/result-parser.ts
 function parseTaskResult(content) {
   const match = content.match(/<task-result>([\s\S]*?)<\/task-result>/);
@@ -4141,108 +4237,6 @@ ${r.content}`;
 
 // src/tools/team-shutdown.ts
 init_merge_helper();
-init_log();
-async function executeTeamShutdown(deps, args, sessionId, isDirty = checkWorktreeDirty, preserve = preserveBranch, commitCount = countBranchCommits) {
-  const teamInfo = requireLead(deps, sessionId);
-  const member = deps.db.query("SELECT session_id, status, worktree_branch, worktree_dir FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, args.member);
-  if (!member) throw new Error(`Teammate "${args.member}" not found in team "${teamInfo.teamName}"`);
-  if (member.status === "shutdown") throw new Error(`Teammate "${args.member}" is already shut down`);
-  const force = args.force ?? false;
-  if (member.status === "shutdown_requested") {
-    await preserveAndAbort(deps, teamInfo.teamId, args.member, member.session_id, member.worktree_branch, preserve);
-    const status = await getBranchStatus(deps, teamInfo.teamId, args.member, member.worktree_dir, isDirty, commitCount);
-    return `Force shut down "${args.member}".${status}`;
-  }
-  let isIdle = false;
-  try {
-    const statuses = await deps.client.session.status();
-    const sessionStatus = statuses.data?.[member.session_id];
-    isIdle = !sessionStatus || sessionStatus.type === "idle";
-  } catch {
-  }
-  if (isIdle || force) {
-    await preserveAndAbort(deps, teamInfo.teamId, args.member, member.session_id, member.worktree_branch, preserve);
-    const status = await getBranchStatus(deps, teamInfo.teamId, args.member, member.worktree_dir, isDirty, commitCount);
-    return `Teammate "${args.member}" has been shut down.${status}`;
-  }
-  if (member.worktree_branch) {
-    const resource = getTeamResourceParts(deps.db, teamInfo.teamId);
-    const safeBranch = preservedBranchName(resource.projectName, resource.teamName, resource.teamId, args.member);
-    const ok = await preserve(member.worktree_branch, safeBranch, deps.directory);
-    if (ok) {
-      deps.db.run(
-        "UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
-        [safeBranch, teamInfo.teamId, args.member]
-      );
-      log(`shutdown:branch:preserved-graceful src=${member.worktree_branch} target=${safeBranch}`);
-    }
-  }
-  try {
-    deps.client.session.promptAsync({
-      sessionID: member.session_id,
-      parts: [{
-        type: "text",
-        text: `[Shutdown requested]: The lead has requested you shut down. Finish your current task, send your final findings to the lead via team_message, then stop.`
-      }]
-    }).catch(() => {
-    });
-  } catch {
-  }
-  deps.db.run(
-    "UPDATE team_member SET status = 'shutdown_requested', time_updated = ? WHERE team_id = ? AND name = ?",
-    [Date.now(), teamInfo.teamId, args.member]
-  );
-  return `Shutdown requested for ${args.member}. They will finish current work and shut down. Call team_shutdown with force: true to abort immediately.`;
-}
-async function preserveAndAbort(deps, teamId, memberName, sessionId, worktreeBranch, preserve) {
-  if (worktreeBranch && !worktreeBranch.startsWith("ensemble/preserved/")) {
-    const resource = getTeamResourceParts(deps.db, teamId);
-    const safeBranch = preservedBranchName(resource.projectName, resource.teamName, resource.teamId, memberName);
-    const ok = await preserve(worktreeBranch, safeBranch, deps.directory);
-    if (ok) {
-      deps.db.run(
-        "UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
-        [safeBranch, teamId, memberName]
-      );
-      log(`shutdown:branch:preserved src=${worktreeBranch} target=${safeBranch}`);
-    } else {
-      log(`shutdown:branch:preserve-failed src=${worktreeBranch} target=${safeBranch}`);
-    }
-  }
-  try {
-    await deps.client.session.abort({ sessionID: sessionId });
-  } catch {
-  }
-  deps.db.run(
-    "UPDATE team_member SET status = 'shutdown', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = ?",
-    [Date.now(), teamId, memberName]
-  );
-  const released = releaseMemberTasks(deps.db, teamId, memberName);
-  if (released > 0) log(`shutdown:tasks:released name=${memberName} count=${released}`);
-}
-async function getBranchStatus(deps, teamId, memberName, worktreeDir, isDirty, commitCount) {
-  const row = deps.db.query("SELECT worktree_branch FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
-  if (!row?.worktree_branch) return "";
-  const branch = row.worktree_branch;
-  const parts = [];
-  const commits = await commitCount(branch, deps.directory);
-  const dirty = worktreeDir ? await isDirty(worktreeDir).catch(() => false) : false;
-  if (commits > 0 && dirty) {
-    parts.push(`${memberName} committed ${commits} change${commits !== 1 ? "s" : ""} and has uncommitted work.`);
-  } else if (commits > 0) {
-    parts.push(`${memberName} committed ${commits} change${commits !== 1 ? "s" : ""}. Ready to merge.`);
-  } else if (dirty) {
-    parts.push(`${memberName} has uncommitted changes only \u2014 their work may be incomplete.`);
-  } else if (commits < 0) {
-    parts.push(`Could not determine ${memberName}'s commit status. Merge to check their work.`);
-  } else {
-    parts.push(`${memberName} made no changes.`);
-  }
-  parts.push(`Branch: ${branch}`);
-  parts.push("Use team_merge to merge their work.");
-  return `
-${parts.join("\n")}`;
-}
 
 // src/tools/team-cleanup.ts
 init_merge_helper();
@@ -4681,6 +4675,175 @@ Review with: git diff`);
   return parts.join("\n");
 }
 
+// src/tools/team-shutdown.ts
+init_log();
+var WILDCARD_MEMBERS = /* @__PURE__ */ new Set(["*", "all"]);
+async function executeTeamShutdown(deps, args, sessionId, isDirty = checkWorktreeDirty, preserve = preserveBranch, commitCount = countBranchCommits, merge = void 0, delBranch = void 0, mergeOnCleanup = true, overlapCheck = void 0) {
+  if (args.purge && args.purge.length > 0) {
+    return executeTeamCleanup(
+      deps,
+      {
+        force: args.force ?? false,
+        acknowledge_uncommitted: args.acknowledge_uncommitted,
+        purge: args.purge,
+        confirm_purge: args.confirm_purge,
+        confirm_token: args.confirm_token
+      },
+      sessionId
+    );
+  }
+  const teamInfo = requireLead(deps, sessionId);
+  const requested = args.member?.trim() ?? "";
+  if (requested === "" || WILDCARD_MEMBERS.has(requested.toLowerCase())) {
+    return shutdownWholeTeam(deps, teamInfo, args, sessionId, isDirty, preserve, merge, delBranch, mergeOnCleanup, overlapCheck);
+  }
+  const member = deps.db.query("SELECT session_id, status, worktree_branch, worktree_dir FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, requested);
+  if (!member) throw new Error(`Teammate "${requested}" not found in team "${teamInfo.teamName}"`);
+  if (member.status === "shutdown") throw new Error(`Teammate "${requested}" is already shut down`);
+  const force = args.force ?? false;
+  if (member.status === "shutdown_requested") {
+    await preserveAndAbort(deps, teamInfo.teamId, requested, member.session_id, member.worktree_branch, preserve);
+    const status = await getBranchStatus(deps, teamInfo.teamId, requested, member.worktree_dir, isDirty, commitCount);
+    return `Force shut down "${requested}".${status}`;
+  }
+  let isIdle = false;
+  try {
+    const statuses = await deps.client.session.status();
+    const sessionStatus = statuses.data?.[member.session_id];
+    isIdle = !sessionStatus || sessionStatus.type === "idle";
+  } catch {
+  }
+  if (isIdle || force) {
+    await preserveAndAbort(deps, teamInfo.teamId, requested, member.session_id, member.worktree_branch, preserve);
+    const status = await getBranchStatus(deps, teamInfo.teamId, requested, member.worktree_dir, isDirty, commitCount);
+    return `Teammate "${requested}" has been shut down.${status}`;
+  }
+  if (member.worktree_branch) {
+    const resource = getTeamResourceParts(deps.db, teamInfo.teamId);
+    const safeBranch = preservedBranchName(resource.projectName, resource.teamName, resource.teamId, requested);
+    const ok = await preserve(member.worktree_branch, safeBranch, deps.directory);
+    if (ok) {
+      deps.db.run(
+        "UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
+        [safeBranch, teamInfo.teamId, requested]
+      );
+      log(`shutdown:branch:preserved-graceful src=${member.worktree_branch} target=${safeBranch}`);
+    }
+  }
+  try {
+    deps.client.session.promptAsync({
+      sessionID: member.session_id,
+      parts: [{
+        type: "text",
+        text: `[Shutdown requested]: The lead has requested you shut down. Finish your current task, send your final findings to the lead via team_message, then stop.`
+      }]
+    }).catch(() => {
+    });
+  } catch {
+  }
+  deps.db.run(
+    "UPDATE team_member SET status = 'shutdown_requested', time_updated = ? WHERE team_id = ? AND name = ?",
+    [Date.now(), teamInfo.teamId, requested]
+  );
+  return `Shutdown requested for ${requested}. They will finish current work and shut down. Call team_shutdown with force: true to abort immediately.`;
+}
+async function shutdownWholeTeam(deps, teamInfo, args, sessionId, isDirty, preserve, merge, delBranch, mergeOnCleanup, overlapCheck) {
+  const members = deps.db.query(
+    "SELECT name, session_id, status, worktree_dir, worktree_branch, workspace_id FROM team_member WHERE team_id = ?"
+  ).all(teamInfo.teamId);
+  const active = members.filter((m) => m.status !== "shutdown" && m.status !== "error");
+  if (!args.acknowledge_uncommitted && active.length > 0) {
+    const dirty = [];
+    for (const member of active) {
+      if (!member.worktree_dir) continue;
+      try {
+        if (await isDirty(member.worktree_dir)) dirty.push({ name: member.name, branch: member.worktree_branch ?? "unknown" });
+      } catch {
+        log(`shutdown-all:dirty-check:failed name=${member.name}`);
+      }
+    }
+    if (dirty.length > 0) {
+      const warnings = dirty.map((d) => `  - ${d.name} (branch: ${d.branch})`).join("\n");
+      return `Warning: ${dirty.length} teammate(s) have uncommitted changes in their worktrees:
+${warnings}
+
+Commit or merge their work first, then call team_shutdown with acknowledge_uncommitted: true to shut down and clean up the whole team.`;
+    }
+  }
+  const settled = await Promise.allSettled(
+    active.map((member) => preserveAndAbort(deps, teamInfo.teamId, member.name, member.session_id, member.worktree_branch, preserve))
+  );
+  const failed = settled.map((result, i) => result.status === "rejected" ? `${active[i].name}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}` : null).filter((value) => value !== null);
+  const cleanupResult = await executeTeamCleanup(
+    deps,
+    { force: false, acknowledge_uncommitted: true },
+    sessionId,
+    isDirty,
+    merge,
+    delBranch,
+    mergeOnCleanup,
+    overlapCheck
+  );
+  const parts = [];
+  if (active.length > 0) {
+    parts.push(`Shut down ${active.length} teammate(s): ${active.map((m) => m.name).join(", ")}.`);
+  } else {
+    parts.push("No active teammates to shut down.");
+  }
+  if (failed.length > 0) parts.push(`Failed to shut down: ${failed.join("; ")}.`);
+  parts.push(cleanupResult);
+  return parts.join("\n");
+}
+async function preserveAndAbort(deps, teamId, memberName, sessionId, worktreeBranch, preserve) {
+  if (worktreeBranch && !worktreeBranch.startsWith("ensemble/preserved/")) {
+    const resource = getTeamResourceParts(deps.db, teamId);
+    const safeBranch = preservedBranchName(resource.projectName, resource.teamName, resource.teamId, memberName);
+    const ok = await preserve(worktreeBranch, safeBranch, deps.directory);
+    if (ok) {
+      deps.db.run(
+        "UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
+        [safeBranch, teamId, memberName]
+      );
+      log(`shutdown:branch:preserved src=${worktreeBranch} target=${safeBranch}`);
+    } else {
+      log(`shutdown:branch:preserve-failed src=${worktreeBranch} target=${safeBranch}`);
+    }
+  }
+  try {
+    await deps.client.session.abort({ sessionID: sessionId });
+  } catch {
+  }
+  deps.db.run(
+    "UPDATE team_member SET status = 'shutdown', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = ?",
+    [Date.now(), teamId, memberName]
+  );
+  const released = releaseMemberTasks(deps.db, teamId, memberName);
+  if (released > 0) log(`shutdown:tasks:released name=${memberName} count=${released}`);
+}
+async function getBranchStatus(deps, teamId, memberName, worktreeDir, isDirty, commitCount) {
+  const row = deps.db.query("SELECT worktree_branch FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
+  if (!row?.worktree_branch) return "";
+  const branch = row.worktree_branch;
+  const parts = [];
+  const commits = await commitCount(branch, deps.directory);
+  const dirty = worktreeDir ? await isDirty(worktreeDir).catch(() => false) : false;
+  if (commits > 0 && dirty) {
+    parts.push(`${memberName} committed ${commits} change${commits !== 1 ? "s" : ""} and has uncommitted work.`);
+  } else if (commits > 0) {
+    parts.push(`${memberName} committed ${commits} change${commits !== 1 ? "s" : ""}. Ready to merge.`);
+  } else if (dirty) {
+    parts.push(`${memberName} has uncommitted changes only \u2014 their work may be incomplete.`);
+  } else if (commits < 0) {
+    parts.push(`Could not determine ${memberName}'s commit status. Merge to check their work.`);
+  } else {
+    parts.push(`${memberName} made no changes.`);
+  }
+  parts.push(`Branch: ${branch}`);
+  parts.push("Use team_merge to merge their work.");
+  return `
+${parts.join("\n")}`;
+}
+
 // src/tools/team-merge.ts
 init_merge_helper();
 init_log();
@@ -5058,6 +5221,21 @@ async function registerV2Tools(domain, deps) {
       execute: run(executeTeamStandby)
     });
     editor.add({
+      name: "team_task_handover",
+      description: "Hand over an in_progress task you own to another teammate (cooperative intra-card baton pass). The card's assignee becomes 'to', the runtime wakes them with your notes, and you enter standby with a clean context window. Use it to work sequentially on the SAME card without write contention instead of working outside your specialty.",
+      input: {
+        type: "object",
+        properties: {
+          task_id: str("ID of the in_progress task to hand over"),
+          to: str("Teammate name to receive the baton (must be in the room, not yourself)"),
+          notes: str("Context/notes passed to the receiver (stored on the card)")
+        },
+        required: ["task_id", "to"],
+        additionalProperties: false
+      },
+      execute: run(executeTeamTaskHandover)
+    });
+    editor.add({
       name: "team_results",
       description: "Retrieve full message content from teammates. Returns unread messages and marks them as read. Use this after receiving a truncated message notification.",
       input: {
@@ -5069,25 +5247,32 @@ async function registerV2Tools(domain, deps) {
     });
     editor.add({
       name: "team_shutdown",
-      description: "Request a teammate to shut down. The teammate finishes current work then stops. Pass force: true to abort immediately without waiting.",
+      description: "Shut down the team lifecycle. Pass a specific member name to stop that teammate (legacy). Omit member \u2014 or pass '*'/'all' \u2014 to shut down and abort every active/standby teammate in parallel AND run the full room cleanup (merge safety net, worktree/workspace teardown, archive) in a single call. Pass force: true to abort immediately without waiting. Use purge for archived-team administration.",
       input: {
         type: "object",
         properties: {
-          member: str("Teammate name to shut down"),
-          force: bool("Force immediate abort without waiting for current work to finish", false)
+          member: str("Teammate name to shut down. Omit \u2014 or pass '*'/'all' \u2014 to shut down and clean up the entire team."),
+          force: bool("Force immediate abort without waiting for current work to finish", false),
+          acknowledge_uncommitted: bool("Acknowledge uncommitted worktree changes and proceed with full-team shutdown/cleanup", false),
+          purge: {
+            type: "array",
+            items: { type: "string" },
+            description: "Archived team names to permanently delete, or ['*'] for all archived teams."
+          },
+          confirm_purge: bool("Set true only after the user explicitly approves the purge preview.", false),
+          confirm_token: str("Confirmation token from the purge preview.")
         },
-        required: ["member"],
         additionalProperties: false
       },
       execute: run(executeTeamShutdown)
     });
     editor.add({
       name: "team_cleanup",
-      description: "Clean up the current team, or purge archived teams after human approval. Omit purge for normal cleanup.",
+      description: "Deprecated alias of team_shutdown. Cleans up the current team (shutting down any active members), or purges archived teams after human approval. Delegates to the unified team_shutdown routine. Omit purge for normal cleanup.",
       input: {
         type: "object",
         properties: {
-          force: bool("Force cleanup even if members are active (will abort them)", false),
+          force: bool("Force immediate abort of active members", false),
           acknowledge_uncommitted: bool("Acknowledge uncommitted changes", false),
           purge: {
             type: "array",
@@ -5101,9 +5286,10 @@ async function registerV2Tools(domain, deps) {
       },
       execute: async (input, context) => {
         const args = input;
-        const content = await executeTeamCleanup(
+        const content = await executeTeamShutdown(
           deps,
           {
+            member: "*",
             force: args.force ?? false,
             acknowledge_uncommitted: args.acknowledge_uncommitted,
             purge: args.purge,
@@ -5566,16 +5752,23 @@ function buildLeadSystemPrompt(db, teamId, config) {
     "In shared workspace mode (worktree: false), all teammates work in the same checkout directly \u2014 no branch merging is needed.",
     "Do NOT tell teammates to commit \u2014 in isolated worktrees they handle that themselves, and in shared workspaces commits follow the quality gate / delivery workflow.",
     "Do NOT run git merge manually \u2014 use team_merge which squash-merges and unstages for you.",
-    "team_cleanup will safety-net merge any branches you forgot, but prefer explicit team_merge.",
+    "A full-team team_shutdown will safety-net merge any branches you forgot, but prefer explicit team_merge.",
     "",
-    "Before calling team_cleanup, verify teammates using isolated worktrees have committed their work.",
-    "team_shutdown will warn you if a teammate has uncommitted changes in their worktree.",
-    "team_cleanup will block if any worktree has uncommitted changes \u2014 merge or commit first.",
-    'To permanently delete archived teams, call team_cleanup with purge: ["team-name"] or purge: ["*"] for all archived teams.',
+    "team_shutdown is the canonical lifecycle contact: pass a member name to stop one teammate, or omit it (or pass member: '*') to shut down EVERY active teammate in parallel and clean up the whole room (merge safety net, worktree teardown, archive) in one call.",
+    "team_cleanup is a deprecated alias that delegates to the same unified routine \u2014 new flows should call team_shutdown.",
+    "team_shutdown will warn you if a teammate has uncommitted changes in their worktree; pass acknowledge_uncommitted: true once you have merged/committed to proceed.",
+    "A full-team team_shutdown blocks if any worktree has uncommitted changes \u2014 merge or commit first.",
+    'To permanently delete archived teams, call team_shutdown (or the team_cleanup alias) with purge: ["team-name"] or purge: ["*"] for all archived teams.',
     "The first purge call is preview-only and deletes nothing.",
     "Use the question tool to ask the user for visible human approval before deleting archived team records or preserved Ensemble branches.",
     "The question must include the exact approval and denial option labels shown in the preview.",
-    "Only if the user selects that exact approval option, call team_cleanup again with the same purge value, confirm_purge: true, and the confirm_token from the preview."
+    "Only if the user selects that exact approval option, call again with the same purge value, confirm_purge: true, and the confirm_token from the preview."
+  );
+  lines.push(
+    "",
+    "SEQUENTIAL BENCH PARTNERSHIP (INTRA-CARD HANDOVER):",
+    "Parallelism is for disjoint files, not a rule: summon as many specialists as the task requires and avoid any specialist working outside their own expertise.",
+    "When multiple specialties must touch the SAME card (or the same files), spawn them together and let them take turns on one card with team_task_handover: the current assignee hands the card over (assignee -> receiver, woken with notes) and enters standby, releasing its context window. Sequential, zero write contention."
   );
   const prompt = lines.join("\n");
   for (const id of deliveredMessageIds) {
@@ -5605,7 +5798,12 @@ function buildTeammateSystemPrompt(db, teamId, memberName, config) {
     "Intermediate interactions and partial/in-progress deliveries during development happen EXCLUSIVELY via team_message(to: '<colleague>') \u2014 coordinate peer-to-peer; never open a review for partial work.",
     "submit_review is the SINGLE channel for the FINAL consolidation of the functionality: it moves the card in_progress -> in_review and wakes the reviewer. Use it ONLY when the deliverable is complete.",
     "Do NOT send a redundant team_message(to: 'lead') for partial work \u2014 report to the lead only when the task is fully complete.",
-    "If a genuinely blocking decision requires the lead, escalate with decision_lead instead of a best-effort message."
+    "If a genuinely blocking decision requires the lead, escalate with decision_lead instead of a best-effort message.",
+    "",
+    "SEQUENTIAL BENCH PARTNERSHIP (INTRA-CARD HANDOVER):",
+    "Parallelism is for disjoint files, not a rule: summon as many specialists as the task requires and avoid any specialist working outside their own expertise.",
+    "When the SAME card needs a complementary specialty you do not own (or your context window gets crowded), do NOT grind through it alone: call team_task_handover(task_id, to, notes) to hand the card over to the right specialist.",
+    "The receiver becomes the assignee, is woken with your notes and gets a clean context window; you enter standby automatically. This sequences work on one card with zero write contention instead of forcing a single specialist out of their domain."
   ];
   const roomSdet = getTeamSDETMember(db, teamId);
   if (roomSdet && isSDETMEmber(db, teamId, memberName) && memberName === roomSdet.name) {
@@ -8372,6 +8570,19 @@ var plugin = async (input) => {
           return result;
         }
       }),
+      team_task_handover: tool({
+        description: "Hand over an in_progress task you own to another teammate (cooperative intra-card baton pass). The card's assignee becomes 'to', the runtime wakes them with your notes, and you enter standby with a clean context window. Use it to work sequentially on the SAME card without write contention instead of working outside your specialty.",
+        args: {
+          task_id: tool.schema.string().describe("ID of the in_progress task to hand over"),
+          to: tool.schema.string().describe("Teammate name to receive the baton (must be in the room, not yourself)"),
+          notes: tool.schema.string().optional().describe("Context/notes passed to the receiver (stored on the card)")
+        },
+        async execute(args, ctx) {
+          const result = await executeTeamTaskHandover(deps, args, ctx.sessionID);
+          ctx.metadata({ title: `Handed over to ${args.to}` });
+          return result;
+        }
+      }),
       team_results: tool({
         description: "Retrieve full message content from teammates. Returns unread messages and marks them as read. Use this after receiving a truncated message notification.",
         args: {
@@ -8384,57 +8595,63 @@ var plugin = async (input) => {
         }
       }),
       team_shutdown: tool({
-        description: "Request a teammate to shut down. The teammate finishes current work then stops. Pass force: true to abort immediately without waiting.",
+        description: "Shut down the team lifecycle. Pass a specific member name to stop that teammate (legacy behavior). Omit member \u2014 or pass '*'/'all' \u2014 to shut down and abort EVERY active/standby teammate in parallel AND run the full room cleanup (merge safety net, worktree/workspace teardown, archive) in a single call. Pass force: true to abort immediately without waiting. Use purge for archived-team administration.",
         args: {
-          member: tool.schema.string().describe("Teammate name to shut down"),
-          force: tool.schema.boolean().default(false).describe("Force immediate abort without waiting for current work to finish")
+          member: tool.schema.string().optional().describe("Teammate name to shut down. Omit \u2014 or pass '*'/'all' \u2014 to shut down and clean up the entire team."),
+          force: tool.schema.boolean().default(false).describe("Force immediate abort without waiting for current work to finish"),
+          acknowledge_uncommitted: tool.schema.boolean().default(false).describe("Acknowledge uncommitted worktree changes and proceed with full-team shutdown/cleanup"),
+          purge: tool.schema.array(tool.schema.string()).optional().describe("Archived team names to permanently delete, or ['*'] for all archived teams. Requires human approval."),
+          confirm_purge: tool.schema.boolean().default(false).describe("Set true only after the user explicitly selects the exact approval option from the purge preview via the question tool."),
+          confirm_token: tool.schema.string().optional().describe("Confirmation token from the purge preview. Valid only after the matching exact approval answer is selected in this session.")
         },
         async execute(args, ctx) {
-          const result = await executeTeamShutdown(deps, args, ctx.sessionID);
+          const result = await executeTeamShutdown(deps, args, ctx.sessionID, void 0, void 0, void 0, void 0, void 0, config.mergeOnCleanup);
           const callerTeam = findTeamBySession(db, registry, ctx.sessionID);
           if (callerTeam) {
-            const member = deps.db.query(
-              "SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status IN ('shutdown', 'shutdown_requested')"
-            ).get(callerTeam.teamId, args.member);
-            if (member) {
-              progressTracker.remove(member.session_id);
-              activityBuffer.remove(member.session_id);
+            const memberArg = args.member?.trim();
+            const wildcard2 = !memberArg || memberArg === "*" || memberArg.toLowerCase() === "all";
+            if (wildcard2) {
+              const sessions = deps.db.query("SELECT session_id FROM team_member WHERE team_id = ?").all(callerTeam.teamId);
+              for (const s of sessions) {
+                progressTracker.remove(s.session_id);
+                activityBuffer.remove(s.session_id);
+              }
+            } else {
+              const member = deps.db.query(
+                "SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND status IN ('shutdown', 'shutdown_requested')"
+              ).get(callerTeam.teamId, memberArg);
+              if (member) {
+                progressTracker.remove(member.session_id);
+                activityBuffer.remove(member.session_id);
+              }
             }
           }
           const hasWarning = result.includes("uncommitted");
-          ctx.metadata({ title: hasWarning ? `${args.member} shut down \u2014 uncommitted changes` : `${args.member} shut down` });
+          const wildcard = !args.member?.trim() || args.member.trim() === "*" || args.member.trim().toLowerCase() === "all";
+          ctx.metadata({
+            title: hasWarning ? "Shutdown blocked \u2014 uncommitted changes" : wildcard ? "Team shut down and cleaned up" : `${args.member} shut down`
+          });
           return result;
         }
       }),
       team_cleanup: tool({
-        description: "Clean up the current team, or purge archived teams after human approval. Omit purge for normal cleanup. Pass purge with archived team names, or ['*'] for all archived teams. First purge call returns a preview, exact approval and denial options, and confirmation token only. Archived worktree/workspace references and stale Ensemble-owned branches are shown in the preview and cleaned during confirmed purge. Use the question tool with those exact options, then call again with confirm_purge: true and confirm_token only if the user selected the exact approval option.",
+        description: "Deprecated alias of team_shutdown. Cleans up the current team (shutting down any active members), or purges archived teams after human approval. Delegates to the unified team_shutdown routine. Omit purge for normal cleanup. Pass purge with archived team names, or ['*'] for all archived teams. First purge call returns a preview, exact approval and denial options, and confirmation token only. Use the question tool with those exact options, then call again with confirm_purge: true and confirm_token only if the user selected the exact approval option.",
         args: {
-          force: tool.schema.boolean().default(false).describe("Force cleanup even if members are active (will abort them)"),
+          force: tool.schema.boolean().default(false).describe("Force immediate abort of active members"),
           acknowledge_uncommitted: tool.schema.boolean().default(false),
           purge: tool.schema.array(tool.schema.string()).optional().describe("Archived team names to permanently delete, or ['*'] for all archived teams. Requires human approval."),
           confirm_purge: tool.schema.boolean().default(false).describe("Set true only after the user explicitly selects the exact approval option from the purge preview via the question tool."),
           confirm_token: tool.schema.string().optional().describe("Confirmation token from the purge preview. Valid only after the matching exact approval answer is selected in this session.")
         },
         async execute(args, ctx) {
-          const approvePurge = args.purge && args.purge.length > 0 && args.confirm_purge ? async (preview) => {
-            await ctx.ask({
-              permission: "team_cleanup.purge",
-              patterns: args.purge ?? [],
-              always: [],
-              metadata: {
-                title: "Purge archived teams",
-                preview
-              }
-            });
-          } : void 0;
           const teamInfoForCleanup = findTeamBySession(db, registry, ctx.sessionID);
           const memberSessions = teamInfoForCleanup ? db.query("SELECT session_id FROM team_member WHERE team_id = ?").all(teamInfoForCleanup.teamId).map((m) => m.session_id) : [];
-          const result = await executeTeamCleanup(deps, args, ctx.sessionID, void 0, void 0, void 0, config.mergeOnCleanup, void 0, approvePurge);
+          const result = await executeTeamShutdown(deps, { ...args, member: "*" }, ctx.sessionID, void 0, void 0, void 0, void 0, void 0, config.mergeOnCleanup);
           if (!result.includes("uncommitted") && !args.purge) {
             for (const sid of memberSessions) activityBuffer.remove(sid);
           }
           const blocked = result.includes("uncommitted");
-          const title = args.purge ? result.startsWith("No archived teams") ? "No archived teams to purge" : result.startsWith("Purge preview") ? "Purge confirmation required" : "Archived teams purged" : blocked ? "Cleanup blocked \u2014 uncommitted changes" : "Team cleaned up";
+          const title = args.purge ? result.startsWith("No archived teams") ? "No archived teams to purge" : result.startsWith("Purge") ? "Purge confirmation required" : "Archived teams purged" : blocked ? "Cleanup blocked \u2014 uncommitted changes" : "Team cleaned up";
           ctx.metadata({ title });
           return result;
         }
@@ -8516,7 +8733,10 @@ export {
   endTracked,
   executeDecisionLead,
   executeTeamClaim,
+  executeTeamCleanup,
+  executeTeamShutdown,
   executeTeamStandby,
+  executeTeamTaskHandover,
   executeTeamTasksReject,
   executeTeamTasksReview,
   failoverCooldown,
