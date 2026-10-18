@@ -38,7 +38,7 @@ function rClock(t){
 
 function rSum(t){
   const el=document.getElementById('sum'),mm=t.members||[],tk=t.tasks||[],msgs=t.messages||[];
-  const h=deriveHealth(t),tc=tk.filter(x=>x.status==='completed').length;
+  const h=deriveHealth(t),tc=tk.filter(x=>x.status==='completed').length,rc=tk.filter(x=>x.status==='in_review').length;
   patch(el,
     '<span class="w-[6px] h-[6px] rounded-full '+(t.status==='active'?'bg-emerald-500':'bg-txt-500')+'"></span>'+
     '<span class="font-mono font-semibold text-txt-200">'+E(t.name)+'</span>'+
@@ -48,6 +48,7 @@ function rSum(t){
     (h.d?chip(h.d+' done','muted'):'')+
     (h.e?chip(h.e+' error','red'):'')+
     (tk.length?chip(tc+'/'+tk.length+' tasks','green'):'')+
+    (rc?chip(rc+' in review','amber'):'')+
     (msgs.length?chip(msgs.length+' msgs','muted'):'')
   );
 }
@@ -272,7 +273,11 @@ function rTasks(t){
   if(!tk.length){patch(el,'<div class="text-txt-500 text-sm py-6 text-center">No tasks yet</div>');return}
   const c=tk.filter(x=>x.status==='completed').length,pct=Math.max(Math.round(c/tk.length*100),tk.length>0?2:0);
   const allDone=c===tk.length&&tk.length>0;
-  const g={in_progress:[],in_review:[],pending:[],completed:[],cancelled:[]};for(const x of tk)(g[x.status]||(g[x.status]=[])).push(x);
+  // Migration 19 purged the legacy 'blocked' status; a stale row (or any
+  // unknown status) is normalised to 'pending' so it never silently vanishes
+  // from the board — matching the DB-level blocked -> pending mapping.
+  const g={in_progress:[],in_review:[],pending:[],completed:[],cancelled:[]};
+  for(const x of tk){const st=(x.status==='blocked'||!g[x.status])?'pending':x.status;g[st].push(x)}
   const ds=saveD(el);
   function grp(label,items,dc,defOpen){
     if(!items.length)return'';

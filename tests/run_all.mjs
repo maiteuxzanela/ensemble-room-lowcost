@@ -67,6 +67,7 @@ const SUITES = [
   { file: "test_ticket_harness_48_ledger_discovery.mjs", label: "HARNESS-48/Frente 1 (Auto-commit universal via ledger: repo fora da árvore da sala, multi-mount, diretório não-git, repo já-limpo + prova de mutação)" },
   { file: "test_ticket_harness_49_lifecycle.mjs", label: "HARNESS-49/Frente 2 (Ciclo de vida unificado: team_shutdown wildcard/omisso/'*'/'all' paralelo, retrocompat single-member, guarda de uncommitted, alias team_cleanup + prova de mutação)" },
   { file: "test_ticket_harness_38.mjs", label: "HARNESS-38 (M9 unref+catch+dispose idempotente do Watchdog, M10 re-arme do report chatty, M11 poda/limpeza escopada de nudgedMembers no shutdown, M12 defaults + higienização de README/residuais/package.json; watchdog e plugin V1 reais + prova de mutação)" },
+  { file: "test_ticket_harness_52_dashboard.mjs", label: "HARNESS-52 (Dashboard: endpoints /api/state /api/health /api/session/:id/activity /api/chat/send /, compatibilidade Migration 19 sem depends_on/blocked, serialização e renderer REAL de in_review, gate DNS rebinding Host/Origin em GET e POST; prova de mutação M1-M6)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 
