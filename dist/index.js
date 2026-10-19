@@ -6935,6 +6935,164 @@ async function handleActivityRoute(db, sessionId, options, res, corsOrigin) {
   const combined = [...buffered, ...fallbackActivity].sort((a, b) => a.timestamp - b.timestamp);
   sendJson(res, { activity: combined, session: sessionData }, corsOrigin);
 }
+var MAX_EMERGENCY_BODY_BYTES = 16 * 1024;
+function readJsonBody(req, maxBytes) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let received = 0;
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    req.on("error", () => finish({ ok: false, status: 400, error: "Request stream error" }));
+    req.on("data", (chunk) => {
+      if (settled) return;
+      received += chunk.length;
+      if (received > maxBytes) {
+        finish({ ok: false, status: 413, error: "Payload Too Large" });
+        req.removeAllListeners("data");
+        req.resume();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      const raw = Buffer.concat(chunks).toString("utf8");
+      if (!raw.trim()) {
+        finish({ ok: true, payload: {} });
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          finish({ ok: false, status: 400, error: "Invalid JSON body: expected an object" });
+          return;
+        }
+        finish({ ok: true, payload: parsed });
+      } catch {
+        finish({ ok: false, status: 400, error: "Invalid JSON body" });
+      }
+    });
+  });
+}
+function stringField(payload, key) {
+  const value = payload[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+function teamExists(db, teamId) {
+  return !!db.query("SELECT id FROM team WHERE id = ?").get(teamId);
+}
+async function handleEmergencyPauseMember(db, req, res, corsOrigin, options) {
+  const body = await readJsonBody(req, MAX_EMERGENCY_BODY_BYTES);
+  if (!body.ok) {
+    sendJson(res, { ok: false, code: body.status === 413 ? "payload_too_large" : "invalid_json", error: body.error }, corsOrigin, body.status);
+    return;
+  }
+  const teamId = stringField(body.payload, "teamId");
+  const memberName = stringField(body.payload, "memberName");
+  if (!teamId || !memberName) {
+    sendJson(res, { ok: false, code: "missing_fields", error: "teamId and memberName are required" }, corsOrigin, 400);
+    return;
+  }
+  if (!teamExists(db, teamId)) {
+    sendJson(res, { ok: false, code: "team_not_found", error: `Team '${teamId}' not found` }, corsOrigin, 404);
+    return;
+  }
+  const member = db.query("SELECT name, session_id, status FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
+  if (!member) {
+    sendJson(res, { ok: false, code: "member_not_found", error: `Member '${memberName}' not found in team` }, corsOrigin, 404);
+    return;
+  }
+  if (member.status === "shutdown" || member.status === "error") {
+    sendJson(res, { ok: false, code: "member_not_active", error: `Member '${memberName}' is not active (status='${member.status}')` }, corsOrigin, 409);
+    return;
+  }
+  if (options?.client && member.session_id) {
+    try {
+      await options.client.session.abort({ sessionID: member.session_id });
+    } catch (err) {
+      log(`dashboard:emergency:pause-member:abort-failed team=${teamId} member=${memberName} err=${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  const inflightCleared = member.session_id ? abortInflight(member.session_id) : false;
+  db.run(
+    "UPDATE team_member SET status = 'ready', execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ?",
+    Date.now(),
+    teamId,
+    memberName
+  );
+  log(`dashboard:emergency:pause-member team=${teamId} member=${memberName} inflight=${inflightCleared}`);
+  sendJson(res, { ok: true, paused: memberName, teamId }, corsOrigin);
+}
+async function handleEmergencyPauseRoom(db, req, res, corsOrigin, options) {
+  const body = await readJsonBody(req, MAX_EMERGENCY_BODY_BYTES);
+  if (!body.ok) {
+    sendJson(res, { ok: false, code: body.status === 413 ? "payload_too_large" : "invalid_json", error: body.error }, corsOrigin, body.status);
+    return;
+  }
+  const teamId = stringField(body.payload, "teamId");
+  if (!teamId) {
+    sendJson(res, { ok: false, code: "missing_team_id", error: "teamId is required" }, corsOrigin, 400);
+    return;
+  }
+  if (!teamExists(db, teamId)) {
+    sendJson(res, { ok: false, error: `Team '${teamId}' not found` }, corsOrigin, 404);
+    return;
+  }
+  const members = db.query(
+    "SELECT name, session_id FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error') AND session_id IS NOT NULL AND session_id <> ''"
+  ).all(teamId);
+  await Promise.allSettled(members.map(async (member) => {
+    abortInflight(member.session_id);
+    if (!options?.client) return;
+    try {
+      await options.client.session.abort({ sessionID: member.session_id });
+    } catch (err) {
+      log(`dashboard:emergency:pause-room:abort-failed team=${teamId} member=${member.name} err=${err instanceof Error ? err.message : String(err)}`);
+    }
+  }));
+  const now = Date.now();
+  const pauseRoom = db.transaction(() => {
+    db.run(
+      "UPDATE team_member SET status = 'ready', execution_status = 'standby', time_updated = ? WHERE team_id = ? AND status NOT IN ('shutdown', 'error')",
+      now,
+      teamId
+    );
+    db.run(
+      "UPDATE team_task SET status = 'pending', time_updated = ? WHERE team_id = ? AND status = 'in_progress'",
+      now,
+      teamId
+    );
+  });
+  pauseRoom();
+  const pausedMembers = members.map((member) => member.name);
+  if (options?.client) {
+    try {
+      notifyLead(
+        options.client,
+        db,
+        teamId,
+        "[System: Sala pausada por acionamento de emerg\xEAncia da usu\xE1ria]",
+        {
+          ...options.config ? { config: options.config } : {},
+          forceWake: true
+        }
+      );
+    } catch (err) {
+      log(`dashboard:emergency:pause-room:notify-failed team=${teamId} err=${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  log(`dashboard:emergency:pause-room team=${teamId} paused=${pausedMembers.join(",") || "-"}`);
+  sendJson(res, { ok: true, pausedMembers, teamId }, corsOrigin);
+}
+function sendEmergencyFailure(res, corsOrigin, err) {
+  if (res.headersSent) return;
+  const msg = err instanceof Error ? err.message : String(err);
+  sendJson(res, { ok: false, code: "internal_error", error: msg }, corsOrigin, 500);
+}
 function handleDashboardRequest(db, port, req, res, options) {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? `localhost:${port}`}`);
   const corsOrigin = corsOriginFor(port, req.headers.origin);
@@ -7093,6 +7251,14 @@ function handleDashboardRequest(db, port, req, res, options) {
         sendJson(res, { ok: false, error: msg }, corsOrigin, 500);
       }
     });
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/emergency/pause-member") {
+    handleEmergencyPauseMember(db, req, res, corsOrigin, options).catch((err) => sendEmergencyFailure(res, corsOrigin, err));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/emergency/pause-room") {
+    handleEmergencyPauseRoom(db, req, res, corsOrigin, options).catch((err) => sendEmergencyFailure(res, corsOrigin, err));
     return;
   }
   const activityMatch = url.pathname?.match(/^\/api\/session\/([^/]+)\/activity$/);
@@ -7909,7 +8075,7 @@ async function setupEnsemble(ctx, options = {}) {
   let dashboard = null;
   const dashboardPort = options.dashboardPort ?? config.dashboardPort;
   if (dashboardPort !== 0 && !isWorktreeInstance(ctx.location.directory)) {
-    dashboard = await startDashboard(db, dashboardPort, { activityBuffer, client }).catch((err) => {
+    dashboard = await startDashboard(db, dashboardPort, { activityBuffer, client, config }).catch((err) => {
       vlog(`init:dashboard:failed err=${err instanceof Error ? err.message : String(err)}`);
       return null;
     });
@@ -8055,7 +8221,7 @@ var plugin = async (input) => {
     });
     log("init:recovery:done");
     if (config.dashboardPort !== 0) {
-      startDashboard(db, config.dashboardPort, { activityBuffer, client }).catch((err) => {
+      startDashboard(db, config.dashboardPort, { activityBuffer, client, config }).catch((err) => {
         log(`init:dashboard:failed err=${err instanceof Error ? err.message : String(err)}`);
       });
     }
