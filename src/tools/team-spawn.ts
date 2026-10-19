@@ -14,6 +14,7 @@ import { log } from "../log"
 import { getTeamQAMember, getTeamSDETMember } from "../qa-role"
 import type { EnsembleConfig } from "../config"
 import { getTeamResourceParts, teamWorktreeName } from "./merge-helper"
+import { trackPrompt, endTracked } from "../v2-session"
 import { existsSync, readFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -755,12 +756,27 @@ export async function executeTeamSpawn(
   } else {
     // Fire-and-forget: send prompt to teammate session.
     log(`spawn:promptAsync:fire name=${args.name} sessionId=${childSessionId}`)
+    // TICKET-HARNESS-57: register the delivery so a forced model switch can
+    // abort the stuck HTTP request (abortInflight) and a newer delivery
+    // supersedes this one instead of racing it.
+    const controller = trackPrompt(childSessionId)
     deps.client.session.promptAsync({
       sessionID: childSessionId,
       parts: [{ type: "text", text: contextStr }],
       agent,
+      signal: controller.signal,
       ...(modelParam ? { model: modelParam } : {}),
+    }).then(() => {
+      endTracked(childSessionId, controller)
     }).catch((err) => {
+      endTracked(childSessionId, controller)
+      // An aborted delivery was cancelled on purpose (forced model switch /
+      // superseded by a newer prompt). Do NOT roll back the member: the
+      // session is alive and the caller is driving the next turn.
+      if (controller.signal.aborted) {
+        log(`spawn:promptAsync:aborted name=${args.name} sessionId=${childSessionId} (request cancelled)`)
+        return
+      }
       const errMsg = err instanceof Error ? err.message : String(err)
       log(`spawn:promptAsync:failed name=${args.name} err=${errMsg} — rolling back`)
       try {

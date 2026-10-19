@@ -583,15 +583,21 @@ type FailoverCooldownVerdict =
  *      suppress inside FAILOVER_COOLDOWN_MS, proceed after it.
  *   3. Last action was `exhausted` → suppress the dead burst for
  *      FAILOVER_COOLDOWN_MS (no repeated toast/log), then retry.
- *   4. Last action was a switch:
- *      a. inside FAILOVER_BURST_DEBOUNCE_MS → SUPPRESS (residual retry events
- *         of the request that was just aborted);
- *      b. beyond the debounce → PROCEED immediately. The chain walks from the
- *         model that is actually bound now. When the caller still sees the
- *         PREVIOUS model (server has not rebound `session.model` yet, or the
- *         member row was not read back), the walk starts from the model the
- *         last switch applied (`record.toModel`) so the ladder never re-picks
- *         the same rung (A -> B -> B loop) nor restarts at chain[0].
+ *   4. Last action was a switch. The debounce is MODEL-AWARE (HARNESS-57):
+ *      it only shields residual retry events of the request that was just
+ *      aborted (`currentModel === null` or `currentModel === record.fromModel`).
+ *      a. residual echo inside FAILOVER_BURST_DEBOUNCE_MS → SUPPRESS;
+ *      b. residual echo beyond the debounce → PROCEED from `record.toModel`
+ *         (the caller still sees the PREVIOUS model: the server has not
+ *         rebound `session.model` yet, or the member row was not read back),
+ *         so the ladder never re-picks the same rung (A -> B -> B loop) nor
+ *         restarts at chain[0];
+ *      c. a DIFFERENT model already reporting the error (typically
+ *         `currentModel === record.toModel` dying in under the debounce)
+ *         → PROCEED IMMEDIATELY, bypassing the debounce, walking from
+ *         `currentModel` (falling back to `record.toModel`). Without this
+ *         bypass the freshly applied fallback's fast 429 was swallowed and
+ *         the CLI slept through its native hours-long backoff.
  */
 export function evaluateFailoverCooldown(
   key: string,
@@ -619,13 +625,19 @@ export function evaluateFailoverCooldown(
     return { verdict: "proceed", walkFrom: currentModel }
   }
 
-  if (elapsed < FAILOVER_BURST_DEBOUNCE_MS) {
+  // TICKET-HARNESS-57 — the debounce only shields residual echoes of the model
+  // that was JUST aborted. If the error already comes from a DIFFERENT model
+  // (e.g. the freshly applied `record.toModel` answering 429 in under 2.5s),
+  // this is a NEW burst and must advance immediately; suppressing it froze the
+  // session in the CLI's native hours-long backoff.
+  const echoOfAborted = currentModel === null || currentModel === record.fromModel
+  if (echoOfAborted && elapsed < FAILOVER_BURST_DEBOUNCE_MS) {
     return { verdict: "suppressed", remainingMs: FAILOVER_BURST_DEBOUNCE_MS - elapsed }
   }
 
-  // New burst on the freshly applied fallback: advance NOW.
-  const stale = currentModel === null || currentModel === record.fromModel
-  const walkFrom = stale ? record.toModel : currentModel
+  // Residual echo beyond the debounce walks from the model the last switch
+  // applied; a different model advances from itself.
+  const walkFrom = echoOfAborted ? record.toModel : currentModel
   return { verdict: "proceed", walkFrom: walkFrom ?? currentModel }
 }
 

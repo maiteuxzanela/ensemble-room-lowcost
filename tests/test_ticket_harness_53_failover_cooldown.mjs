@@ -11,12 +11,15 @@
  *                      (os MESMOS cenários rodam contra o dist real).
  *
  * Contratos provados:
- *   1. Dentro do burst (FAILOVER_BURST_DEBOUNCE_MS) os eventos residuais do
- *      pedido que acabou de ser abortado continuam "suppressed" — a cadeia
- *      NÃO é queimada por attempt (proteção original preservada).
- *   2. Passado o debounce, um 429 NO MODELO DE FALLBACK RECÉM-APLICADO avança
- *      imediatamente o degrau seguinte (A -> B -> C -> D em segundos), em
- *      AMBOS os caminhos (membro e sessão isolada/Lead).
+ *   1. Dentro do burst (FAILOVER_BURST_DEBOUNCE_MS) o ECO RESIDUAL do modelo
+ *      que acabou de ser abortado (`currentModel === null` ou `=== fromModel`,
+ *      leitura defasada) continua "suppressed" — a cadeia não é queimada por
+ *      um attempt residual.
+ *   2. Já um 429 vindo do MODELO NOVO (`currentModel === record.toModel`) em
+ *      ~500ms faz BYPASS IMEDIATO do debounce (TICKET-HARNESS-57) e avança o
+ *      degrau seguinte (A -> B em 500ms -> C), em AMBOS os caminhos (membro e
+ *      sessão isolada/Lead); o trade-off é queimar o ladder mais rápido
+ *      quando a leitura já reflete o rebind.
  *   3. Sessão isolada com `session.model` defasado (servidor ainda reporta o
  *      modelo anterior) NÃO repete o mesmo degrau nem reinicia no chain[0]:
  *      caminha a partir do degrau recém-aplicado.
@@ -249,6 +252,10 @@ const leadMessages = (db, teamId) =>
 function passBurstDebounce(mod, key) {
   mod.failoverCooldown.set(key, Date.now() - mod.FAILOVER_BURST_DEBOUNCE_MS - 1);
 }
+/** Rewind DETERMINÍSTICO: o 429 do fallback recém-aplicado chega em ~500ms. */
+function rewindBurst500(mod, key) {
+  mod.failoverCooldown.set(key, Date.now() - 500);
+}
 /** Rewind DETERMINÍSTICO: simula a expiração total do cooldown de exaustão. */
 function passFullCooldown(mod, key) {
   mod.failoverCooldown.set(key, Date.now() - mod.FAILOVER_COOLDOWN_MS - 1_000);
@@ -280,26 +287,36 @@ async function scenarioMember(mod, tag) {
   const r1 = await mod.handleRetryModelFailover(db, seed.registry, client, MEMBER_CFG, seed.sessionId, { ...README_CFG, attempt: 1 });
   out.set("member.step1-switch-fb1", r1?.action === "switched" && r1.toModel === "prov/fb1#low");
 
-  // Mesmo burst (attempt 2 e 3, milissegundos depois) → suppressed, cadeia intacta.
-  const r2 = await mod.handleRetryModelFailover(db, seed.registry, client, MEMBER_CFG, seed.sessionId, { ...README_CFG, attempt: 2 });
-  const r3 = await mod.handleRetryModelFailover(db, seed.registry, client, MEMBER_CFG, seed.sessionId, { ...README_CFG, attempt: 3 });
-  out.set("member.burst-suppressed",
-    r2?.action === "suppressed" && r3?.action === "suppressed"
-    && getMember(db, seed.teamId, seed.memberName).model === "prov/fb1#low");
-  out.set("member.burst-single-switch", client.calls.promptAsync.length === 1 && client.calls.abort.length === 1);
+  // HARNESS-57: eco residual REAL = leitura DEFASADA (o servidor ainda reporta
+  // o fromModel do último salto). Simula o rebind pendente restaurando o valor
+  // antigo na linha REAL do SQLite, sem tocar no metadata do cooldown.
+  db.run(
+    "UPDATE team_member SET model = ? WHERE team_id = ? AND name = ?",
+    ["prov/primary", seed.teamId, seed.memberName],
+  );
+  const rResidual = await mod.handleRetryModelFailover(db, seed.registry, client, MEMBER_CFG, seed.sessionId, { ...README_CFG, attempt: 2 });
+  out.set("member.residual-echo-suppressed",
+    rResidual?.action === "suppressed"
+    && client.calls.promptAsync.length === 1 && client.calls.abort.length === 1);
+  db.run(
+    "UPDATE team_member SET model = ? WHERE team_id = ? AND name = ?",
+    ["prov/fb1#low", seed.teamId, seed.memberName],
+  );
 
-  // 429 no MODELO DE FALLBACK recém-aplicado (passado o debounce) → avança JÁ.
-  passBurstDebounce(mod, key);
-  const r4 = await mod.handleRetryModelFailover(db, seed.registry, client, MEMBER_CFG, seed.sessionId, { ...README_CFG, attempt: 1 });
-  out.set("member.immediate-advance-fb2",
-    r4?.action === "switched" && r4.toModel === "prov/fb2#low" && r4.fromModel === "prov/fb1#low"
+  // HARNESS-57: o fallback recém-aplicado morre em ~500ms → bypass IMEDIATO do
+  // debounce e o ladder avança (A -> B -> C sem supressão).
+  rewindBurst500(mod, key);
+  const r2 = await mod.handleRetryModelFailover(db, seed.registry, client, MEMBER_CFG, seed.sessionId, { ...README_CFG, attempt: 2 });
+  out.set("member.fast-advance-fb2",
+    r2?.action === "switched" && r2.toModel === "prov/fb2#low" && r2.fromModel === "prov/fb1#low"
     && getMember(db, seed.teamId, seed.memberName).model === "prov/fb2#low");
 
-  passBurstDebounce(mod, key);
-  const r5 = await mod.handleRetryModelFailover(db, seed.registry, client, MEMBER_CFG, seed.sessionId, { ...README_CFG, attempt: 1 });
-  out.set("member.immediate-advance-fb3",
-    r5?.action === "switched" && r5.toModel === "prov/fb3#low"
+  rewindBurst500(mod, key);
+  const r3 = await mod.handleRetryModelFailover(db, seed.registry, client, MEMBER_CFG, seed.sessionId, { ...README_CFG, attempt: 3 });
+  out.set("member.fast-advance-fb3",
+    r3?.action === "switched" && r3.toModel === "prov/fb3#low"
     && getMember(db, seed.teamId, seed.memberName).model === "prov/fb3#low");
+  out.set("member.fast-cycle-not-suppressed", r2?.action !== "suppressed" && r3?.action !== "suppressed");
 
   // Exaustão: cacheada pelo cooldown longo (sem novo log/toast no burst morto).
   passBurstDebounce(mod, key);
@@ -339,20 +356,24 @@ async function scenarioIsolated(mod, tag) {
 
   const r1 = await mod.handleRetryModelFailover(db, new stateMod.MemberRegistry(), client, ISO_CFG, sessionId, { ...README_CFG, attempt: 1 });
   out.set("iso.step1-a", r1?.action === "switched" && r1.toModel === "prov/iso-a");
-  bound = { providerID: "prov", id: "iso-a" };
 
-  // Residual do MESMO burst (abort ainda em voo) → suppressed, sem 2º salto.
+  // HARNESS-57: eco residual REAL — o servidor AINDA reporta o modelo anterior
+  // (leitura defasada) dentro do debounce → suppressed, sem 2º salto.
   const rResidual = await mod.handleRetryModelFailover(db, new stateMod.MemberRegistry(), client, ISO_CFG, sessionId, { ...README_CFG, attempt: 2 });
-  out.set("iso.burst-suppressed", rResidual?.action === "suppressed" && client.calls.promptAsync.length === 1);
+  out.set("iso.residual-echo-suppressed", rResidual?.action === "suppressed" && client.calls.promptAsync.length === 1);
 
-  passBurstDebounce(mod, `isolated:${sessionId}`);
-  const r2 = await mod.handleRetryModelFailover(db, new stateMod.MemberRegistry(), client, ISO_CFG, sessionId, { ...README_CFG, attempt: 1 });
-  out.set("iso.step2-b", r2?.action === "switched" && r2.toModel === "prov/iso-b");
+  // Rebind concluído: o fallback recém-aplicado morre em ~500ms → bypass
+  // imediato e avanço do ladder (sem esperar/suprimir).
+  bound = { providerID: "prov", id: "iso-a" };
+  rewindBurst500(mod, `isolated:${sessionId}`);
+  const r2 = await mod.handleRetryModelFailover(db, new stateMod.MemberRegistry(), client, ISO_CFG, sessionId, { ...README_CFG, attempt: 2 });
+  out.set("iso.fast-advance-b", r2?.action === "switched" && r2.toModel === "prov/iso-b" && r2.fromModel === "prov/iso-a");
   bound = { providerID: "prov", id: "iso-b" };
 
-  passBurstDebounce(mod, `isolated:${sessionId}`);
-  const r3 = await mod.handleRetryModelFailover(db, new stateMod.MemberRegistry(), client, ISO_CFG, sessionId, { ...README_CFG, attempt: 1 });
-  out.set("iso.step3-c", r3?.action === "switched" && r3.toModel === "prov/iso-c");
+  rewindBurst500(mod, `isolated:${sessionId}`);
+  const r3 = await mod.handleRetryModelFailover(db, new stateMod.MemberRegistry(), client, ISO_CFG, sessionId, { ...README_CFG, attempt: 3 });
+  out.set("iso.fast-advance-c", r3?.action === "switched" && r3.toModel === "prov/iso-c" && r3.fromModel === "prov/iso-b");
+  out.set("iso.fast-cycle-not-suppressed", r2?.action !== "suppressed" && r3?.action !== "suppressed");
   bound = { providerID: "prov", id: "iso-c" };
 
   passBurstDebounce(mod, `isolated:${sessionId}`);
@@ -419,15 +440,16 @@ async function scenarioLead(mod, tag) {
 
   const r1 = await mod.handleRetryModelFailover(db, reg, client, ISO_CFG, leadSession, { ...README_CFG, attempt: 1 });
   out.set("lead.step1-a", r1?.action === "switched" && r1.toModel === "prov/iso-a" && r1.teamId === "");
-  bound = { providerID: "prov", id: "iso-a" };
 
-  // Residual do MESMO burst no Lead → suppressed (gate igual ao do membro).
+  // HARNESS-57: eco residual REAL (leitura defasada do session.model) → suppressed.
   const rResidual = await mod.handleRetryModelFailover(db, reg, client, ISO_CFG, leadSession, { ...README_CFG, attempt: 2 });
-  out.set("lead.burst-suppressed", rResidual?.action === "suppressed" && client.calls.promptAsync.length === 1);
+  out.set("lead.residual-echo-suppressed", rResidual?.action === "suppressed" && client.calls.promptAsync.length === 1);
 
-  passBurstDebounce(mod, `isolated:${leadSession}`);
-  const r2 = await mod.handleRetryModelFailover(db, reg, client, ISO_CFG, leadSession, { ...README_CFG, attempt: 1 });
-  out.set("lead.step2-b", r2?.action === "switched" && r2.toModel === "prov/iso-b");
+  // Rebind concluído + queda em ~500ms do fallback → bypass imediato para B.
+  bound = { providerID: "prov", id: "iso-a" };
+  rewindBurst500(mod, `isolated:${leadSession}`);
+  const r2 = await mod.handleRetryModelFailover(db, reg, client, ISO_CFG, leadSession, { ...README_CFG, attempt: 2 });
+  out.set("lead.fast-advance-b", r2?.action === "switched" && r2.toModel === "prov/iso-b" && r2.fromModel === "prov/iso-a");
 
   out.set("lead.board-untouched", getMember(db, `team-h53-lead-${tag}`, "worker").model === memberBefore);
   out.set("lead.agent-explicit-every-prompt",
@@ -534,18 +556,18 @@ for (const [scn, map] of Object.entries(DIST_MAPS)) {
 const MUTATIONS = [
   {
     id: "M1",
-    desc: "regressão ao cooldown cego: debounce volta a ser a janela de 10min (nenhum salto imediato)",
-    from: "if (elapsed < FAILOVER_BURST_DEBOUNCE_MS) {",
-    to: "if (elapsed < FAILOVER_COOLDOWN_MS) {",
+    desc: "debounce volta a ser CEGO (ignora o modelo atual): bypass do fallback recém-aplicado desaparece",
+    from: "if (echoOfAborted && elapsed < FAILOVER_BURST_DEBOUNCE_MS) {",
+    to: "if (elapsed < FAILOVER_BURST_DEBOUNCE_MS) {",
     scenarios: ["member"],
-    detect: ["member.immediate-advance-fb2", "member.immediate-advance-fb3"],
-    unaffected: ["member.burst-suppressed", "member.zero-lead-wake"],
+    detect: ["member.fast-advance-fb2", "member.fast-advance-fb3"],
+    unaffected: ["member.residual-echo-suppressed", "member.zero-lead-wake"],
   },
   {
     id: "M2",
     desc: "walkFrom deixa de considerar a leitura defasada (repete o degrau / reinicia)",
-    from: "const stale = currentModel === null || currentModel === record.fromModel;",
-    to: "const stale = false;",
+    from: "const walkFrom = echoOfAborted ? record.toModel : currentModel",
+    to: "const walkFrom = currentModel",
     scenarios: ["stale"],
     detect: ["stale.step2-advances-not-repeats"],
     unaffected: ["stale.step1-a"],
@@ -557,7 +579,7 @@ const MUTATIONS = [
     to: "recordFailoverAction(cooldownKey, now, member.model, null, false);",
     scenarios: ["member"],
     detect: ["member.exhausted-cached"],
-    unaffected: ["member.burst-suppressed", "member.zero-lead-wake"],
+    unaffected: ["member.residual-echo-suppressed", "member.zero-lead-wake"],
   },
   {
     id: "M4",
@@ -565,8 +587,8 @@ const MUTATIONS = [
     from: "const gate = evaluateFailoverCooldown(cooldownKey, currentModel, now)",
     to: "const gate = { verdict: \"proceed\", walkFrom: currentModel }",
     scenarios: ["iso", "lead"],
-    detect: ["iso.burst-suppressed", "lead.burst-suppressed"],
-    unaffected: ["iso.step1-a", "lead.step1-a", "iso.step2-b", "lead.step2-b"],
+    detect: ["iso.residual-echo-suppressed", "lead.residual-echo-suppressed"],
+    unaffected: ["iso.step1-a", "lead.step1-a", "iso.fast-advance-b", "lead.fast-advance-b"],
   },
 ];
 

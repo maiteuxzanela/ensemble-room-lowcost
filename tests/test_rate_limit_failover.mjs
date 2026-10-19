@@ -280,16 +280,31 @@ const leadMessages = (db, teamId) =>
   const cfg = { ...DEFAULT_CONFIG };
 
   const first = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 1, message: "429", next: Date.now() });
+
+  // HARNESS-57: eco residual REAL = leitura DEFASADA do modelo abortado.
+  // Restaura o valor antigo na linha real do SQLite (rebind do servidor ainda
+  // não refletido) e o attempt 2 dentro do debounce continua suprimido.
+  db.run(
+    "UPDATE team_member SET model = ? WHERE team_id = ? AND name = ?",
+    ["google/antigravity-gemini-3.8-flash", seed.teamId, seed.memberName],
+  );
   const second = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 2, message: "429", next: Date.now() });
+
+  // Rebind visível: o 429 agora vem do modelo NOVO → bypass imediato do
+  // debounce. Com a cadeia default de 1 degrau, o 3º attempt esgota.
+  db.run(
+    "UPDATE team_member SET model = ? WHERE team_id = ? AND name = ?",
+    ["google/antigravity-gemini-3.8-flash#low", seed.teamId, seed.memberName],
+  );
   const third = await handleRetryModelFailover(db, seed.registry, client, cfg, seed.sessionId, { attempt: 3, message: "429", next: Date.now() });
 
   check(
-    "B1: 1º retry → 'switched'; 2º e 3º (mesmo burst) → 'suppressed'",
-    first?.action === "switched" && second?.action === "suppressed" && third?.action === "suppressed",
+    "B1: 1º retry → 'switched'; eco residual defasado (2º) → 'suppressed'; 429 do modelo novo (3º) → 'exhausted'",
+    first?.action === "switched" && second?.action === "suppressed" && third?.action === "exhausted",
     `first=${first?.action} second=${second?.action} third=${third?.action}`,
   );
   check(
-    "B2: modelo NÃO avança mais de uma entrada por burst (não queima a cadeia)",
+    "B2: o eco residual NÃO queima degrau; o bypass do modelo novo reconhece a cadeia esgotada",
     getMember(db, seed.teamId, seed.memberName).model === "google/antigravity-gemini-3.8-flash#low",
   );
   check(

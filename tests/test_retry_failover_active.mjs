@@ -354,9 +354,25 @@ function seedMember(db, {
     db, seed.registry, client, { ...DEFAULT_CONFIG }, seed.sessionId,
     { attempt: 1, message: "429 first" },
   );
+  // HARNESS-57: eco residual = leitura defasada do modelo abortado. Restaura o
+  // valor antigo na linha real do SQLite para simular o rebind ainda pendente.
+  db.run(
+    "UPDATE team_member SET model = ? WHERE team_id = ? AND name = ?",
+    ["opencode/mimo-v2.6-flash-free", seed.teamId, seed.memberName],
+  );
   const second = await handleRetryModelFailover(
     db, seed.registry, client, { ...DEFAULT_CONFIG }, seed.sessionId,
     { attempt: 2, message: "429 second" },
+  );
+  // Rebind visível: o mesmo burst agora reporta o modelo NOVO → bypass do
+  // debounce; a cadeia default de 1 degrau já está esgotada.
+  db.run(
+    "UPDATE team_member SET model = ? WHERE team_id = ? AND name = ?",
+    ["google/antigravity-gemini-3.8-flash#low", seed.teamId, seed.memberName],
+  );
+  const third = await handleRetryModelFailover(
+    db, seed.registry, client, { ...DEFAULT_CONFIG }, seed.sessionId,
+    { attempt: 3, message: "429 third" },
   );
 
   check(
@@ -364,8 +380,13 @@ function seedMember(db, {
     first?.action === "switched",
   );
   check(
-    "2ª chamada no mesmo cooldown retorna 'suppressed'",
+    "2ª chamada com leitura DEFASADA no mesmo debounce retorna 'suppressed'",
     second?.action === "suppressed",
+  );
+  check(
+    "3ª chamada no modelo NOVO faz bypass do debounce e reconhece a cadeia esgotada",
+    third?.action === "exhausted",
+    `third=${third?.action}`,
   );
   check(
     "Apenas 1 abort e 1 promptAsync disparados no burst inteiro",

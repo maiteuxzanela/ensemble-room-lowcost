@@ -72,6 +72,7 @@ const SUITES = [
   { file: "test_ticket_harness_54_system_prompt_anti_polling.mjs", label: "HARNESS-54 (Blindagem anti-polling do Lead: diretiva condicional de pulso sintético [Continue]/Continue só com board aberto + paridade src↔dist e prova de mutação)" },
   { file: "test_ticket_harness_55_auto_sizing.mjs", label: "HARNESS-55 (Auto-Dimensionamento Nativo: protocolo pedagógico no prompt do Lead + compaction + retorno enriquecido de team_create + saneamento depends_on; SQLite real e prova de mutação M1-M3)" },
   { file: "test_emergency_pause.mjs", label: "HARNESS-56 (Emergency kill-switch: pausa individual/sala real com SQLite + gate Host, abort paralelo, tasks in_progress->pending, wake forçado ao Lead + contrato do proxy da extensão real; prova de mutação M1-M11)" },
+  { file: "test_ticket_harness_57_failover_refinement.mjs", label: "HARNESS-57 (Failover model-aware: supressão do eco residual vs bypass imediato do modelo novo + AbortController no spawn sem rollback destrutivo; SQLite/transporte reais, paridade src↔dist e prova de mutação M1-M3)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 
