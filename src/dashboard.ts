@@ -9,7 +9,10 @@ import { log } from "./log"
 import { broadcastMessage, sendMessage, markDelivered, hasReportedCompletion } from "./messaging"
 import { getMemberModel } from "./member-model"
 import { resolveStandbyWake } from "./tools/shared"
+import { abortInflight } from "./v2-session"
+import { notifyLead } from "./notify"
 import type { ActivityBuffer, ActivityEntry } from "./activity"
+import type { EnsembleConfig } from "./config"
 import type { PluginClient } from "./types"
 
 /** Assemble the full dashboard HTML from parts. */
@@ -201,6 +204,11 @@ export interface DashboardOptions {
   activityBuffer?: ActivityBuffer
   /** SDK client for on-demand session message retrieval. */
   client?: PluginClient
+  /**
+   * Plugin config (TICKET-HARNESS-56). Threaded into `notifyLead` so the
+   * emergency room pause emits a model-aware, forced system wake to the lead.
+   */
+  config?: Required<EnsembleConfig>
 }
 
 /**
@@ -367,6 +375,269 @@ async function handleActivityRoute(
   const combined = [...buffered, ...fallbackActivity].sort((a, b) => a.timestamp - b.timestamp)
 
   sendJson(res, { activity: combined, session: sessionData }, corsOrigin)
+}
+
+/**
+ * TICKET-HARNESS-56 — Emergency kill-switch.
+ *
+ * Hard ceiling for the small JSON bodies accepted by the emergency routes.
+ * They only ever carry a team id and a member name, so 16 KiB is generous and
+ * keeps the parse cost bounded on a loopback console.
+ */
+export const MAX_EMERGENCY_BODY_BYTES = 16 * 1024
+
+type JsonBodyResult =
+  | { ok: true; payload: Record<string, unknown> }
+  | { ok: false; status: number; error: string }
+
+/**
+ * Read and parse a JSON object body with a hard byte ceiling (fail-fast).
+ *
+ * Never throws: transport/parse failures are reported as a discriminated
+ * result so the caller writes exactly one response. An empty body degrades to
+ * `{}` (validation then reports the missing fields).
+ */
+function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<JsonBodyResult> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = []
+    let received = 0
+    let settled = false
+
+    const finish = (result: JsonBodyResult): void => {
+      if (settled) return
+      settled = true
+      resolve(result)
+    }
+
+    // Client went away mid-body: surface a 400 instead of hanging forever.
+    req.on("error", () => finish({ ok: false, status: 400, error: "Request stream error" }))
+
+    req.on("data", (chunk: Buffer) => {
+      if (settled) return
+      received += chunk.length
+      if (received > maxBytes) {
+        finish({ ok: false, status: 413, error: "Payload Too Large" })
+        // Stop buffering but drain the remainder so the 413 reaches the client
+        // before the socket is torn down (same intent as the chat route).
+        req.removeAllListeners("data")
+        req.resume()
+        return
+      }
+      chunks.push(chunk)
+    })
+
+    req.on("end", () => {
+      if (settled) return
+      const raw = Buffer.concat(chunks).toString("utf8")
+      if (!raw.trim()) {
+        finish({ ok: true, payload: {} })
+        return
+      }
+      try {
+        const parsed: unknown = JSON.parse(raw)
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          finish({ ok: false, status: 400, error: "Invalid JSON body: expected an object" })
+          return
+        }
+        finish({ ok: true, payload: parsed as Record<string, unknown> })
+      } catch {
+        finish({ ok: false, status: 400, error: "Invalid JSON body" })
+      }
+    })
+  })
+}
+
+/** Read an optional string field from a parsed JSON body (trimmed). */
+function stringField(payload: Record<string, unknown>, key: string): string {
+  const value = payload[key]
+  return typeof value === "string" ? value.trim() : ""
+}
+
+/** True when the team row exists. */
+function teamExists(db: Database, teamId: string): boolean {
+  return !!db.query("SELECT id FROM team WHERE id = ?").get(teamId)
+}
+
+interface EmergencyMemberRow {
+  name: string
+  session_id: string
+}
+
+/**
+ * `POST /api/emergency/pause-member` (TICKET-HARNESS-56-A).
+ *
+ * Aborts one member's running turn, drops its in-flight delivery tracking and
+ * parks the member in the standby state (`ready` + `standby`) so the user can
+ * take over the session without the agent racing her.
+ *
+ * Responses: 400 invalid payload · 404 unknown team/member · 409 member not
+ * pausable (shutdown/error) · 200 `{ ok, paused, teamId }`.
+ */
+async function handleEmergencyPauseMember(
+  db: Database,
+  req: IncomingMessage,
+  res: ServerResponse,
+  corsOrigin: string,
+  options?: DashboardOptions,
+): Promise<void> {
+  const body = await readJsonBody(req, MAX_EMERGENCY_BODY_BYTES)
+  if (!body.ok) {
+    sendJson(res, { ok: false, code: body.status === 413 ? "payload_too_large" : "invalid_json", error: body.error }, corsOrigin, body.status)
+    return
+  }
+
+  const teamId = stringField(body.payload, "teamId")
+  const memberName = stringField(body.payload, "memberName")
+  if (!teamId || !memberName) {
+    sendJson(res, { ok: false, code: "missing_fields", error: "teamId and memberName are required" }, corsOrigin, 400)
+    return
+  }
+
+  if (!teamExists(db, teamId)) {
+    sendJson(res, { ok: false, code: "team_not_found", error: `Team '${teamId}' not found` }, corsOrigin, 404)
+    return
+  }
+
+  const member = db.query("SELECT name, session_id, status FROM team_member WHERE team_id = ? AND name = ?")
+    .get(teamId, memberName) as (EmergencyMemberRow & { status: string }) | null
+  if (!member) {
+    sendJson(res, { ok: false, code: "member_not_found", error: `Member '${memberName}' not found in team` }, corsOrigin, 404)
+    return
+  }
+  // A terminated member must never be resurrected into `ready`: the pause
+  // would silently make a shut-down card claimable again.
+  if (member.status === "shutdown" || member.status === "error") {
+    sendJson(res, { ok: false, code: "member_not_active", error: `Member '${memberName}' is not active (status='${member.status}')` }, corsOrigin, 409)
+    return
+  }
+
+  // Abort the host turn first (best effort): a failure here must not block the
+  // local state cleanup, otherwise the dashboard would be unusable while the
+  // SDK is wedged.
+  if (options?.client && member.session_id) {
+    try {
+      await options.client.session.abort({ sessionID: member.session_id })
+    } catch (err: unknown) {
+      log(`dashboard:emergency:pause-member:abort-failed team=${teamId} member=${memberName} err=${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  // Drop the in-memory delivery controller so a stale settle cannot later
+  // mark a message delivered for a turn we just interrupted.
+  const inflightCleared = member.session_id ? abortInflight(member.session_id) : false
+
+  db.run(
+    "UPDATE team_member SET status = 'ready', execution_status = 'standby', time_updated = ? WHERE team_id = ? AND name = ?",
+    Date.now(),
+    teamId,
+    memberName,
+  )
+
+  log(`dashboard:emergency:pause-member team=${teamId} member=${memberName} inflight=${inflightCleared}`)
+  sendJson(res, { ok: true, paused: memberName, teamId }, corsOrigin)
+}
+
+/**
+ * `POST /api/emergency/pause-room` (TICKET-HARNESS-56-A).
+ *
+ * Room-wide kill-switch: abort every active member turn in parallel, park the
+ * whole room in standby, release the retained `in_progress` tasks back to
+ * `pending` (so nothing stays owned by a suspended agent) and force-wake the
+ * lead with a system notice.
+ *
+ * Responses: 400 invalid payload · 404 unknown team · 200
+ * `{ ok, pausedMembers, teamId }`.
+ */
+async function handleEmergencyPauseRoom(
+  db: Database,
+  req: IncomingMessage,
+  res: ServerResponse,
+  corsOrigin: string,
+  options?: DashboardOptions,
+): Promise<void> {
+  const body = await readJsonBody(req, MAX_EMERGENCY_BODY_BYTES)
+  if (!body.ok) {
+    sendJson(res, { ok: false, code: body.status === 413 ? "payload_too_large" : "invalid_json", error: body.error }, corsOrigin, body.status)
+    return
+  }
+
+  const teamId = stringField(body.payload, "teamId")
+  if (!teamId) {
+    sendJson(res, { ok: false, code: "missing_team_id", error: "teamId is required" }, corsOrigin, 400)
+    return
+  }
+
+  if (!teamExists(db, teamId)) {
+    sendJson(res, { ok: false, error: `Team '${teamId}' not found` }, corsOrigin, 404)
+    return
+  }
+
+  // Only members with a real session can be aborted; terminated members are
+  // excluded both from the abort fan-out and from the "paused" report.
+  const members = db.query(
+    "SELECT name, session_id FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error') AND session_id IS NOT NULL AND session_id <> ''",
+  ).all(teamId) as EmergencyMemberRow[]
+
+  await Promise.allSettled(members.map(async (member) => {
+    abortInflight(member.session_id)
+    if (!options?.client) return
+    try {
+      await options.client.session.abort({ sessionID: member.session_id })
+    } catch (err: unknown) {
+      log(`dashboard:emergency:pause-room:abort-failed team=${teamId} member=${member.name} err=${err instanceof Error ? err.message : String(err)}`)
+    }
+  }))
+
+  const now = Date.now()
+  const pauseRoom = db.transaction(() => {
+    db.run(
+      "UPDATE team_member SET status = 'ready', execution_status = 'standby', time_updated = ? WHERE team_id = ? AND status NOT IN ('shutdown', 'error')",
+      now,
+      teamId,
+    )
+    // TICKET-HARNESS-56-A — tasks held by the suspended agents go back to the
+    // unclaimed pool, so the room resumes from the board instead of leaving
+    // ghost `in_progress` cards pointing at idle members.
+    db.run(
+      "UPDATE team_task SET status = 'pending', time_updated = ? WHERE team_id = ? AND status = 'in_progress'",
+      now,
+      teamId,
+    )
+  })
+  pauseRoom()
+
+  const pausedMembers = members.map((member) => member.name)
+
+  // The wake is forced: an emergency pause is an operator action the lead must
+  // react to immediately (silentLead must not swallow it). A notification
+  // failure must NOT turn a successful pause into a 500 — the room is already
+  // suspended and its state is consistent.
+  if (options?.client) {
+    try {
+      notifyLead(
+        options.client,
+        db,
+        teamId,
+        "[System: Sala pausada por acionamento de emergência da usuária]",
+        {
+          ...(options.config ? { config: options.config } : {}),
+          forceWake: true,
+        },
+      )
+    } catch (err: unknown) {
+      log(`dashboard:emergency:pause-room:notify-failed team=${teamId} err=${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  log(`dashboard:emergency:pause-room team=${teamId} paused=${pausedMembers.join(",") || "-"}`)
+  sendJson(res, { ok: true, pausedMembers, teamId }, corsOrigin)
+}
+
+/** Write a 500 only when the route has not answered yet (no double write). */
+function sendEmergencyFailure(res: ServerResponse, corsOrigin: string, err: unknown): void {
+  if (res.headersSent) return
+  const msg = err instanceof Error ? err.message : String(err)
+  sendJson(res, { ok: false, code: "internal_error", error: msg }, corsOrigin, 500)
 }
 
 function handleDashboardRequest(
@@ -578,6 +849,18 @@ function handleDashboardRequest(
         sendJson(res, { ok: false, error: msg }, corsOrigin, 500)
       }
     })
+    return
+  }
+
+  // TICKET-HARNESS-56-A — emergency kill-switch. The loopback Host/Origin gate
+  // already ran above, so these routes inherit the DNS-rebinding protection.
+  if (req.method === "POST" && url.pathname === "/api/emergency/pause-member") {
+    handleEmergencyPauseMember(db, req, res, corsOrigin, options).catch((err: unknown) => sendEmergencyFailure(res, corsOrigin, err))
+    return
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/emergency/pause-room") {
+    handleEmergencyPauseRoom(db, req, res, corsOrigin, options).catch((err: unknown) => sendEmergencyFailure(res, corsOrigin, err))
     return
   }
 
