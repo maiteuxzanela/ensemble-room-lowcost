@@ -2,6 +2,7 @@ import type { ToolDeps } from "../types"
 import { generateId, generateProjectName, validateProjectName, validateTeamName } from "../util"
 import { findTeamBySession } from "../types"
 import { isSessionAlive } from "../recovery"
+import { leadTopologySizingReminder } from "../system-prompt"
 
 /**
  * Execute the team_create tool. Creates a new team with the caller as lead.
@@ -53,5 +54,8 @@ export async function executeTeamCreate(
     [id, args.name, projectId, sessionId, now, now]
   )
 
-  return `Team "${args.name}" created. You are the lead. Para demandas de engenharia, convoque o squad canônico via team_spawn: Implementador, Hugo (testes determinísticos) e Clara (Quality Gate). Use team_tasks_add para planejar as frentes.`
+  // TICKET-HARNESS-55 (Camada C): the tool result is the lead's first post-create
+  // read, so it carries a direct reminder of the SAME sizing scaffold injected in
+  // the system prompt (single source of truth: leadTopologySizingReminder).
+  return `Team "${args.name}" created. You are the lead. Para demandas de engenharia, convoque o squad canônico via team_spawn: Implementador, Hugo (testes determinísticos) e Clara (Quality Gate). Use team_tasks_add para planejar as frentes.\n\n${leadTopologySizingReminder()}`
 }

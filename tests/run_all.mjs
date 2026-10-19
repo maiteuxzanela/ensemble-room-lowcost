@@ -70,6 +70,7 @@ const SUITES = [
   { file: "test_ticket_harness_52_dashboard.mjs", label: "HARNESS-52 (Dashboard: endpoints /api/state /api/health /api/session/:id/activity /api/chat/send /, compatibilidade Migration 19 sem depends_on/blocked, serialização e renderer REAL de in_review, gate DNS rebinding Host/Origin em GET e POST; prova de mutação M1-M6)" },
   { file: "test_ticket_harness_53_failover_cooldown.mjs", label: "HARNESS-53 (Cooldown model-aware: debounce curto + avanço imediato de degrau no 429 do fallback recém-aplicado, membro e isolada/Lead, cadeia de Hugo/Clara/Diana no ensemble.json real + prova de mutação M1-M4)" },
   { file: "test_ticket_harness_54_system_prompt_anti_polling.mjs", label: "HARNESS-54 (Blindagem anti-polling do Lead: diretiva condicional de pulso sintético [Continue]/Continue só com board aberto + paridade src↔dist e prova de mutação)" },
+  { file: "test_ticket_harness_55_auto_sizing.mjs", label: "HARNESS-55 (Auto-Dimensionamento Nativo: protocolo pedagógico no prompt do Lead + compaction + retorno enriquecido de team_create + saneamento depends_on; SQLite real e prova de mutação M1-M3)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

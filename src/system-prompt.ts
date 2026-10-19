@@ -9,6 +9,36 @@ function truncate(s: string, maxLen: number): string {
   return s.length > maxLen ? `${s.slice(0, maxLen)}...` : s
 }
 
+/**
+ * TICKET-HARNESS-55 (Camada C) — Lead Topology & Sizing Protocol.
+ *
+ * Pedagogical scaffold injected into the lead's system prompt BEFORE the team is
+ * summoned. It replaces the old "always parallel" reflex with an explicit sizing
+ * interview: domain coverage, persona-gap hiring report, overload prevention
+ * (>2 complex steps -> clone the persona) and hybrid topology (parallel cards for
+ * disjoint files, sequential bench partnership on the same card). Exported as a
+ * single source of truth so `team_create` can surface the same reminder.
+ */
+export const LEAD_TOPOLOGY_PROTOCOL: readonly string[] = [
+  "LEAD TOPOLOGY & SIZING PROTOCOL (AUTO-DIMENSIONAMENTO NATIVO):",
+  "Before calling the team, ask yourself these four questions:",
+  "a) DOMAIN COVERAGE — which specialties does this task involve? Summon every required domain; never leave a layer (runtime, web, data, tests, GPU) without its specialist.",
+  "b) SPECIALIST HIRING REPORT (PERSONA GAP) — if a step requires a specialist that does not exist in the catalog, do NOT stall the demand: summon a temporary generic implementer to keep the work moving, and report the gap in your answer to the user with the suggested role spec (name, function, stack, template path personas/<name>.md).",
+  "c) OVERLOAD PREVENTION (>2 COMPLEX STEPS) — which specialists are carrying more than two complex steps? Clone the same persona (parallel instances such as <persona>-1/<persona>-2, or sequential copies) according to the real constraints of the task.",
+  "d) HYBRID TOPOLOGY — which parts are parallelizable? Independent cards on the board for disjoint files/modules. Which parts are sequential? Same card or same files -> Sequential Bench Partnership via team_task_handover (baton pass), or intra-card chaining. Adapt to the demand; never lock yourself into always-parallel or always-sequential.",
+]
+
+/** Compact reminder of the sizing scaffold, surfaced when a room is created. */
+export function leadTopologySizingReminder(): string {
+  return [
+    "LEAD TOPOLOGY & SIZING PROTOCOL — dimensione o time ANTES de convocar:",
+    "(a) Domínios: quais especialistas a tarefa envolve? Convoque todos os domínios necessários.",
+    "(b) Persona Gap: falta especialista no catálogo? Convoque um implementador genérico temporário para não travar a demanda e relate a lacuna ao usuário com a especificação da vaga (nome, função, stack, template personas/<name>.md).",
+    "(c) Sobrecarga (>2 passos complexos): clone a mesma persona — cópias paralelas (<persona>-1/<persona>-2) ou sequenciais, conforme as possibilidades da tarefa.",
+    "(d) Topologia híbrida: arquivos disjuntos -> cards independentes no board (paralelo); mesmo card/arquivos -> Parceria de Bancada via team_task_handover (sequencial). Adapte-se à demanda.",
+  ].join("\n")
+}
+
 /** Status display mapping from DB status to human-readable label. */
 const STATUS_DISPLAY: Record<string, string> = {
   busy: "working",
@@ -188,6 +218,11 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
       ]
 
   lines.push(
+    "",
+    // TICKET-HARNESS-55 (Camada C): sizing interview runs BEFORE the spawn
+    // instructions so the lead decides WHICH specialists, HOW MANY copies and
+    // WHICH topology before touching team_spawn/team_tasks_add.
+    ...LEAD_TOPOLOGY_PROTOCOL,
     "",
     "Spawn teammates ONE AT A TIME. Wait for each tool result before spawning the next.",
     "This avoids git worktree contention. Once all are spawned, wait for their messages.",
@@ -427,6 +462,10 @@ export function buildTeamCompactionContext(
   }
 
   if (role === "lead") {
+    // TICKET-HARNESS-55 (Camada C): the sizing scaffold must survive compaction —
+    // a lead that loses it mid-room falls back to blind one-size-fits-all sizing.
+    lines.push("", ...LEAD_TOPOLOGY_PROTOCOL)
+
     // Include recently completed tasks
     const completedTasks = db.query(
       "SELECT content, assignee FROM team_task WHERE team_id = ? AND status = 'completed' ORDER BY time_updated DESC LIMIT 5"

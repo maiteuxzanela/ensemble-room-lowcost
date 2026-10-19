@@ -649,7 +649,7 @@ async function autoCommitApprovedTask(deps: ToolDeps, teamId: string, taskConten
  * Execute the team_tasks_complete tool. Marks a task as completed.
  *
  * TICKET-HARNESS-51 — the board is a flat, fully-parallel pool: every task is
- * independent and there is no `depends_on`/`blocked` unblock pass. Coordination
+ * independent and no unblock pass runs on completion. Coordination
  * between fronts happens through `team_message` (disjoint fronts) or
  * `team_task_handover` (sequential baton pass on the SAME card).
  *

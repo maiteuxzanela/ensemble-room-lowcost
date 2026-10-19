@@ -11,8 +11,8 @@ interface TaskInput {
  * Execute the team_tasks_add tool. Adds tasks to the shared board.
  *
  * TICKET-HARNESS-51 — every task is born directly in `'pending'`: the board is
- * a flat, fully-parallel pool. There is no `depends_on`, no `sequential` chaining
- * and no `'blocked'` state — coordination between fronts happens through
+ * a flat, fully-parallel pool. There is no chaining parameter and no
+ * `'blocked'` state — coordination between fronts happens through
  * `team_message` (disjoint fronts) or `team_task_handover` (sequential baton pass
  * on the SAME card), never through an artificial DAG.
  */
