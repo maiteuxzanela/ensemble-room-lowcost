@@ -1632,11 +1632,11 @@ function evaluateFailoverCooldown(key, currentModel, now) {
     }
     return { verdict: "proceed", walkFrom: currentModel };
   }
-  if (elapsed < FAILOVER_BURST_DEBOUNCE_MS) {
+  const echoOfAborted = currentModel === null || currentModel === record.fromModel;
+  if (echoOfAborted && elapsed < FAILOVER_BURST_DEBOUNCE_MS) {
     return { verdict: "suppressed", remainingMs: FAILOVER_BURST_DEBOUNCE_MS - elapsed };
   }
-  const stale = currentModel === null || currentModel === record.fromModel;
-  const walkFrom = stale ? record.toModel : currentModel;
+  const walkFrom = echoOfAborted ? record.toModel : currentModel;
   return { verdict: "proceed", walkFrom: walkFrom ?? currentModel };
 }
 function recordFailoverAction(key, at, fromModel, toModel, exhausted) {
@@ -3240,12 +3240,21 @@ async function executeTeamSpawn(deps, args, sessionId) {
     log(`spawn:standby:no-prompt name=${args.name} sessionId=${childSessionId}`);
   } else {
     log(`spawn:promptAsync:fire name=${args.name} sessionId=${childSessionId}`);
+    const controller = trackPrompt(childSessionId);
     deps.client.session.promptAsync({
       sessionID: childSessionId,
       parts: [{ type: "text", text: contextStr }],
       agent,
+      signal: controller.signal,
       ...modelParam ? { model: modelParam } : {}
+    }).then(() => {
+      endTracked(childSessionId, controller);
     }).catch((err) => {
+      endTracked(childSessionId, controller);
+      if (controller.signal.aborted) {
+        log(`spawn:promptAsync:aborted name=${args.name} sessionId=${childSessionId} (request cancelled)`);
+        return;
+      }
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`spawn:promptAsync:failed name=${args.name} err=${errMsg} \u2014 rolling back`);
       try {
