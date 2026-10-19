@@ -1612,7 +1612,37 @@ function handleSessionErrorEvent(db, registry, client, sessionId, error, config)
   );
 }
 var FAILOVER_COOLDOWN_MS = 10 * 60 * 1e3;
+var FAILOVER_BURST_DEBOUNCE_MS = 2500;
 var failoverCooldown = /* @__PURE__ */ new Map();
+var failoverActions = /* @__PURE__ */ new Map();
+function evaluateFailoverCooldown(key, currentModel, now) {
+  const last = failoverCooldown.get(key);
+  if (last === void 0) return { verdict: "proceed", walkFrom: currentModel };
+  const elapsed = now - last;
+  const record = failoverActions.get(key);
+  if (!record) {
+    if (elapsed < FAILOVER_COOLDOWN_MS) {
+      return { verdict: "suppressed", remainingMs: FAILOVER_COOLDOWN_MS - elapsed };
+    }
+    return { verdict: "proceed", walkFrom: currentModel };
+  }
+  if (record.exhausted) {
+    if (elapsed < FAILOVER_COOLDOWN_MS) {
+      return { verdict: "suppressed", remainingMs: FAILOVER_COOLDOWN_MS - elapsed };
+    }
+    return { verdict: "proceed", walkFrom: currentModel };
+  }
+  if (elapsed < FAILOVER_BURST_DEBOUNCE_MS) {
+    return { verdict: "suppressed", remainingMs: FAILOVER_BURST_DEBOUNCE_MS - elapsed };
+  }
+  const stale = currentModel === null || currentModel === record.fromModel;
+  const walkFrom = stale ? record.toModel : currentModel;
+  return { verdict: "proceed", walkFrom: walkFrom ?? currentModel };
+}
+function recordFailoverAction(key, at, fromModel, toModel, exhausted) {
+  failoverCooldown.set(key, at);
+  failoverActions.set(key, { at, fromModel, toModel, exhausted });
+}
 async function handleRetryModelFailover(db, registry, client, config, sessionId, retryPayload) {
   const entry = registry.getBySession(sessionId);
   if (!entry) {
@@ -1627,15 +1657,15 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
   }
   const cooldownKey = `${entry.teamId}:${entry.memberName}`;
   const now = Date.now();
-  const lastAction = failoverCooldown.get(cooldownKey);
-  if (lastAction !== void 0 && now - lastAction < FAILOVER_COOLDOWN_MS) {
-    log(`failover:suppressed member=${entry.memberName} remaining_ms=${FAILOVER_COOLDOWN_MS - (now - lastAction)}`);
+  const gate = evaluateFailoverCooldown(cooldownKey, member.model, now);
+  if (gate.verdict === "suppressed") {
+    log(`failover:suppressed member=${entry.memberName} remaining_ms=${gate.remainingMs}`);
     return { action: "suppressed", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model };
   }
   const chain = resolveFallbackChainForAgent(config, member.agent);
-  const next = selectNextFallback(chain, member.model);
+  const next = selectNextFallback(chain, gate.walkFrom);
   if (!next) {
-    failoverCooldown.set(cooldownKey, now);
+    recordFailoverAction(cooldownKey, now, member.model, null, true);
     const detail = retryPayload?.action?.message ?? retryPayload?.message ?? "rate limited";
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty";
     log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}] detail=${detail}`);
@@ -1646,7 +1676,7 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
     "UPDATE team_member SET model = ?, time_updated = ? WHERE team_id = ? AND name = ?",
     [toSelector, now, entry.teamId, entry.memberName]
   );
-  failoverCooldown.set(cooldownKey, now);
+  recordFailoverAction(cooldownKey, now, member.model, toSelector, false);
   log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} (silent \u2014 lead not woken)`);
   const cancelled = abortInflight(sessionId);
   log(`failover:abort-inflight member=${entry.memberName} session=${sessionId} cancelled=${cancelled}`);
@@ -1720,20 +1750,20 @@ async function handleIsolatedSessionFailover(db, client, config, sessionId, retr
   if (chain.length === 0) return void 0;
   const cooldownKey = `isolated:${sessionId}`;
   const now = Date.now();
-  const lastAction = failoverCooldown.get(cooldownKey);
-  if (lastAction !== void 0 && now - lastAction < FAILOVER_COOLDOWN_MS) {
-    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${FAILOVER_COOLDOWN_MS - (now - lastAction)}`);
+  const gate = evaluateFailoverCooldown(cooldownKey, currentModel, now);
+  if (gate.verdict === "suppressed") {
+    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${gate.remainingMs}`);
     return { action: "suppressed", memberName: agent, teamId: "", fromModel: currentModel };
   }
-  const next = selectNextFallback(chain, currentModel);
+  const next = selectNextFallback(chain, gate.walkFrom);
   if (!next) {
-    failoverCooldown.set(cooldownKey, now);
+    recordFailoverAction(cooldownKey, now, currentModel, null, true);
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty";
     log(`failover:exhausted ${scope} session=${sessionId} agent=${agent} model=${currentModel ?? "default"} chain=[${chainDesc}]`);
     return { action: "exhausted", memberName: agent, teamId: "", fromModel: currentModel };
   }
   const toSelector = formatModelSelector(next);
-  failoverCooldown.set(cooldownKey, now);
+  recordFailoverAction(cooldownKey, now, currentModel, toSelector, false);
   log(`failover:switched ${scope} session=${sessionId} agent=${agent} from=${currentModel ?? "default"} to=${toSelector} (silent \u2014 lead not woken)`);
   const cancelled = abortInflight(sessionId);
   log(`failover:abort-inflight ${scope} session=${sessionId} cancelled=${cancelled}`);
@@ -5574,11 +5604,16 @@ function buildLeadSystemPrompt(db, teamId, config) {
     );
   }
   const silentLead = config?.silentLead !== false;
+  const openTaskCount = pending + inProgress + inReview;
   const coordinationLines = silentLead ? [
     "Teammates work asynchronously; under silentLead you are NOT woken for each individual completion.",
     "Progress lives on the shared board and in team_results \u2014 do not expect or demand a completion message per member.",
     "Rest until the board closes (all tasks completed) or a teammate escalates an emergency with decision_lead.",
     "Do NOT poll team_status or team_tasks_list repeatedly \u2014 wait for the board to close or an emergency escalation.",
+    ...openTaskCount > 0 ? [
+      'SYNTHETIC CONTINUATION PULSES: a bare continuation turn ("[Continue]", "Continue", or the compaction continuation "Continue if you have next steps...") is a transport artifact, NOT a human order.',
+      "While tasks are still open, never react to such a pulse by calling team_status, team_tasks_list or team_results \u2014 stay in standby and wait for the board event."
+    ] : [],
     "After spawning all teammates, tell the user what you've set up and wait.",
     "When the board closes, inspect team_results / team_tasks_list, summarize results, and suggest next steps."
   ] : [
