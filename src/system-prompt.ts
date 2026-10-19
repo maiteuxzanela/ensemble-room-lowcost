@@ -164,12 +164,19 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Req
   // false expectations and spurious lead wakes. Legacy silentLead:false keeps
   // the original wording byte-for-byte.
   const silentLead = config?.silentLead !== false
+  const openTaskCount = pending + inProgress + inReview
   const coordinationLines = silentLead
     ? [
         "Teammates work asynchronously; under silentLead you are NOT woken for each individual completion.",
         "Progress lives on the shared board and in team_results — do not expect or demand a completion message per member.",
         "Rest until the board closes (all tasks completed) or a teammate escalates an emergency with decision_lead.",
         "Do NOT poll team_status or team_tasks_list repeatedly — wait for the board to close or an emergency escalation.",
+        ...(openTaskCount > 0
+          ? [
+              "SYNTHETIC CONTINUATION PULSES: a bare continuation turn (\"[Continue]\", \"Continue\", or the compaction continuation \"Continue if you have next steps...\") is a transport artifact, NOT a human order.",
+              "While tasks are still open, never react to such a pulse by calling team_status, team_tasks_list or team_results — stay in standby and wait for the board event.",
+            ]
+          : []),
         "After spawning all teammates, tell the user what you've set up and wait.",
         "When the board closes, inspect team_results / team_tasks_list, summarize results, and suggest next steps.",
       ]

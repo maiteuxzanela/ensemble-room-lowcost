@@ -507,22 +507,142 @@ export function handleSessionErrorEvent(
  * ------------------------------------------------------------------ */
 
 /**
- * Minimum interval between failover ACTIONS (a model switch or an
- * exhausted-chain decision) for the same member. Retry events for
- * one rate-limit burst arrive attempt-after-attempt (1, 2, 3…) on the SAME
- * in-flight model — advancing the chain per attempt would burn it in
- * seconds, and acting per attempt would flood the lead. One action per
- * member per window keeps the burst silent after the first decision.
+ * Long cooldown window (TICKET-HARNESS-53): how long an EXHAUSTED-chain
+ * decision stays cached for the same member/session. It is NOT the window
+ * between consecutive model switches anymore — see
+ * FAILOVER_BURST_DEBOUNCE_MS. Keeping the exhausted decision cached this long
+ * avoids re-logging/re-toasting "no fallback left" on every residual retry
+ * event of the same dead burst.
  */
 export const FAILOVER_COOLDOWN_MS = 10 * 60 * 1000
 
 /**
- * Last failover-action timestamp per `${teamId}:${memberName}`. Module-level
- * like team-spawn's spawnFailures — one decision per member per cooldown
- * window is process-wide in-memory state. Exported so deterministic suites
- * can clear/rewind it without sleeping.
+ * Short debounce (TICKET-HARNESS-53): retry events for ONE rate-limit burst
+ * arrive attempt-after-attempt (1, 2, 3…) on the SAME in-flight model, and
+ * those residual events may still land in the milliseconds right after the
+ * abort. Inside this window every event after an action is `failover:suppressed`
+ * — the abort is in flight and the chain must not be burned per attempt.
+ *
+ * Beyond this window the event can only come from the model that was JUST
+ * applied: if that fallback also answers 429, the chain must advance
+ * IMMEDIATELY (A -> B -> C -> D in seconds) instead of freezing the session
+ * for FAILOVER_COOLDOWN_MS in the native ~4h backoff trap.
+ */
+export const FAILOVER_BURST_DEBOUNCE_MS = 2_500
+
+/**
+ * Last failover-action timestamp per cooldown key (`${teamId}:${memberName}`
+ * for members, `isolated:${sessionId}` for isolated/lead sessions).
+ * Module-level like team-spawn's spawnFailures — one decision per key is
+ * process-wide in-memory state. Exported so deterministic suites can
+ * clear/rewind it without sleeping.
+ *
+ * NOTE: this map is intentionally kept as `Map<string, number>` — the public
+ * get/set/delete/clear contract used by every existing suite. Model metadata
+ * lives in the parallel `failoverActions` map below.
  */
 export const failoverCooldown = new Map<string, number>()
+
+/**
+ * Model metadata for the last failover action of each cooldown key.
+ * Parallel to `failoverCooldown` (never a replacement) so the exported
+ * timestamp map keeps its `number` value type.
+ *
+ * `exhausted` records let the gate re-suppress the same dead burst for the
+ * whole FAILOVER_COOLDOWN_MS; live records let it tell "residual event of the
+ * burst I just aborted" (suppress) from "the fallback model I just applied
+ * also died" (advance now).
+ */
+export interface FailoverActionRecord {
+  /** Timestamp of the action (mirrors the `failoverCooldown` value). */
+  at: number
+  /** Model the session was on when the action fired (null = server default). */
+  fromModel: string | null
+  /** Model the session was switched TO (null when the chain was exhausted). */
+  toModel: string | null
+  /** True when the decision was `exhausted` (nothing left to switch to). */
+  exhausted: boolean
+}
+
+/** @see FailoverActionRecord */
+export const failoverActions = new Map<string, FailoverActionRecord>()
+
+type FailoverCooldownVerdict =
+  | { verdict: "proceed"; walkFrom: string | null }
+  | { verdict: "suppressed"; remainingMs: number }
+
+/**
+ * Model-aware failover gate (TICKET-HARNESS-53).
+ *
+ * The clock is ALWAYS the exported `failoverCooldown` timestamp, so existing
+ * suites that rewind/clear it keep working unchanged.
+ *
+ * Cases:
+ *   1. No timestamp for the key → proceed from `currentModel`.
+ *   2. Timestamp without metadata (legacy/seeded entry) → historical rule:
+ *      suppress inside FAILOVER_COOLDOWN_MS, proceed after it.
+ *   3. Last action was `exhausted` → suppress the dead burst for
+ *      FAILOVER_COOLDOWN_MS (no repeated toast/log), then retry.
+ *   4. Last action was a switch:
+ *      a. inside FAILOVER_BURST_DEBOUNCE_MS → SUPPRESS (residual retry events
+ *         of the request that was just aborted);
+ *      b. beyond the debounce → PROCEED immediately. The chain walks from the
+ *         model that is actually bound now. When the caller still sees the
+ *         PREVIOUS model (server has not rebound `session.model` yet, or the
+ *         member row was not read back), the walk starts from the model the
+ *         last switch applied (`record.toModel`) so the ladder never re-picks
+ *         the same rung (A -> B -> B loop) nor restarts at chain[0].
+ */
+export function evaluateFailoverCooldown(
+  key: string,
+  currentModel: string | null,
+  now: number,
+): FailoverCooldownVerdict {
+  const last = failoverCooldown.get(key)
+  if (last === undefined) return { verdict: "proceed", walkFrom: currentModel }
+
+  const elapsed = now - last
+  const record = failoverActions.get(key)
+  if (!record) {
+    // Legacy/seeded entry: no model metadata to reason about — keep the
+    // pre-HARNESS-53 semantics byte-for-byte.
+    if (elapsed < FAILOVER_COOLDOWN_MS) {
+      return { verdict: "suppressed", remainingMs: FAILOVER_COOLDOWN_MS - elapsed }
+    }
+    return { verdict: "proceed", walkFrom: currentModel }
+  }
+
+  if (record.exhausted) {
+    if (elapsed < FAILOVER_COOLDOWN_MS) {
+      return { verdict: "suppressed", remainingMs: FAILOVER_COOLDOWN_MS - elapsed }
+    }
+    return { verdict: "proceed", walkFrom: currentModel }
+  }
+
+  if (elapsed < FAILOVER_BURST_DEBOUNCE_MS) {
+    return { verdict: "suppressed", remainingMs: FAILOVER_BURST_DEBOUNCE_MS - elapsed }
+  }
+
+  // New burst on the freshly applied fallback: advance NOW.
+  const stale = currentModel === null || currentModel === record.fromModel
+  const walkFrom = stale ? record.toModel : currentModel
+  return { verdict: "proceed", walkFrom: walkFrom ?? currentModel }
+}
+
+/**
+ * Record a failover action in BOTH maps atomically (timestamp first — it is
+ * the authoritative clock read by evaluateFailoverCooldown).
+ */
+function recordFailoverAction(
+  key: string,
+  at: number,
+  fromModel: string | null,
+  toModel: string | null,
+  exhausted: boolean,
+): void {
+  failoverCooldown.set(key, at)
+  failoverActions.set(key, { at, fromModel, toModel, exhausted })
+}
 
 /** Outcome of a rate-limit failover evaluation (see handleRetryModelFailover). */
 export interface ModelFailoverDecision {
@@ -584,11 +704,15 @@ export interface ModelFailoverDecision {
  *   1. Registry lookup decides the SEAM — non-members and lead sessions fall
  *      through to the isolated path instead of a hard no-op.
  *   2. Shutdown-bound members never fail over (they are leaving anyway).
- *   3. Cooldown (FAILOVER_COOLDOWN_MS) deduplicates one burst's retry
+ *   3. Cooldown (FAILOVER_BURST_DEBOUNCE_MS) deduplicates one burst's retry
  *      attempts into ONE action; the server keeps retrying the in-flight
  *      request with the old model — the switch arms every SUBSEQUENT
  *      delivery (team_message, standby wake, watchdog re-prompt) with the
  *      fallback, because all delivery paths read team_member.model.
+ *      TICKET-HARNESS-53: past that short debounce the decision is
+ *      MODEL-AWARE (evaluateFailoverCooldown) — a 429 on the freshly applied
+ *      fallback advances the ladder immediately; only an exhausted chain is
+ *      re-suppressed for the full FAILOVER_COOLDOWN_MS.
  *   4. selectNextFallback walks the config chain forward; landing on
  *      undefined means exhaustion — log + decision only, the lead is not
  *      woken (HARNESS-13).
@@ -621,9 +745,13 @@ export async function handleRetryModelFailover(
 
   const cooldownKey = `${entry.teamId}:${entry.memberName}`
   const now = Date.now()
-  const lastAction = failoverCooldown.get(cooldownKey)
-  if (lastAction !== undefined && now - lastAction < FAILOVER_COOLDOWN_MS) {
-    log(`failover:suppressed member=${entry.memberName} remaining_ms=${FAILOVER_COOLDOWN_MS - (now - lastAction)}`)
+  // TICKET-HARNESS-53: model-aware gate. A residual retry event of the burst
+  // that was just aborted is suppressed (FAILOVER_BURST_DEBOUNCE_MS), but a
+  // 429 on the fallback model that was JUST applied advances the ladder
+  // immediately instead of freezing the member for FAILOVER_COOLDOWN_MS.
+  const gate = evaluateFailoverCooldown(cooldownKey, member.model, now)
+  if (gate.verdict === "suppressed") {
+    log(`failover:suppressed member=${entry.memberName} remaining_ms=${gate.remainingMs}`)
     return { action: "suppressed", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model }
   }
 
@@ -631,13 +759,13 @@ export async function handleRetryModelFailover(
   // selects its `fallbackModelsByAgent` override; agents without an override
   // fall back to the global chain (resolveFallbackChainForAgent delegates).
   const chain = resolveFallbackChainForAgent(config, member.agent)
-  const next = selectNextFallback(chain, member.model)
+  const next = selectNextFallback(chain, gate.walkFrom)
   if (!next) {
     // HARNESS-13 zero-noise: exhaustion does NOT wake the lead — no
     // notifyLead, no team_message. Log + decision only: the wiring layer
     // (index.ts) toasts the user, and the lead re-syncs from the board on
     // its own next turn (update config / respawn is a board-visible act).
-    failoverCooldown.set(cooldownKey, now)
+    recordFailoverAction(cooldownKey, now, member.model, null, true)
     const detail = retryPayload?.action?.message ?? retryPayload?.message ?? "rate limited"
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty"
     log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}] detail=${detail}`)
@@ -649,7 +777,7 @@ export async function handleRetryModelFailover(
     "UPDATE team_member SET model = ?, time_updated = ? WHERE team_id = ? AND name = ?",
     [toSelector, now, entry.teamId, entry.memberName],
   )
-  failoverCooldown.set(cooldownKey, now)
+  recordFailoverAction(cooldownKey, now, member.model, toSelector, false)
   log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} (silent — lead not woken)`)
 
   // 1. Cancel in-flight HTTP request controller
@@ -746,8 +874,10 @@ interface IsolatedSessionInfo {
  *      next model AND the explicit agent (synthetic). Zero-noise: the lead
  *      is NEVER woken (HARNESS-13); "exhausted" is returned as a decision so
  *      the wiring layer (index.ts) can toast the user.
- *   5. Cooldown reuses FAILOVER_COOLDOWN_MS with the key
- *      `isolated:${sessionId}` — one action per burst, same as members.
+ *   5. Cooldown reuses the model-aware gate of the member path with the key
+ *      `isolated:${sessionId}` — one action per burst (FAILOVER_BURST_DEBOUNCE_MS),
+ *      then immediate ladder advancement on a 429 of the applied fallback
+ *      (TICKET-HARNESS-53).
  *
  * Never throws — safe to call from event handlers.
  */
@@ -812,24 +942,27 @@ async function handleIsolatedSessionFailover(
 
   const cooldownKey = `isolated:${sessionId}`
   const now = Date.now()
-  const lastAction = failoverCooldown.get(cooldownKey)
-  if (lastAction !== undefined && now - lastAction < FAILOVER_COOLDOWN_MS) {
-    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${FAILOVER_COOLDOWN_MS - (now - lastAction)}`)
+  // TICKET-HARNESS-53: same model-aware gate as the member path (this one
+  // covers the Lead and Diana's isolated blind-review session — fixing only
+  // the member path would leave both stuck on the second 429).
+  const gate = evaluateFailoverCooldown(cooldownKey, currentModel, now)
+  if (gate.verdict === "suppressed") {
+    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${gate.remainingMs}`)
     return { action: "suppressed", memberName: agent, teamId: "", fromModel: currentModel }
   }
 
-  const next = selectNextFallback(chain, currentModel)
+  const next = selectNextFallback(chain, gate.walkFrom)
   if (!next) {
     // Chain exhausted — surface the decision so the wiring layer can toast.
     // HARNESS-13 zero-noise: the lead is NEVER woken from a failover path.
-    failoverCooldown.set(cooldownKey, now)
+    recordFailoverAction(cooldownKey, now, currentModel, null, true)
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty"
     log(`failover:exhausted ${scope} session=${sessionId} agent=${agent} model=${currentModel ?? "default"} chain=[${chainDesc}]`)
     return { action: "exhausted", memberName: agent, teamId: "", fromModel: currentModel }
   }
 
   const toSelector = formatModelSelector(next)
-  failoverCooldown.set(cooldownKey, now)
+  recordFailoverAction(cooldownKey, now, currentModel, toSelector, false)
   log(`failover:switched ${scope} session=${sessionId} agent=${agent} from=${currentModel ?? "default"} to=${toSelector} (silent — lead not woken)`)
 
   // Same active cycle as the member path: cancel in-flight, abort the native
