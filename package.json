@@ -1,5 +1,5 @@
 {
-  "name": "@maiteuxzanela/ensemble-room-lowcost",
+  "name": "ensemble-room-lowcost",
   "version": "0.18.1",
   "description": "OpenCode Ensemble Hardened - Low-cost multi-agent runtime with native standby, silent lead, and deterministic board wake",
   "module": "src/index.ts",
@@ -11,6 +11,11 @@
   },
   "type": "module",
   "license": "MIT",
+  "author": "Maiteux Zanela",
+  "homepage": "https://github.com/maiteuxzanela/ensemble-room-lowcost#readme",
+  "bugs": {
+    "url": "https://github.com/maiteuxzanela/ensemble-room-lowcost/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/maiteuxzanela/ensemble-room-lowcost.git"

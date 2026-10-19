@@ -1,4 +1,8 @@
-# @maiteuxzanela/ensemble-room-lowcost
+# ⚡ Ensemble Room (Low-Cost Multi-Agent Runtime)
+
+[![npm version](https://img.shields.io/npm/v/ensemble-room-lowcost.svg?color=cb3837&style=flat-square)](https://www.npmjs.com/package/ensemble-room-lowcost)
+[![npm downloads](https://img.shields.io/npm/dm/ensemble-room-lowcost.svg?style=flat-square)](https://www.npmjs.com/package/ensemble-room-lowcost)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
 **OpenCode Ensemble Hardened — a low-cost multi-agent runtime with native standby, silent lead, and deterministic board wake.**
 
@@ -6,7 +10,7 @@ A multi-agent team runtime for [OpenCode](https://opencode.ai), derived from `@h
 
 | | |
 |---|---|
-| Package | `@maiteuxzanela/ensemble-room-lowcost` |
+| Package | `ensemble-room-lowcost` |
 | Version | `0.18.1` (upstream base: `@hueyexe/opencode-ensemble@0.18.0`) |
 | Runtime entrypoint | `dist/index.js` (self-contained bundle) |
 | Source entrypoint | `src/index.ts` (`exports["."]`) |
