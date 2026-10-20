@@ -33,3 +33,8 @@ bun-debug.log*
 .env.*
 *.pem
 *.key
+
+# Harness local e tickets internos
+kanban.json
+opencode.json
+
