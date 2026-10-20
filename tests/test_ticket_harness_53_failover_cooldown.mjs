@@ -519,8 +519,8 @@ for (const [scn, map] of Object.entries(DIST_MAPS)) {
     ];
     const DIANA_CHAIN_CANON = [
       "google/antigravity-gemini-4-argon#medium",
-      "opencode/glm-5.3-flash-free",
       "google/antigravity-gemini-3.8-flash#high",
+      "opencode-go/deepseek-v4.1-flash#high",
     ];
     check(
       "4.1: modelsByAgent.hugo e .clara primam em opencode/deepseek-v4.1-flash-free",

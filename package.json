@@ -39,6 +39,8 @@
     "tsconfig.json",
     "LICENSE",
     "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
     "social-preview.png"
   ],
   "scripts": {

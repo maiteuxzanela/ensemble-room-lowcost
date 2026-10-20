@@ -2,13 +2,25 @@
 /**
  * Runner determinístico das suítes do ensemble-room-lowcost.
  *
- * Executa, em sequência estrita (fail-report, sem aborte antecipado):
+ * Executa as 46 suítes determinísticas do repositório em sequência estrita
+ * (fail-report, sem aborte antecipado): cada arquivo listado em SUITES roda
+ * até o fim mesmo que um anterior falhe, e o relatório consolidado final
+ * agrega PASS/FAIL de todas elas. Total atual: 46 arquivos de teste
+ * (milhares de verificações, zero mocks).
+ *
+ * As 3 suítes históricas seguem sendo o núcleo das 5 blindagens e re-executam
+ * umas às outras como regressão encadeada:
  *
  *   1. test_watchdog_heartbeat.mjs     — Heartbeat ativo + imunidade a compaction (55 checks)
  *   2. test_standby_lifecycle.mjs      — Spawn em standby + blindagem de nudge/fast-idle (130 checks,
  *                                        re-executa a suíte 1 como regressão)
  *   3. test_silent_lead_board_wake.mjs — Silent lead + despertar sistemático por board (151 checks,
  *                                        re-executa as suítes 1 e 2 como regressão)
+ *
+ * As demais 43 suítes cobrem standby/auto-wake, failover model-aware e cooldown,
+ * Quality Gate/SDET/handover, dashboard HTTP, auto-commit multi-repo, pausa de
+ * emergência e saneamento de schema (HARNESS-16 … HARNESS-57). A lista canônica
+ * é o array SUITES abaixo — ele é a fonte da verdade da cobertura.
  *
  * Regras:
  *   - SEM MOCKS: toda suíte roda contra src/ e dist/ REAIS deste repositório,

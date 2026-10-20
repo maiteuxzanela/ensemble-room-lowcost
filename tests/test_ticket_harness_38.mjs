@@ -167,7 +167,7 @@ check("1.M12 src e dist: DEFAULT_CONFIG endurecido (300s / 5 steps / 200 tokens)
 
 /* ---- package.json: files sem "tests" + exports íntegros ---- */
 const pkg = JSON.parse(readFileSync(path.join(PKG, "package.json"), "utf8"));
-const EXPECTED_FILES = ["dist", "src", "tsconfig.json", "LICENSE", "README.md", "social-preview.png"];
+const EXPECTED_FILES = ["dist", "src", "tsconfig.json", "LICENSE", "README.md", "CHANGELOG.md", "SECURITY.md", "social-preview.png"];
 check("1.pkg package.json.files não contém 'tests'",
   Array.isArray(pkg.files) && !pkg.files.includes("tests"), JSON.stringify(pkg.files));
 check("1.pkg package.json.files = conjunto exato esperado (nada a mais, nada a menos)",
