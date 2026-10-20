@@ -17,7 +17,7 @@ import { findTeamBySession } from "./types"
 import { loadConfig, type EnsembleConfig } from "./config"
 import { TokenBucket } from "./rate-limit"
 import { ActivityBuffer, recordFromToolBefore, recordFromToolAfter } from "./activity"
-import { recordFileFromToolCall } from "./modified-files"
+import { captureShellBaseline, recordFileFromToolCall } from "./modified-files"
 import { buildLeadSystemPrompt, buildTeammateSystemPrompt, buildTeamCompactionContext } from "./system-prompt"
 import { startDashboard, type DashboardServer } from "./dashboard"
 import { EnsembleRpc, emitMemberEvent, emitNoticeEvent } from "./v2-rpc"
@@ -282,7 +282,7 @@ export async function setupEnsemble(
   })()
 
   await ctx.tool.hook("execute.before", (raw) => {
-    const input = raw as unknown as { tool: string; sessionID: string }
+    const input = raw as unknown as { tool: string; sessionID: string; input?: unknown; args?: unknown; callID?: string }
     checkToolIsolation(registry, tracker, input.tool, input.sessionID, db)
     if (input.tool.startsWith("team_")) {
       if (!rateLimiter.tryConsume()) {
@@ -290,6 +290,17 @@ export async function setupEnsemble(
       }
     }
     recordFromToolBefore({ sessionID: input.sessionID, tool: input.tool }, registry, activityBuffer)
+    // TICKET-RELEASE-05: snapshot the repo(s) a shell call may touch, so the
+    // `after` hook can ledger every artifact it generated (npm/sed/builders).
+    captureShellBaseline(
+      db,
+      registry,
+      input.sessionID,
+      input.tool,
+      input.args ?? input.input,
+      ctx.location.directory,
+      input.callID,
+    )
   })
 
   await ctx.tool.hook("execute.after", (raw) => {
@@ -297,6 +308,7 @@ export async function setupEnsemble(
       tool: string
       sessionID: string
       input: unknown
+      callID?: string
       status: string
       result?: { content?: string | Array<{ type?: string; text?: string }> }
     }
@@ -313,7 +325,16 @@ export async function setupEnsemble(
     // TICKET-32A: ledger every file this room's session mutates
     // (edit/write/patch/...) so the Portão 1 auto-commit can commit a repo
     // strictly with the room-touched files — never a blind `git add -A`.
-    recordFileFromToolCall(db, registry, event.sessionID, event.tool, event.input)
+    // TICKET-RELEASE-05: shell calls are diffed against their baseline here.
+    recordFileFromToolCall(
+      db,
+      registry,
+      event.sessionID,
+      event.tool,
+      event.input,
+      ctx.location.directory,
+      event.callID,
+    )
     recordFromToolAfter(
       { sessionID: event.sessionID, tool: event.tool },
       {},

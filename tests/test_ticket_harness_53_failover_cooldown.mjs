@@ -534,12 +534,12 @@ for (const [scn, map] of Object.entries(DIST_MAPS)) {
       `hugo=[${hugo}] clara=[${clara}]`,
     );
     check(
-      "4.3: cadeia da Diana sem opencode-go/glm-5.3-flash na ordem canônica",
-      eq(diana, DIANA_CHAIN_CANON) && !diana.includes("opencode-go/glm-5.3-flash"),
+      "4.3: cadeia da Diana sem GLM na ordem canônica",
+      eq(diana, DIANA_CHAIN_CANON) && !diana.some((m) => m.includes("glm")),
       `diana=[${diana}]`,
     );
     check(
-      "4.4: opencode-go/glm-5.3-flash não aparece em NENHUMA das três cadeias",
+      "4.4: opencode-go/glm-5.3-flash pago não aparece em NENHUMA das três cadeias",
       ![...hugo, ...clara, ...diana].includes("opencode-go/glm-5.3-flash"),
     );
     check(

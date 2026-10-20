@@ -3716,6 +3716,8 @@ init_process();
 // src/modified-files.ts
 init_log();
 import path4 from "node:path";
+import { spawnSync } from "node:child_process";
+import { statSync } from "node:fs";
 var FILE_MUTATING_TOOLS = /* @__PURE__ */ new Set([
   "edit",
   "write",
@@ -3725,6 +3727,136 @@ var FILE_MUTATING_TOOLS = /* @__PURE__ */ new Set([
   "notebookEdit",
   "insert"
 ]);
+var SHELL_TOOLS = /* @__PURE__ */ new Set(["bash", "shell"]);
+var LEDGER_IGNORED_SEGMENTS = /* @__PURE__ */ new Set([".git", "node_modules", ".test-scratch"]);
+var MAX_SHELL_LEDGER_FILES = 400;
+var SHELL_GIT_TIMEOUT_MS = 5e3;
+var SHELL_BASELINE_TTL_MS = 10 * 60 * 1e3;
+var pendingShellBaselines = /* @__PURE__ */ new Map();
+function isLedgerIgnoredPath(relPath) {
+  return relPath.split(/[\\/]+/).some((segment) => LEDGER_IGNORED_SEGMENTS.has(segment));
+}
+function changeSignature(absPath) {
+  try {
+    const st = statSync(absPath);
+    if (!st.isFile()) return st.isDirectory() ? "dir" : "other";
+    return `${st.size}:${st.mtimeMs}:${st.ino}`;
+  } catch {
+    return "missing";
+  }
+}
+function porcelainEntries(root, raw) {
+  const out = [];
+  const tokens = raw.split("\0");
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (!token || token.length < 4) continue;
+    const status = token.slice(0, 2);
+    const rel = token.slice(3);
+    if (status.startsWith("R") || status.startsWith("C")) i += 1;
+    if (!rel || isLedgerIgnoredPath(rel)) continue;
+    out.push([path4.resolve(root, rel), status]);
+  }
+  return out;
+}
+function gitStatusSnapshot(cwd) {
+  const top = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+    cwd,
+    encoding: "utf8",
+    timeout: SHELL_GIT_TIMEOUT_MS
+  });
+  if (top.error || top.status !== 0) return null;
+  const root = top.stdout.trim();
+  if (!root) return null;
+  const statusRes = spawnSync(
+    "git",
+    [
+      "status",
+      "--porcelain",
+      "-z",
+      "-uall",
+      "--",
+      ".",
+      ":(exclude)node_modules",
+      ":(exclude).test-scratch",
+      ":(exclude).git"
+    ],
+    { cwd: root, encoding: "utf8", timeout: SHELL_GIT_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 }
+  );
+  if (statusRes.error || statusRes.status !== 0) return null;
+  const entries = /* @__PURE__ */ new Map();
+  for (const [abs, status] of porcelainEntries(root, statusRes.stdout ?? "")) {
+    entries.set(abs, `${status}:${changeSignature(abs)}`);
+  }
+  return { root, entries };
+}
+function resolveShellCwd(db, sessionId, args, workspaceDir) {
+  if (args && typeof args === "object") {
+    const raw = args.cwd;
+    if (typeof raw === "string" && raw.length > 0) return path4.resolve(raw);
+  }
+  const row = db.query("SELECT worktree_dir FROM team_member WHERE session_id = ?").get(sessionId);
+  if (row?.worktree_dir) return row.worktree_dir;
+  return workspaceDir ? path4.resolve(workspaceDir) : null;
+}
+function prunePendingShellBaselines(now) {
+  for (const [sessionId, queue] of pendingShellBaselines) {
+    const fresh = queue.filter((entry) => now - entry.at <= SHELL_BASELINE_TTL_MS);
+    if (fresh.length === 0) pendingShellBaselines.delete(sessionId);
+    else pendingShellBaselines.set(sessionId, fresh);
+  }
+}
+function captureShellBaseline(db, registry, sessionId, tool2, args, workspaceDir, callId) {
+  try {
+    if (!SHELL_TOOLS.has(tool2)) return;
+    const teamInfo = findTeamBySession(db, registry, sessionId);
+    if (!teamInfo) return;
+    const cwd = resolveShellCwd(db, sessionId, args, workspaceDir);
+    if (!cwd) return;
+    const now = Date.now();
+    prunePendingShellBaselines(now);
+    const queue = pendingShellBaselines.get(sessionId) ?? [];
+    queue.push({ callId, at: now, snapshot: gitStatusSnapshot(cwd) });
+    while (queue.length > 8) queue.shift();
+    pendingShellBaselines.set(sessionId, queue);
+  } catch (err) {
+    log(`modified-file:shell-baseline-failed tool=${tool2} err=${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+function consumeShellBaseline(db, registry, sessionId, tool2, args, workspaceDir, callId) {
+  const teamInfo = findTeamBySession(db, registry, sessionId);
+  if (!teamInfo) return null;
+  const cwd = resolveShellCwd(db, sessionId, args, workspaceDir);
+  if (!cwd) return null;
+  const queue = pendingShellBaselines.get(sessionId) ?? [];
+  let idx = -1;
+  if (callId) idx = queue.findIndex((entry) => entry.callId === callId);
+  if (idx < 0) idx = 0;
+  const pending = queue.length > 0 ? queue.splice(idx, 1)[0] : void 0;
+  if (queue.length === 0) pendingShellBaselines.delete(sessionId);
+  else pendingShellBaselines.set(sessionId, queue);
+  return { baseline: pending?.snapshot ?? null, current: gitStatusSnapshot(cwd) };
+}
+function recordShellDiff(db, teamId, baseline, current) {
+  if (!current) return [];
+  const before = baseline && baseline.root === current.root ? baseline.entries : /* @__PURE__ */ new Map();
+  const touched = [];
+  for (const [abs, signature] of current.entries) {
+    if (before.get(abs) === signature) continue;
+    touched.push(abs);
+  }
+  for (const abs of before.keys()) {
+    if (!current.entries.has(abs)) touched.push(abs);
+  }
+  const limited = touched.length > MAX_SHELL_LEDGER_FILES ? touched.slice(0, MAX_SHELL_LEDGER_FILES) : touched;
+  if (touched.length > limited.length) {
+    log(
+      `modified-file:shell-truncated team=${teamId} touched=${touched.length} recorded=${limited.length} max=${MAX_SHELL_LEDGER_FILES}`
+    );
+  }
+  for (const abs of limited) recordModifiedFile(db, teamId, abs);
+  return limited;
+}
 function normalizeModifiedPath(filePath) {
   return path4.resolve(filePath);
 }
@@ -3753,8 +3885,23 @@ function extractFilePath(tool2, args) {
   }
   return null;
 }
-function recordFileFromToolCall(db, registry, sessionId, tool2, args) {
+function recordFileFromToolCall(db, registry, sessionId, tool2, args, workspaceDir, callId) {
   try {
+    if (SHELL_TOOLS.has(tool2)) {
+      const teamInfo2 = findTeamBySession(db, registry, sessionId);
+      if (!teamInfo2) return;
+      const snapshots = consumeShellBaseline(db, registry, sessionId, tool2, args, workspaceDir, callId);
+      if (!snapshots) return;
+      if (!snapshots.baseline) {
+        log(`modified-file:shell-baseline-missing team=${teamInfo2.teamId} tool=${tool2}`);
+        return;
+      }
+      const recorded = recordShellDiff(db, teamInfo2.teamId, snapshots.baseline, snapshots.current);
+      log(
+        `modified-file:shell-recorded team=${teamInfo2.teamId} tool=${tool2} files=${recorded.length}` + (recorded.length > 0 ? ` first=${recorded[0]}` : "")
+      );
+      return;
+    }
     if (!FILE_MUTATING_TOOLS.has(tool2)) return;
     const filePath = extractFilePath(tool2, args);
     if (!filePath) return;
@@ -3791,7 +3938,7 @@ function modifiedFilesUnderRepo(ledger, repoRoot) {
 // src/tools/team-tasks-complete.ts
 init_log();
 import path5 from "node:path";
-import { existsSync as existsSync2, readdirSync, statSync } from "node:fs";
+import { existsSync as existsSync2, readdirSync, statSync as statSync2 } from "node:fs";
 var TEAM_TASK_ACTIONS = ["complete", "submit_review", "reject", "sdet_pass"];
 function wakeReviewTarget(deps, teamId, taskId, caller, target, notes, kind) {
   if (!target.sessionId) return false;
@@ -3943,7 +4090,7 @@ function findNestedRepoRoots(root, maxDepth) {
       const child = path5.join(dir, entry);
       let isDir = false;
       try {
-        isDir = statSync(child).isDirectory();
+        isDir = statSync2(child).isDirectory();
       } catch {
         continue;
       }
@@ -3973,7 +4120,7 @@ function findSiblingRepoRoots(dir) {
     if (entry === self || entry.startsWith(".")) continue;
     const child = path5.join(parent, entry);
     try {
-      if (!statSync(child).isDirectory()) continue;
+      if (!statSync2(child).isDirectory()) continue;
     } catch {
       continue;
     }
@@ -4130,6 +4277,20 @@ async function autoCommitApprovedTask(deps, teamId, taskContent) {
         log(`tasks-complete:autocommit:committed dir=${repo} repo=${path5.basename(repo)} hash=${hash || "?"} files=${addList.length} (gitlink) task="${taskContent}"`);
       } catch (err) {
         log(`tasks-complete:autocommit:error dir=${repo} err=${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    const auditRepos = [.../* @__PURE__ */ new Set([...targets.map((t) => t.path), ...committedPaths.map((p) => normalizeDir(p))])];
+    for (const repo of auditRepos) {
+      try {
+        const status = await runCommand(["git", "status", "--porcelain", "-uall"], { cwd: repo });
+        if (status.exitCode !== 0) continue;
+        const remaining = status.stdout.split("\n").filter((line) => line.trim().length > 3).map((line) => line.slice(3).trim()).filter((p) => p.length > 0);
+        if (remaining.length === 0) continue;
+        log(
+          `tasks-complete:autocommit:ledger-gap dir=${repo} omitted=${remaining.length} sample=${remaining.slice(0, 5).join(",")} task="${taskContent}"`
+        );
+      } catch (err) {
+        log(`tasks-complete:autocommit:ledger-gap-check-failed dir=${repo} err=${err instanceof Error ? err.message : String(err)}`);
       }
     }
     if (committed.length === 0) {
@@ -8078,6 +8239,15 @@ async function setupEnsemble(ctx, options = {}) {
       }
     }
     recordFromToolBefore({ sessionID: input.sessionID, tool: input.tool }, registry, activityBuffer);
+    captureShellBaseline(
+      db,
+      registry,
+      input.sessionID,
+      input.tool,
+      input.args ?? input.input,
+      ctx.location.directory,
+      input.callID
+    );
   });
   await ctx.tool.hook("execute.after", (raw) => {
     const event = raw;
@@ -8088,7 +8258,15 @@ async function setupEnsemble(ctx, options = {}) {
         event.input
       );
     }
-    recordFileFromToolCall(db, registry, event.sessionID, event.tool, event.input);
+    recordFileFromToolCall(
+      db,
+      registry,
+      event.sessionID,
+      event.tool,
+      event.input,
+      ctx.location.directory,
+      event.callID
+    );
     recordFromToolAfter(
       { sessionID: event.sessionID, tool: event.tool },
       {},
@@ -8573,12 +8751,29 @@ var plugin = async (input) => {
         }
       }
       recordFromToolBefore(input2, registry, activityBuffer);
+      captureShellBaseline(
+        db,
+        registry,
+        input2.sessionID,
+        input2.tool,
+        input2.args,
+        deps.directory,
+        input2.callID
+      );
     },
     "tool.execute.after": async (input2, output) => {
       if (input2.tool === "question") {
         purgeApprovals.recordQuestionAnswer(input2.sessionID, output.output, input2.args);
       }
-      recordFileFromToolCall(db, registry, input2.sessionID, input2.tool, input2.args);
+      recordFileFromToolCall(
+        db,
+        registry,
+        input2.sessionID,
+        input2.tool,
+        input2.args,
+        deps.directory,
+        input2.callID
+      );
       recordFromToolAfter(input2, output, registry, activityBuffer);
     },
     // System prompt injection — keeps lead aware of team state, reminds teammates of role
