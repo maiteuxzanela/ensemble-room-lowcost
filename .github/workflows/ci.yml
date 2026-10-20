@@ -21,8 +21,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 22 is the floor where node:sqlite is available without a flag
-        # (see package.json "engines": node >=22.13.0); 24 is the current LTS.
+        # node:sqlite ships unflagged from 22.13; package.json "engines"
+        # declares >=22.22.2 (piso real: dependência aninhada ini@7 exige
+        # ^22.22.2). setup-node resolve a 22.x/24.x atual, sempre acima do piso.
         node: [22, 24]
 
     steps:
@@ -47,8 +48,12 @@ jobs:
       - name: Typecheck sources
         run: npm run typecheck
 
-      # The deterministic suites are hermetic (TICKET-RELEASE-01): the real
-      # `session`/`project` DDL comes from tests/fixtures/session_schema.sql,
-      # so no host store (~/.local/share/opencode/opencode.db) is required.
+      # Hermetic suites (TICKET-RELEASE-01): the real `session`/`project` DDL
+      # comes from tests/fixtures/session_schema.sql and the standby upgrade
+      # fixture is replayed from MIGRATIONS — no host store needed. The
+      # extension contract (front B of test_emergency_pause) reports an
+      # explicit N/A/SKIP when the extension is not vendored in this repo;
+      # export ENSEMBLE_EXTENSION_DIR in a job that owns the extension to
+      # exercise it end-to-end.
       - name: Run deterministic test suite
         run: npm test

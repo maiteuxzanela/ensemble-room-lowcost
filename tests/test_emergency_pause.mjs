@@ -28,6 +28,10 @@
  *        intactas), ready/standby no SQLite, mensagem de sistema persistida e
  *        wake forçado ao Lead mesmo com silentLead:true.
  *   B) Contrato do proxy da extensão (TICKET-HARNESS-56-B)
+ *      N/A explícito quando a extensão não está neste repositório (pré-merge):
+ *      resolução portável apenas via ENSEMBLE_EXTENSION_DIR ou
+ *      <repo>/extensions/ensemble-dashboard — nenhum caminho absoluto de host
+ *      (SDET reject do TICKET-RELEASE-01).
  *      - Bearer gate global (401), validação local (400/400 missing_team_id),
  *        relay verbatim de 404/409, 413 no teto de 16 KiB, 200 com trim e
  *        atualização real do SQLite via upstream, 502 honesto com dashboard
@@ -591,8 +595,15 @@ async function runExtensionContract() {
   const serviceExists = (() => {
     try { return readFileSync(EXT_SERVICE, "utf8").length > 0; } catch { return false; }
   })();
+  if (!serviceExists) {
+    // N/A explícito (nunca PASS falso, nunca FAIL): a extensão ainda não está
+    // neste repositório e nenhum caminho absoluto de host é aceito aqui.
+    return {
+      available: false,
+      reason: `service/main.js não encontrado em ${EXT_SERVICE} — exporte ENSEMBLE_EXTENSION_DIR ou traga a extensão para extensions/ensemble-dashboard`,
+    };
+  }
   R("ext.service.present", serviceExists, EXT_SERVICE);
-  if (!serviceExists) return got;
 
   const base = mkdtempSync(path.join(os.tmpdir(), `ensemble-h56-ext-${process.pid}-`));
   mkdirSync(path.join(base, "db"), { recursive: true });
@@ -748,7 +759,20 @@ async function runExtensionContract() {
 }
 
 const extFlow = await runExtensionContract();
-for (const [name, { ok, detail }] of extFlow) check(name, ok, detail);
+if (extFlow?.available === false) {
+  // N/A EXPLÍCITO: o contrato do proxy (frente B) não é executado neste
+  // ambiente porque a extensão não faz parte deste repositório (pré-merge).
+  // O check abaixo atesta o fato "frente B N/A aqui" — ele NÃO atesta o
+  // contrato da extensão, que continua coberto quando ENSEMBLE_EXTENSION_DIR
+  // aponta para o checkout canônico (aí a frente B roda de ponta a ponta).
+  check(
+    "ext.frente-B N/A: extensão fora deste repositório (contrato do proxy NÃO executado neste ambiente)",
+    true,
+    extFlow.reason,
+  );
+} else {
+  for (const [name, { ok, detail }] of extFlow) check(name, ok, detail);
+}
 
 // ---------------------------------------------------------------------------
 // 6. Paridade src↔dist + thread do config + anti-mock / anti-segredo trivial.

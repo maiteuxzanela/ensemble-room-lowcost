@@ -48,7 +48,7 @@
     "build": "esbuild src/index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/index.js"
   },
   "engines": {
-    "node": ">=22.13.0",
+    "node": ">=22.22.2",
     "bun": ">=1.0"
   },
   "devDependencies": {

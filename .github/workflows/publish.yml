@@ -18,8 +18,9 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          # Node 22.13+ ships node:sqlite without a flag and matches
-          # package.json "engines": { "node": ">=22.13.0" }.
+          # node:sqlite é nativo sem flag a partir de 22.13; o piso declarado
+          # em package.json "engines" é "node": ">=22.22.2" (alinhado à
+          # dependência aninhada ini@7, que exige ^22.22.2 || ^24.15.0).
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
           cache: npm
