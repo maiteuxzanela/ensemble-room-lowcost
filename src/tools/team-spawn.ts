@@ -251,8 +251,8 @@ export async function executeTeamSpawn(
     }
   }
 
-  // Semantic Auto-Standby for the SDET / Test Engineering persona ("hugo"):
-  // unlike the Quality Gate guardian, Hugo is born in standby BY DEFAULT —
+  // Semantic Auto-Standby for the SDET / Test Engineering role:
+  // unlike the Quality Gate guardian, the SDET is born in standby BY DEFAULT —
   // regardless of the room's membership or board state — because its role is
   // reactive (design and validate deliveries) and it must not burn tokens
   // speculating before work lands. Only an explicit `standby: false` overrides
@@ -669,7 +669,7 @@ export async function executeTeamSpawn(
     )
   } else if (!isReadOnly) {
     context.push(
-      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for inspection and anti-early-commit governance). The runtime commits the shared workspace LOCALLY and automatically the moment the Quality Gate reviewer (Clara) approves your card via team_tasks_complete(action: 'complete') — no manual git commit is needed. Pushing stays reserved for the pre-push batch gate.",
+      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for inspection and anti-early-commit governance). The runtime commits the shared workspace LOCALLY and automatically the moment the Quality Gate reviewer approves your card via team_tasks_complete(action: 'complete') — no manual git commit is needed. Pushing stays reserved for the pre-push batch gate.",
     )
     context.push(finishStep2("a standalone task"))
     context.push(

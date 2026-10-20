@@ -63,7 +63,8 @@ sleeps, and the schema survives the upgrade.
 - **Failover de-duplication.** A per-`teamId:memberName` cooldown (`FAILOVER_COOLDOWN_MS`, 10 minutes)
   collapses a 429 burst into a single chain advance.
 - **Zero-noise failover.** Switched and suppressed decisions only log and update `team_member.model`;
-  chain exhaustion produces exactly one lead notification.
+  chain exhaustion is silent as well (log + cooldown, no lead notification). The single automatic lead
+  wake is the systematic full-board closure event.
 - **Conditional prompt coercion.** With `silentLead` active, the mandatory "report to the lead before
   stopping" directive is replaced by a collaboration directive. Legacy text is preserved verbatim when the
   flag is off.
@@ -95,7 +96,7 @@ sleeps, and the schema survives the upgrade.
 
 ### Tests
 
-- 46 deterministic suites, thousands of assertions, zero mocks, executed against both the real bundle
+- 48 deterministic suites, thousands of assertions, zero mocks, executed against both the real bundle
   (`dist/index.js`) and the `.ts` sources of `src/`.
 
 ## [0.18.0] - upstream baseline

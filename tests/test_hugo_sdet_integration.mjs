@@ -59,7 +59,7 @@ const TEAM_C = { name: "thmulti", lead: "ses_lead_hugo_c" };
 
 const SQUAD_MARKER = "specialized implementers, deterministic test engineer (SDET), and Quality Gate reviewer";
 const DISPATCH_MARKER =
-  "Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.";
+  "Dispatch the SDET for deterministic tests (born in standby by default) and the Quality Gate reviewer for the final audit.";
 const SDET_MSG = (team, name = "hugo") =>
   `Engenheiro de Testes '${name}' já está ativo na equipe '${team}'. Papéis de engenharia de testes são exclusivos e não admitem instâncias concorrentes.`;
 
@@ -416,7 +416,7 @@ async function runSuite() {
   const v2Spawn = captured.find((t) => t.name === "team_spawn");
   check("(5) registerV2Tools registra team_create e team_spawn (V2)", !!v2Create && !!v2Spawn);
   check("(5) V2 team_create.description convoca o squad canônico", v2Create?.description.includes(SQUAD_MARKER));
-  check("(5) V2 team_spawn.description despacha Hugo (standby default) e Clara", v2Spawn?.description.includes(DISPATCH_MARKER));
+  check("(5) V2 team_spawn.description despacha o SDET (standby default) e o Quality Gate (role-agnostic)", v2Spawn?.description.includes(DISPATCH_MARKER));
   const keysOf = (def) => Object.keys(def.input.properties).sort();
   check(
     "(5) V2 team_create: additionalProperties:false, required [name], props [name, project_name]",

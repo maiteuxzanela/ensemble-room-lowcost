@@ -112,10 +112,22 @@ function porcelainEntries(root: string, raw: string): Array<[string, string]> {
     if (!token || token.length < 4) continue
     const status = token.slice(0, 2)
     const rel = token.slice(3)
-    // Rename/copy entries carry the ORIGINAL path as the next NUL token.
-    if (status.startsWith("R") || status.startsWith("C")) i += 1
-    if (!rel || isLedgerIgnoredPath(rel)) continue
-    out.push([path.resolve(root, rel), status])
+    // TICKET-RELEASE-06 — rename/copy entries are emitted by `git status
+    // --porcelain -z` as TWO consecutive NUL tokens: "XY <new-path>" followed
+    // by "<original-path>" (verified against real git). Both paths belong to
+    // the surgical ledger:
+    //   - the NEW path carries the content that must be committed;
+    //   - the ORIGINAL path (absent from the work tree…) must also be staged,
+    //     otherwise `git add -- <new>` leaves the removal/move side unstaged
+    //     and the tree ends dirty after a "successful" Portão 1 commit.
+    // The original token is consumed here so it is never parsed as a status.
+    const isRenameOrCopy = status.startsWith("R") || status.startsWith("C")
+    const original = isRenameOrCopy ? tokens[i + 1] : undefined
+    if (isRenameOrCopy) i += 1
+    if (rel && !isLedgerIgnoredPath(rel)) out.push([path.resolve(root, rel), status])
+    if (original && original.length > 0 && !isLedgerIgnoredPath(original)) {
+      out.push([path.resolve(root, original), status])
+    }
   }
   return out
 }
@@ -171,8 +183,16 @@ function resolveShellCwd(
   workspaceDir: string | undefined,
 ): string | null {
   if (args && typeof args === "object") {
-    const raw = (args as Record<string, unknown>).cwd
-    if (typeof raw === "string" && raw.length > 0) return path.resolve(raw)
+    // TICKET-RELEASE-06 — `workdir` is the field opencode's native shell tool
+    // uses for cross-repo commands (`bash` with `workdir`), while other
+    // callers pass `cwd`. Honoring only `cwd` snapshotted the plugin/worktree
+    // directory and silently missed every artifact the command produced in the
+    // other repository. Precedence: workdir ?? cwd, first non-empty string wins.
+    const raw = args as Record<string, unknown>
+    for (const key of ["workdir", "cwd"]) {
+      const candidate = raw[key]
+      if (typeof candidate === "string" && candidate.length > 0) return path.resolve(candidate)
+    }
   }
   const row = db.query("SELECT worktree_dir FROM team_member WHERE session_id = ?").get(sessionId) as
     | { worktree_dir: string | null }

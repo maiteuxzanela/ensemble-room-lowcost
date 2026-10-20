@@ -646,7 +646,7 @@ const plugin: Plugin = async (input) => {
         description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). " +
           "Each teammate gets their own git worktree for file isolation. " +
           "Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. " +
-          "Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
+          "Dispatch the SDET for deterministic tests (born in standby by default) and the Quality Gate reviewer for the final audit.",
         args: {
           name: tool.schema.string().describe("Teammate name (lowercase alphanumeric with hyphens)"),
           agent: tool.schema.string().default("build").describe("Agent type (e.g. 'build', 'plan', 'explore')"),

@@ -29,7 +29,7 @@ The two structural wins:
 | Source entrypoint | `src/index.ts` — `exports["."]` |
 | Repository | `github.com/maiteuxzanela/ensemble-room-lowcost` (branch `main`) |
 | License | MIT |
-| Test suite | 46 deterministic suites, zero mocks, offline-capable |
+| Test suite | 48 deterministic suites, zero mocks, offline-capable |
 
 ---
 
@@ -41,7 +41,7 @@ The two structural wins:
 4. [Additional capabilities](#4-additional-capabilities)
 5. [Installation](#5-installation)
 6. [`ensemble.json` configuration reference](#6-ensemblejson-configuration-reference)
-7. [Deterministic tests](#7-deterministic-tests-46-suites-no-mocks)
+7. [Deterministic tests](#7-deterministic-tests-48-suites-no-mocks)
 8. [Troubleshooting](#8-troubleshooting)
 9. [Security](#9-security)
 10. [Provenance and license](#10-provenance-and-license)
@@ -300,8 +300,9 @@ hitting the same exhausted model.
 - **Burst de-duplication:** `FAILOVER_COOLDOWN_MS` (10 minutes, per `teamId:memberName`) collapses the
   repeated attempts of a single 429 burst — otherwise advancing the chain once per attempt would burn
   the whole chain in seconds.
-- **Zero-noise:** "switched" / "suppressed" only logs and updates `team_member.model`; the only
-  authorized lead notification is chain **exhaustion**, fired exactly once.
+- **Zero-noise:** "switched" / "suppressed" only log and update `team_member.model`; chain
+  **exhaustion** is silent too — it logs the decision and applies the cooldown without waking the lead.
+  The lead has exactly one automatic wake: the systematic full-board closure event.
 - **Three seams:** member sessions (persisted switch), isolated sessions (explicit per-agent chain only),
   and the lead session (explicit per-agent chain only — the global chain never hijacks it).
 
@@ -463,20 +464,20 @@ that entry, never at the cost of emptying it).
 
 ---
 
-## 7. Deterministic tests (46 suites, no mocks)
+## 7. Deterministic tests (48 suites, no mocks)
 
 The runner executes the real artifacts — no mocks, no stubs, no fake fixtures.
 
 ```bash
 npm run check      # node --check dist/index.js   → syntax gate
-npm test           # node tests/run_all.mjs       → 46 suites, exit 0 only if all pass
+npm test           # node tests/run_all.mjs       → 48 suites, exit 0 only if all pass
 npm run typecheck  # tsc --noEmit
 npm run build      # esbuild → dist/index.js
 ```
 
 Properties of the suite:
 
-- **46 suites** executed in strict sequence (fail-report, no early abort); the consolidated exit code is
+- **48 suites** executed in strict sequence (fail-report, no early abort); the consolidated exit code is
   `0` only when every suite exits `0` and emits no `FAIL` line.
 - **Zero mocks.** The only seam is the **output transport** (`session.create`, `promptAsync`,
   `session.abort`, `showToast`), recorded into an array so assertions prove *what was called*. No
@@ -500,10 +501,10 @@ Representative coverage:
 | Model fallback & rate-limit failover | 7 | precedence, per-agent resolution, cooldown, abort + re-prompt, `#default` normalization |
 | Task board, dependencies & intra-card handover | 9 | atomic reassignment, SDET/QA unlocking, cyclic graphs, shutdown |
 | Governance roles (SDET / Quality Gate) | 4 | role exclusivity, anti-bypass, review flow |
-| Local auto-commit on approval | 2 | git real in sandbox, multi-repo ledger, clean-tree and non-repo cases |
-| Dashboard | 2 | endpoints, renderer, Host/Origin gate |
+| Local auto-commit on approval | 3 | git real in sandbox, multi-repo ledger, shell-artifact ledger (before/after snapshot), clean-tree and non-repo cases |
+| Dashboard | 3 | endpoints, renderer, Host/Origin gate, CSRF/cross-origin hardening |
 | Messaging, discovery & lifecycle regressions | 19 | action strictness, schema parity, recovery, pause kill-switch |
-| **Total** | **46** | thousands of assertions, mutation-tested |
+| **Total** | **48** | thousands of assertions, mutation-tested |
 
 Runner report shape:
 
@@ -512,7 +513,7 @@ PASS | test_watchdog_heartbeat.mjs        | exit=0 |   … ms | RESULT: 55/55 ch
 PASS | test_standby_lifecycle.mjs         | exit=0 |   … ms | RESULT: 130/130 checks passed
 PASS | test_silent_lead_board_wake.mjs    | exit=0 |   … ms | RESULT: 151/151 checks passed
 …
-SUÍTES: 46/46 passaram
+SUÍTES: 48/48 passaram
 RESULT_ALL: ALL SUITES PASSED
 ```
 
@@ -570,7 +571,8 @@ Check, in order:
 3. **Cooldown.** `FAILOVER_COOLDOWN_MS` (10 min per `teamId:memberName`) intentionally collapses a burst
    into one advance. A second distinct 429 inside the window is suppressed.
 4. **Exhaustion.** If the current model is already the last chain entry, the decision is `exhausted`:
-   only a log entry and cooldown are produced, exactly one notification, and no further switches.
+   only a log entry and the cooldown are produced, with no lead notification and no further switches.
+   The lead is woken exclusively by the systematic full-board closure event — failover never wakes it.
 
 ### Dashboard port is busy, or the dashboard does not answer
 

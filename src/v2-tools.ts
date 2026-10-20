@@ -102,7 +102,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
         "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). " +
         "Each teammate gets their own git worktree for file isolation. " +
         "Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. " +
-        "Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
+        "Dispatch the SDET for deterministic tests (born in standby by default) and the Quality Gate reviewer for the final audit.",
       input: {
         type: "object",
         properties: {

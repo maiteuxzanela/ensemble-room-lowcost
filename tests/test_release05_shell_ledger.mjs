@@ -32,6 +32,11 @@
  *   SL11 Diretório não-git: `bash` não lança e não grava nada (fail-graceful).
  *   SL12 Portão 1 fail-safe com HEAD vermelho (pre-commit rejeita): sem
  *        falso-sucesso e HEAD não avança.
+ *   SL13 `args.workdir` (shell nativo cross-repo) manda no baseline/diff, com
+ *        precedência `workdir ?? cwd` — artefato de OUTRO repositório entra.
+ *   SL14 Rename real (`git mv`) no formato `-z` de dois tokens NUL: o ledger
+ *        captura o caminho NOVO e o ORIGINAL, e o Portão 1 deixa a árvore limpa
+ *        (a perna de remoção também é staged, sem `git add -A`).
  *   Estáticos: literais src↔dist, wiring V1 (`index.ts`) e V2 (`v2-setup.ts`),
  *        `git add -A` ausente no caminho de auto-commit, anti-mock.
  *
@@ -386,6 +391,111 @@ function shellCall(mod, env, ses, args, command, callId) {
 }
 
 // ---------------------------------------------------------------------------
+// 8b. SL13: `args.workdir` (shell nativo cross-repo) manda no baseline/diff.
+//     Precedência `workdir ?? cwd`: o campo `workdir` é o que o tool nativo usa
+//     para rodar em outro repositório; honrar só `cwd` fotografava o diretório
+//     do worktree/plugin e perdia TODOS os artefatos do comando.
+// ---------------------------------------------------------------------------
+{
+  const mod = REAL;
+  const env = newEnv(mod, { name: "sl13" });
+  const other = path.join(env.base, "workdir-repo");
+  mkdirSync(other, { recursive: true });
+  git(other, ["init", "-q"]);
+  git(other, ["config", "user.email", "t@t.local"]);
+  git(other, ["config", "user.name", "T"]);
+  writeFileSync(path.join(other, "base.txt"), "b\n");
+  git(other, ["add", "-A"]);
+  git(other, ["commit", "-q", "-m", "chore: base"]);
+
+  mod.captureShellBaseline(env.db, env.registry, env.tales, "bash", { command: "gen", workdir: other }, env.dir, "call-workdir");
+  sh(other, "echo artifact > from-workdir.txt");
+  mod.recordFileFromToolCall(env.db, env.registry, env.tales, "bash", { command: "gen", workdir: other }, env.dir, "call-workdir");
+  check("SL13 args.workdir explícito: artefato do repo apontado entra no ledger", env.ledger().includes(path.join(other, "from-workdir.txt")), JSON.stringify(env.ledger()));
+  check("SL13b args.workdir explícito: nada do repo da sala entra por engano", !env.ledger().some((p) => p.startsWith(`${env.dir}${path.sep}`)));
+
+  // precedência: workdir ?? cwd (workdir vence quando ambos vêm preenchidos)
+  const decoy = path.join(env.base, "decoy-repo");
+  mkdirSync(decoy, { recursive: true });
+  git(decoy, ["init", "-q"]);
+  git(decoy, ["config", "user.email", "t@t.local"]);
+  git(decoy, ["config", "user.name", "T"]);
+  writeFileSync(path.join(decoy, "base.txt"), "b\n");
+  git(decoy, ["add", "-A"]);
+  git(decoy, ["commit", "-q", "-m", "chore: base"]);
+  const args = { command: "gen", workdir: other, cwd: decoy };
+  mod.captureShellBaseline(env.db, env.registry, env.tales, "bash", args, env.dir, "call-workdir-wins");
+  sh(other, "echo precedence > precedence.txt");
+  sh(decoy, "echo decoy > decoy.txt");
+  mod.recordFileFromToolCall(env.db, env.registry, env.tales, "bash", args, env.dir, "call-workdir-wins");
+  check("SL13c workdir tem precedência sobre cwd (artefato capturado)", env.ledger().includes(path.join(other, "precedence.txt")), JSON.stringify(env.ledger()));
+  check("SL13d cwd perdedor não vaza para o ledger", !env.ledger().includes(path.join(decoy, "decoy.txt")));
+  env.cleanup();
+  rmSync(env.base, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 8c. SL14: rename real (`git mv`) — `git status --porcelain -z` emite DOIS
+//     tokens NUL consecutivos (caminho novo, caminho original). O ledger tem de
+//     conter AMBOS: só o novo deixa a perna de remoção fora do staging e a
+//     árvore suja depois do Portão 1.
+// ---------------------------------------------------------------------------
+{
+  const mod = REAL;
+  const base = mkdtempSync(path.join(TMP, "rename-"));
+  const repo = makeRepo(base, { name: "rename", tracked: ["package-lock.json", "keep.txt", "movable.txt"] });
+  const env = newEnv(mod, { name: "sl14", repo });
+  env.addTask("T1", "in_review", "release 06 rename ledger");
+
+  mod.captureShellBaseline(env.db, env.registry, env.tales, "bash", { command: "git mv movable.txt renamed.txt" }, repo, "call-mv");
+  sh(repo, "git mv movable.txt renamed.txt");
+  mod.recordFileFromToolCall(env.db, env.registry, env.tales, "bash", { command: "git mv movable.txt renamed.txt" }, repo, "call-mv");
+
+  const rows = env.ledger();
+  check("SL14 rename: caminho NOVO entra no ledger", rows.includes(path.join(repo, "renamed.txt")), JSON.stringify(rows));
+  check("SL14b rename: caminho ORIGINAL entra no ledger (segundo token NUL)", rows.includes(path.join(repo, "movable.txt")), JSON.stringify(rows));
+  // não-vacuidade: o git realmente reportou um rename (R)
+  check("SL14c não-vacuidade: git reporta R para o mv real", porcelain(repo).some((l) => /^R/.test(l) && l.includes("renamed.txt")), porcelain(repo).join("|"));
+
+  const h0 = headHash(repo);
+  const res = await mod.executeTeamTasksComplete(env.deps, { task_id: "T1", action: "complete" }, env.qa);
+  check("SL14d Portão 1: commit do rename criado", headHash(repo) !== h0 && res.includes("Task completed and locally committed"), res);
+  check("SL14e Portão 1: arquivo renomeado comitado", lastCommitFiles(repo).includes("renamed.txt"), lastCommitFiles(repo).join(","));
+  check("SL14f Portão 1: árvore LIMPA após o rename (perna de remoção staged)", porcelain(repo).length === 0, porcelain(repo).join("|"));
+  env.cleanup();
+  rmSync(base, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 8d. SL15: rename NÃO-encenado (`mv` puro pelo shell) — o caminho original
+//     existe no índice mas sumiu do disco; é justamente ele que precisa ser
+//     staged para a remoção entrar no commit cirúrgico.
+// ---------------------------------------------------------------------------
+{
+  const mod = REAL;
+  const base = mkdtempSync(path.join(TMP, "plainmv-"));
+  const repo = makeRepo(base, { name: "plainmv", tracked: ["package-lock.json", "keep.txt", "movable.txt"] });
+  const env = newEnv(mod, { name: "sl15", repo });
+  env.addTask("T1", "in_review", "release 06 plain mv ledger");
+
+  mod.captureShellBaseline(env.db, env.registry, env.tales, "bash", { command: "mv movable.txt moved.txt" }, repo, "call-plain-mv");
+  sh(repo, "mv movable.txt moved.txt");
+  mod.recordFileFromToolCall(env.db, env.registry, env.tales, "bash", { command: "mv movable.txt moved.txt" }, repo, "call-plain-mv");
+
+  const rows = env.ledger();
+  check("SL15 mv puro: caminho NOVO entra no ledger", rows.includes(path.join(repo, "moved.txt")), JSON.stringify(rows));
+  check("SL15b mv puro: caminho ORIGINAL entra no ledger", rows.includes(path.join(repo, "movable.txt")), JSON.stringify(rows));
+  check("SL15c não-vacuidade: git vê deleção não-encenada do original", porcelain(repo).some((l) => /^ ?D/.test(l) && l.includes("movable.txt")), porcelain(repo).join("|"));
+
+  const h0 = headHash(repo);
+  const res = await mod.executeTeamTasksComplete(env.deps, { task_id: "T1", action: "complete" }, env.qa);
+  check("SL15d Portão 1: commit do mv puro criado", headHash(repo) !== h0 && res.includes("Task completed and locally committed"), res);
+  check("SL15e Portão 1: árvore LIMPA após o mv puro (remoção staged)", porcelain(repo).length === 0, porcelain(repo).join("|"));
+  env.cleanup();
+  rmSync(base, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
 // 9. Estáticos: literais src↔dist, wiring V1/V2, invariante cirúrgico, anti-mock.
 // ---------------------------------------------------------------------------
 const NEW_LITERALS = [
@@ -405,6 +515,13 @@ for (const lit of ["captureShellBaseline", "recordFileFromToolCall"]) {
   check(`wiring V1 (index.ts) chama ${lit}`, srcIdxRaw.includes(lit) && distRaw.includes(lit));
   check(`wiring V2 (v2-setup.ts) chama ${lit}`, srcV2Raw.includes(lit));
 }
+// TICKET-RELEASE-06 — refinamentos de runtime no ledger cirúrgico.
+check("R06 workdir: precedência `workdir ?? cwd` presente em src e dist",
+  srcMfRaw.includes('["workdir", "cwd"]') && distRaw.includes('["workdir", "cwd"]'));
+check("R06 rename/copy: o segundo token NUL (caminho original) é lido do fluxo",
+  srcMfRaw.includes("tokens[i + 1]") && distRaw.includes("tokens[i + 1]"));
+check("R06 rename/copy: status R e C tratados no mesmo branch",
+  srcMfRaw.includes('status.startsWith("R") || status.startsWith("C")') && distRaw.includes("isRenameOrCopy"));
 check("hooks V1/V2 passam o diretório do workspace", srcIdxRaw.includes("deps.directory") && srcV2Raw.includes("ctx.location.directory"));
 // O invariante é sobre o CAMINHO DE AUTO-COMMIT (não sobre o texto de prompt do
 // team_spawn, que ensina o humano/agente a comitar manualmente).
@@ -446,6 +563,33 @@ check("anti-mock: nenhuma dependência de mock no fonte novo", !MOCK_PATTERNS.so
   MUT.recordFileFromToolCall(env.db, env.registry, env.tales, "edit", { filePath: path.join(repo, "edited.ts") }, repo);
   check("M1 mutante: edit continua gravando (prova de que só o branch de shell morreu)", env.ledger().includes(path.join(repo, "edited.ts")));
   env.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// 10b. PROVA DE MUTAÇÃO M2 — o segundo token NUL (caminho original) deixa de
+//      ser registrado. SL14b/SL15b quebram; o caminho NOVO segue capturado,
+//      provando que a asserção observa exatamente o refinamento RELEASE-06.
+// ---------------------------------------------------------------------------
+{
+  const mutated = distRaw.replace(
+    "if (original && original.length > 0 && !isLedgerIgnoredPath(original)) {",
+    "if (false) {",
+  );
+  check("mutação M2 aplicada ao bundle (caminho original descartado)", mutated !== distRaw);
+  writeFileSync(path.join(TMP, "_release05_m2.mjs"), buildHarnessCode(mutated));
+  const MUT = await import(path.join(TMP, "_release05_m2.mjs"));
+
+  const base = mkdtempSync(path.join(TMP, "m2-"));
+  const repo = makeRepo(base, { name: "m2", tracked: ["package-lock.json", "keep.txt", "movable.txt"] });
+  const env = newEnv(MUT, { name: "m2", repo });
+  MUT.captureShellBaseline(env.db, env.registry, env.tales, "bash", { command: "git mv" }, repo, "m2");
+  sh(repo, "git mv movable.txt renamed.txt");
+  MUT.recordFileFromToolCall(env.db, env.registry, env.tales, "bash", { command: "git mv" }, repo, "m2");
+  const rows = env.ledger();
+  check("M2 mutante: caminho NOVO ainda é capturado (isolamento do defeito)", rows.includes(path.join(repo, "renamed.txt")), JSON.stringify(rows));
+  check("M2 mutante: caminho ORIGINAL NÃO é capturado (SL14b quebra)", !rows.includes(path.join(repo, "movable.txt")));
+  env.cleanup();
+  rmSync(base, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------

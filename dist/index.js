@@ -3176,7 +3176,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
     );
   } else if (!isReadOnly) {
     context.push(
-      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for inspection and anti-early-commit governance). The runtime commits the shared workspace LOCALLY and automatically the moment the Quality Gate reviewer (Clara) approves your card via team_tasks_complete(action: 'complete') \u2014 no manual git commit is needed. Pushing stays reserved for the pre-push batch gate."
+      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for inspection and anti-early-commit governance). The runtime commits the shared workspace LOCALLY and automatically the moment the Quality Gate reviewer approves your card via team_tasks_complete(action: 'complete') \u2014 no manual git commit is needed. Pushing stays reserved for the pre-push batch gate."
     );
     context.push(finishStep2("a standalone task"));
     context.push(
@@ -3753,9 +3753,13 @@ function porcelainEntries(root, raw) {
     if (!token || token.length < 4) continue;
     const status = token.slice(0, 2);
     const rel = token.slice(3);
-    if (status.startsWith("R") || status.startsWith("C")) i += 1;
-    if (!rel || isLedgerIgnoredPath(rel)) continue;
-    out.push([path4.resolve(root, rel), status]);
+    const isRenameOrCopy = status.startsWith("R") || status.startsWith("C");
+    const original = isRenameOrCopy ? tokens[i + 1] : void 0;
+    if (isRenameOrCopy) i += 1;
+    if (rel && !isLedgerIgnoredPath(rel)) out.push([path4.resolve(root, rel), status]);
+    if (original && original.length > 0 && !isLedgerIgnoredPath(original)) {
+      out.push([path4.resolve(root, original), status]);
+    }
   }
   return out;
 }
@@ -3792,8 +3796,11 @@ function gitStatusSnapshot(cwd) {
 }
 function resolveShellCwd(db, sessionId, args, workspaceDir) {
   if (args && typeof args === "object") {
-    const raw = args.cwd;
-    if (typeof raw === "string" && raw.length > 0) return path4.resolve(raw);
+    const raw = args;
+    for (const key of ["workdir", "cwd"]) {
+      const candidate = raw[key];
+      if (typeof candidate === "string" && candidate.length > 0) return path4.resolve(candidate);
+    }
   }
   const row = db.query("SELECT worktree_dir FROM team_member WHERE session_id = ?").get(sessionId);
   if (row?.worktree_dir) return row.worktree_dir;
@@ -4194,6 +4201,24 @@ function resolveCommitTargets(candidates, ledger) {
   }
   return targets;
 }
+async function stageableLedgerPaths(repoRoot, relPaths) {
+  const missing = relPaths.filter((rel) => !existsSync2(path5.join(repoRoot, rel)));
+  if (missing.length === 0) return relPaths;
+  const indexed = /* @__PURE__ */ new Set();
+  const res = await runCommand(["git", "-C", repoRoot, "ls-files", "-z", "--", ...missing], { cwd: repoRoot });
+  if (res.exitCode === 0) {
+    for (const entry of res.stdout.split("\0")) if (entry) indexed.add(entry);
+  } else {
+    return relPaths;
+  }
+  const dropped = missing.filter((rel) => !indexed.has(rel));
+  if (dropped.length > 0) {
+    log(
+      `tasks-complete:autocommit:skip-vanished dir=${repoRoot} dropped=${dropped.length} sample=${dropped.slice(0, 5).join(",")}`
+    );
+  }
+  return relPaths.filter((rel) => !dropped.includes(rel));
+}
 async function autoCommitApprovedTask(deps, teamId, taskContent) {
   const dir = deps.directory;
   try {
@@ -4227,7 +4252,8 @@ async function autoCommitApprovedTask(deps, teamId, taskContent) {
         }
         if (status.stdout.trim().length === 0) continue;
         sawDirty = true;
-        const addList = [...addSet].sort();
+        const addList = await stageableLedgerPaths(target.path, [...addSet].sort());
+        if (addList.length === 0) continue;
         const add = await runCommand(
           ["git", "-C", target.path, "add", "--", ...addList],
           { cwd: target.path }
@@ -5423,7 +5449,7 @@ async function registerV2Tools(domain, deps) {
     });
     editor.add({
       name: "team_spawn",
-      description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). Each teammate gets their own git worktree for file isolation. Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
+      description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). Each teammate gets their own git worktree for file isolation. Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. Dispatch the SDET for deterministic tests (born in standby by default) and the Quality Gate reviewer for the final audit.",
       input: {
         type: "object",
         properties: {
@@ -8826,7 +8852,7 @@ var plugin = async (input) => {
         }
       }),
       team_spawn: tool({
-        description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). Each teammate gets their own git worktree for file isolation. Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.",
+        description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). Each teammate gets their own git worktree for file isolation. Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. Dispatch the SDET for deterministic tests (born in standby by default) and the Quality Gate reviewer for the final audit.",
         args: {
           name: tool.schema.string().describe("Teammate name (lowercase alphanumeric with hyphens)"),
           agent: tool.schema.string().default("build").describe("Agent type (e.g. 'build', 'plan', 'explore')"),

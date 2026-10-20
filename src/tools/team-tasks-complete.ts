@@ -516,6 +516,40 @@ function resolveCommitTargets(candidates: string[], ledger: string[]): CommitTar
   return targets
 }
 
+/**
+ * TICKET-RELEASE-06 — keep only the ledger paths `git add` can actually accept.
+ *
+ * A rename/copy row legitimately carries BOTH sides (`src/modified-files.ts`
+ * consumes the second NUL token of `git status --porcelain -z`): the new path
+ * and the original one. When the command already staged the move (`git mv`),
+ * the original path is gone from the worktree AND from the index, so
+ * `git add -- <original>` aborts the whole surgical add with
+ * `fatal: pathspec '<original>' did not match any files` — a correct ledger
+ * would turn into a failed Portão 1. Drop exactly those paths: absent from
+ * disk and untracked in the index (nothing left to stage). Every other path is
+ * returned untouched, so `git add -- <paths>` keeps staging a plain `mv`
+ * deletion (file gone from disk but still in the index).
+ */
+async function stageableLedgerPaths(repoRoot: string, relPaths: string[]): Promise<string[]> {
+  const missing = relPaths.filter((rel) => !existsSync(path.join(repoRoot, rel)))
+  if (missing.length === 0) return relPaths
+  const indexed = new Set<string>()
+  const res = await runCommand(["git", "-C", repoRoot, "ls-files", "-z", "--", ...missing], { cwd: repoRoot })
+  if (res.exitCode === 0) {
+    for (const entry of res.stdout.split("\u0000")) if (entry) indexed.add(entry)
+  } else {
+    // Cannot prove absence — leave the list untouched (git decides, as before).
+    return relPaths
+  }
+  const dropped = missing.filter((rel) => !indexed.has(rel))
+  if (dropped.length > 0) {
+    log(
+      `tasks-complete:autocommit:skip-vanished dir=${repoRoot} dropped=${dropped.length} sample=${dropped.slice(0, 5).join(",")}`,
+    )
+  }
+  return relPaths.filter((rel) => !dropped.includes(rel))
+}
+
 async function autoCommitApprovedTask(deps: ToolDeps, teamId: string, taskContent: string): Promise<string> {
   const dir = deps.directory
   try {
@@ -564,11 +598,12 @@ async function autoCommitApprovedTask(deps: ToolDeps, teamId: string, taskConten
         if (status.stdout.trim().length === 0) continue // already clean → no commit
         sawDirty = true
 
-        const addList = [...addSet].sort()
+        const addList = await stageableLedgerPaths(target.path, [...addSet].sort())
 
         // SURGICAL `git add -- <paths...>` — NEVER `git add -A`. Paths travel as
         // argv (no shell), so spaces/quotes/metacharacters are inert; task
         // content never reaches this command at all.
+        if (addList.length === 0) continue
         const add = await runCommand(
           ["git", "-C", target.path, "add", "--", ...addList],
           { cwd: target.path },
