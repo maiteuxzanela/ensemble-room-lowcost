@@ -129,7 +129,7 @@ Toda alteração neste repositório segue **obrigatoriamente** o ciclo abaixo, n
 - **Proibição absoluta de mocks, stubs ou fixtures falsas** em produção e testes. Dependência indisponível vira **bloqueio reportado**, nunca substituta simulada.
 - O único ponto de "emenda" aceito nas suítes é o **transporte de saída** (`session.create`, `promptAsync`, `session.abort`, `showToast`), gravado num array de captura para que a asserção prove *o que foi chamado*. Nenhuma lógica de decisão é substituída por mock.
 - Bancos usados nos testes são **SQLite reais** (`node:sqlite`), criados isoladamente em `.test-scratch/` (gitignore, recriado a cada execução).
-- `test_watchdog_heartbeat.mjs` usa o schema da tabela `session` extraído **read-only** de `~/.local/share/opencode/opencode.db` — **pré-requisito de ambiente** (falha explícita e visível se ausente; nenhum stub é usado no lugar).
+- `test_watchdog_heartbeat.mjs` e `test_agent_identity_nudges.mjs` materializam o store `session`/`project` a partir da fixture versionada `tests/fixtures/session_schema.sql` (DDL real do store do OpenCode, colunas/constraints preservadas) — sem pré-requisito de ambiente e sem qualquer leitura de `~/.local/share/opencode/opencode.db` (TICKET-RELEASE-01; hermetismo provado rodando com `HOME` vazio).
 - Suítes rodam contra **ambos** `dist/index.js` e os `.ts` de `src/` (copiados para fora de `node_modules` apenas com resolução mecânica de extensão de import — lógica intacta), garantindo paridade fonte/bundle.
 
 ---

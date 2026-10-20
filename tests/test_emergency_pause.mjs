@@ -54,14 +54,19 @@ const TMP = path.join(REPO, ".test-scratch", "h56");
 mkdirSync(TMP, { recursive: true });
 
 /**
- * Guest service da extensão (frente B). Resolve o primeiro candidato cujo
- * service/main.js JÁ contém as rotas de emergência (o worktree da entrega tem
- * precedência; o checkout canônico só é aceito depois do merge).
+ * Guest service da extensão (frente B). Resolução DETERMINÍSTICA e portável
+ * (SDET reject do TICKET-RELEASE-01): zero caminho absoluto de host.
+ *   1. ENSEMBLE_EXTENSION_DIR — override explícito (checkout canônico da
+ *      extensão, que ainda vive fora deste repositório, pré-merge);
+ *   2. <repo>/extensions/ensemble-dashboard — local futuro pós-merge.
+ * Se NENHUM candidato existir no ambiente, a frente B é reportada como N/A
+ * explícito (SKIP, nunca PASS falso e nunca FAIL): o runner limpo do CI não
+ * depende de caminho do host, e quem tiver a extensão pode optar pelo
+ * ENSEMBLE_EXTENSION_DIR para exercitar a frente B de ponta a ponta.
  */
 const EXT_CANDIDATES = [
   process.env.ENSEMBLE_EXTENSION_DIR,
-  "/home/maiteuxzanela/.local/share/opencode/worktree/baa93a2e2be9fe2dc229c10bcc4e4a9aebe2ad24/botao_emergencia/extensions/ensemble-dashboard",
-  "/mnt/94CCB337CCB3130A/opencode_chambers_harness/extensions/ensemble-dashboard",
+  path.join(REPO, "extensions", "ensemble-dashboard"),
 ].filter(Boolean);
 const EXT_DIR = EXT_CANDIDATES.find((dir) => {
   try { return readFileSync(path.join(dir, "service", "main.js"), "utf8").includes("/api/emergency/pause-member"); } catch { return false; }

@@ -18,22 +18,29 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
+          # Node 22.13+ ships node:sqlite without a flag and matches
+          # package.json "engines": { "node": ">=22.13.0" }.
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
+          cache: npm
 
-      - name: Install dependencies
+      - name: Install dependencies (clean, lockfile-exact)
         run: npm ci
 
-      - name: Build bundle
+      - name: Build bundle (dist/index.js)
         run: npm run build
 
-      - name: Run Syntax Check
+      - name: Syntax check bundle
         run: npm run check
 
-      - name: Run Deterministic Tests
+      - name: Typecheck sources
+        run: npm run typecheck
+
+      # Hermetic suite (TICKET-RELEASE-01): schema from tests/fixtures, no host store.
+      - name: Run deterministic test suite
         run: npm test
 
       - name: Publish to NPM
-        run: npm publish --access public
+        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

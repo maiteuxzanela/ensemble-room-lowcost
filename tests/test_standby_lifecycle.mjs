@@ -300,26 +300,97 @@ async function runBehavior(label, mods) {
 
   const now = Date.now();
 
-  /* --- 5.2 UPGRADE DO DB DE PRODUÇÃO (cópia isolada) — v(N-1) → N --- *
-   * A Migration 12 reconstrói team_member. Este check prova que aplicá-la
-   * sobre uma CÓPIA do ensemble.db real (com dados de produção) não perde
-   * nenhuma linha e resulta no mesmo schema de um DB criado do zero.      */
+  /* --- 5.2 UPGRADE DO DB LEGADO (fixture determinística) — v(N-1) → N --- *
+   * TICKET-RELEASE-01: zero dependência de host (~/.config/opencode/
+   * ensemble.db). O estado legado é RECONSTRUÍDO repetindo o histórico REAL
+   * de migrations — MIGRATIONS.slice(0, 11), append-only por HARNESS-51 —
+   * com PRAGMA user_version = 11 (pré-Migration 12) e seed determinístico.
+   * createDb() sobre essa cópia prova de verdade o caminho de upgrade: o
+   * CHECK antigo NÃO aceita 'standby', passa a aceitar, e nenhuma linha cai. */
   {
-    const PROD = path.join(process.env.HOME ?? "", ".config", "opencode", "ensemble.db");
-    check(`[${label}] produção legível (fonte do teste de upgrade)`, existsSync(PROD), PROD);
-    if (existsSync(PROD)) {
-      const prodRo = new DatabaseSync(PROD, { readOnly: true });
-      const COUNT_TABLES = ["team", "team_member", "team_task", "team_message"];
-      const before = Object.fromEntries(COUNT_TABLES.map((t) => [t, prodRo.prepare(`SELECT COUNT(*) AS c FROM ${t}`).get().c]));
-      const beforeVersion = prodRo.prepare("PRAGMA user_version").get().user_version;
-      prodRo.close();
+    const LEGACY_USER_VERSION = 11;
+    const COUNT_TABLES = ["team", "team_member", "team_task", "team_message"];
+    // Queries literais congeladas (sem interpolação de SQL): o identificador de
+    // cada tabela nunca é montado em string — só se escolhe o prepared fixo.
+    const COUNT_SQL = Object.freeze({
+      team: "SELECT COUNT(*) AS c FROM team",
+      team_member: "SELECT COUNT(*) AS c FROM team_member",
+      team_task: "SELECT COUNT(*) AS c FROM team_task",
+      team_message: "SELECT COUNT(*) AS c FROM team_message",
+    });
+    const SEED_NOW = 1_700_000_000_000;
+    const tmp = path.join(root, "legacy_upgrade.db");
+    rmSync(tmp, { force: true, maxRetries: 5, retryDelay: 50 });
 
-      const tmp = path.join(root, "prod_upgrade.db");
-      rmSync(tmp, { force: true });
-      cpSync(PROD, tmp);
-      for (const side of ["-wal", "-shm"]) {
-        if (existsSync(PROD + side)) cpSync(PROD + side, tmp + side, { force: true });
+    const legacyMigrations = (mods.MIGRATIONS ?? []).slice(0, LEGACY_USER_VERSION);
+    let legacyErr = "";
+    let legacySql = "";
+    try {
+      const legacy = new DatabaseSync(tmp);
+      for (const sql of legacyMigrations) legacy.exec(sql);
+      legacy.exec(`PRAGMA user_version = ${LEGACY_USER_VERSION}`);
+      // Seed determinístico: colunas existentes em v11 (team_member sem `id`,
+      // PK composta (team_id,name); team_task ainda com `depends_on`;
+      // team_message com `read`).
+      legacy
+        .prepare("INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?)")
+        .run("team_legacy", "legacy-upgrade-suite", "default", "ses_lead_legacy", "active", 0, SEED_NOW, SEED_NOW);
+      const memberSeed = [
+        ["legacy-a", "ses_legacy_a", "idle"],
+        ["legacy-b", "ses_legacy_b", "running"],
+        ["legacy-c", "ses_legacy_c", "completed"],
+      ];
+      for (const [name, session, exec] of memberSeed) {
+        legacy
+          .prepare("INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?)")
+          .run("team_legacy", name, session, "build", "ready", exec, SEED_NOW, SEED_NOW);
       }
+      const taskSeed = [
+        ["task_legacy_1", "completed", "legacy-a"],
+        ["task_legacy_2", "in_progress", "legacy-b"],
+      ];
+      for (const [id, status, assignee] of taskSeed) {
+        legacy
+          .prepare("INSERT INTO team_task (id, team_id, content, status, priority, assignee, depends_on, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?,?)")
+          .run(id, "team_legacy", `legacy ${id}`, status, "medium", assignee, null, SEED_NOW, SEED_NOW);
+      }
+      const msgSeed = [
+        ["msg_legacy_1", "lead", "legacy-a"],
+        ["msg_legacy_2", "legacy-a", "lead"],
+        ["msg_legacy_3", "system", "legacy-b"],
+      ];
+      for (const [id, from, to] of msgSeed) {
+        legacy
+          .prepare("INSERT INTO team_message (id, team_id, from_name, to_name, content, delivered, time_created, read) VALUES (?,?,?,?,?,?,?,?)")
+          .run(id, "team_legacy", from, to, `legacy payload ${id}`, 0, SEED_NOW, 0);
+      }
+      legacySql = (legacy.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='team_member'").get()?.sql ?? "").replace(/\s+/g, " ");
+      legacy.close();
+    } catch (e) {
+      legacyErr = e instanceof Error ? e.message : String(e);
+    }
+
+    const beforeVersion = (() => {
+      try {
+        const ro = new DatabaseSync(tmp, { readOnly: true });
+        const v = ro.prepare("PRAGMA user_version").get().user_version;
+        ro.close();
+        return v;
+      } catch {
+        return -1;
+      }
+    })();
+
+    check(
+      `[${label}] fixture legada v${LEGACY_USER_VERSION} reconstruída do MIGRATIONS real (CHECK ainda SEM 'standby')`,
+      !legacyErr && beforeVersion === LEGACY_USER_VERSION && legacyMigrations.length === LEGACY_USER_VERSION && /CHECK\(execution_status IN/.test(legacySql) && !/'standby'/.test(legacySql),
+      legacyErr || `v${beforeVersion} migrations=${legacyMigrations.length}`,
+    );
+
+    if (!legacyErr && beforeVersion === LEGACY_USER_VERSION) {
+      const prodRo = new DatabaseSync(tmp, { readOnly: true });
+      const before = Object.fromEntries(COUNT_TABLES.map((t) => [t, prodRo.prepare(COUNT_SQL[t]).get().c]));
+      prodRo.close();
 
       let afterVersion = -1;
       let after = {};
@@ -328,7 +399,7 @@ async function runBehavior(label, mods) {
       try {
         const up = createDb(tmp); // aplica as migrations pendantes de verdade
         afterVersion = up.query("PRAGMA user_version").get().user_version;
-        after = Object.fromEntries(COUNT_TABLES.map((t) => [t, up.query(`SELECT COUNT(*) AS c FROM ${t}`).get().c]));
+        after = Object.fromEntries(COUNT_TABLES.map((t) => [t, up.query(COUNT_SQL[t]).get().c]));
         sqlAfter = (up.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='team_member'").get()?.sql ?? "").replace(/\s+/g, " ");
         up.close();
       } catch (e) {
@@ -336,13 +407,13 @@ async function runBehavior(label, mods) {
       }
 
       check(
-        `[${label}] upgrade do DB de produção v${beforeVersion} → v${migrationsLen} sem erro`,
+        `[${label}] upgrade do DB legado v${beforeVersion} → v${migrationsLen} sem erro`,
         !upErr && afterVersion === migrationsLen,
         upErr || `v${beforeVersion}→${afterVersion}`,
       );
       const lost = COUNT_TABLES.filter((t) => after[t] !== before[t]);
       check(
-        `[${label}] upgrade preservou 100% das linhas reais (team/member/task/message)`,
+        `[${label}] upgrade preservou 100% das linhas (team/member/task/message)`,
         lost.length === 0,
         lost.length ? lost.map((t) => `${t}:${before[t]}→${after[t]}`).join(",") : `${before.team}/${before.team_member}/${before.team_task}/${before.team_message}`,
       );

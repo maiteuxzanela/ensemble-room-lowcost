@@ -108,7 +108,7 @@ A multi-agent team runtime for [OpenCode](https://opencode.ai), derived from `@h
 - `ttlMs = 0` disables the TTL while keeping worktree GC; resilience to a missing/corrupted store returns `false` without throwing.
 - `start()` wraps `check()` in a logged `.catch` and `unref()`s both timers; `dispose()` is idempotent (clears both timers) and `stop()` remains a legacy alias.
 
-**Guarantee:** `tests/test_watchdog_heartbeat.mjs` (53 checks) — 4 scenarios (active, compacting, idle, compaction=0) run **against both `dist` and `src`**, using the real `session` store schema.
+**Guarantee:** `tests/test_watchdog_heartbeat.mjs` (55 checks) — 4 scenarios (active, compacting, idle, compaction=0) run **against both `dist` and `src`**, materializing the `session` store from the versioned schema fixture `tests/fixtures/session_schema.sql` (no dependency on the host `opencode.db`).
 
 ### 2.4 Reactive, dynamic model fallback on 429 / retry
 
@@ -149,7 +149,7 @@ The whole runtime is covered by an offline-capable, fixture-free suite that runs
 - **Zero mocks / stubs / fake fixtures.** The only seam is the **output transport** (`session.create`, `promptAsync`, `session.abort`, `showToast`), recorded into an array so assertions prove *what was called*. No decision logic is replaced.
 - Code under test is the **real** artifact of this repository: `dist/index.js` (bundle) and the `.ts` sources of `src/` copied out of `node_modules` (Node's type-stripping refuses imports from `node_modules`) with mechanical import-extension resolution only — logic intact.
 - **Real SQLite databases** (`node:sqlite`) created in isolation under `.test-scratch/` (gitignored, recreated on every run).
-- The watchdog suite reads the host `session` schema **read-only** from the OpenCode session store — a documented **environment prerequisite** (fails explicitly and visibly if absent; no stub is used instead).
+- The `session`/`project` store schema is **versioned in-repo** as `tests/fixtures/session_schema.sql` (DDL extracted from the real store, columns and constraints preserved). Suites apply it to a throwaway SQLite database under `.test-scratch/`, so the test run is hermetic — the host `opencode.db` is **not** an environment prerequisite anymore.
 - `ENSEMBLE_PKG=/path/to/another/checkout node tests/…` points the suites at another tree without editing any file (handy for auditing a published package).
 
 ---

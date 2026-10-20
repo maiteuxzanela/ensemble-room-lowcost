@@ -6,14 +6,17 @@
  * Sob teste (código real, não simulado):
  *   - Watchdog.check()     → src/watchdog.ts e dist/index.js (paridade).
  *   - ProgressTracker      → classe real (src/progress.ts / bundle).
- *   - createDb/MIGRATIONS  → 11 migrações reais aplicadas num SQLite real.
- *   - session store        → SQLite real com o schema `session` extraído,
- *                            read-only, do opencode.db de produção.
+ *   - createDb/MIGRATIONS  → migrações reais aplicadas num SQLite real.
+ *   - session store        → SQLite real com o schema `session` lido da fixture
+ *                            determinística tests/fixtures/session_schema.sql
+ *                            (TICKET-RELEASE-01: zero dependência do
+ *                            ~/.local/share/opencode/opencode.db do host).
  *
  * Único ponto de emenda: o transporte de saída (session.abort / promptAsync /
  * showToast) é gravado num array para que a asserção prove O QUE foi chamado.
  * Nenhuma lógica de decisão é substituída: não há mock library, nem stub de
- * banco, nem fixture falsa — os bancos são SQLite reais em diretório isolado.
+ * banco, nem fixture falsa — os bancos são SQLite reais em diretório isolado,
+ * criados a partir do DDL real versionado em tests/fixtures/.
  */
 
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -29,7 +32,9 @@ const SRC = path.join(PKG, "src");
 // Scratch isolado, recriado a cada execução e coberto pelo .gitignore.
 const TMP = path.join(REPO, ".test-scratch");
 mkdirSync(TMP, { recursive: true });
-const PROD_SESSION_DB = path.join(process.env.HOME, ".local", "share", "opencode", "opencode.db");
+// Fixture determinística do store de sessões (TICKET-RELEASE-01). Nenhum caminho
+// do host é tocado: o DDL vive versionado junto da suíte.
+const SESSION_SCHEMA = path.join(REPO, "tests", "fixtures", "session_schema.sql");
 
 const TTL_MS = 60_000;            // ttlMs do watchdog no teste (1 min)
 const STALE_OFFSET_MS = 120_000;  // > TTL → membro selecionado como stale
@@ -134,22 +139,24 @@ for (const marker of [
 }
 
 /* ------------------------------------------------------------------ *
- * 4. Store de sessões real (schema extraído read-only do produção)     *
+ * 4. Store de sessões real (schema da fixture determinística)          *
  * ------------------------------------------------------------------ */
+const SESSION_SCHEMA_SQL = readFileSync(SESSION_SCHEMA, "utf8");
 function buildSessionStore(storePath) {
-  const prod = new DatabaseSync(PROD_SESSION_DB, { readOnly: true });
-  const ddl = prod
-    .prepare(
-      `SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('project','session')
-       ORDER BY CASE name WHEN 'project' THEN 0 ELSE 1 END`,
-    )
-    .all();
-  prod.close();
-  if (ddl.length !== 2) throw new Error(`schema real incompleto: ${ddl.map((d) => d.name).join(",")}`);
-
   rmSync(storePath, { force: true });
   const store = new DatabaseSync(storePath);
-  for (const { sql } of ddl) store.exec(sql);
+  store.exec(SESSION_SCHEMA_SQL);
+
+  // Prova de que a fixture realmente materializou as duas tabelas (a FK de
+  // `session` referencia `project`) — falha explícita se o DDL regredir.
+  const ddlNames = store
+    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name IN ('project','session') ORDER BY name`)
+    .all()
+    .map((d) => d.name);
+  if (ddlNames.join(",") !== "project,session") {
+    store.close();
+    throw new Error(`fixture incompleta (${SESSION_SCHEMA}): ${ddlNames.join(",")}`);
+  }
 
   const now = Date.now();
   store
@@ -169,7 +176,7 @@ function buildSessionStore(storePath) {
   S("ses_idle", null);                // caso 3: genuinamente inativo
   S("ses_compaction_zero", 0);        // caso 4: time_compacting = 0 → não é compaction
   store.close();
-  return { ddlNames: ddl.map((d) => d.name).sort().join(",") };
+  return { ddlNames: ddlNames.join(",") };
 }
 
 /* ------------------------------------------------------------------ *
@@ -325,7 +332,23 @@ async function runSuite(label, mods) {
 /* ------------------------------------------------------------------ *
  * 6. Execução                                                        *
  * ------------------------------------------------------------------ */
-check("store de produção legível (fonte do schema)", existsSync(PROD_SESSION_DB), PROD_SESSION_DB);
+check("fixture de schema presente (fonte única do DDL)", existsSync(SESSION_SCHEMA), SESSION_SCHEMA);
+{
+  // Hermetismo: o DDL (fora dos comentários) não pode referenciar caminhos do host.
+  const sqlOnly = SESSION_SCHEMA_SQL.split("\n").filter((l) => !/^\s*--/.test(l)).join("\n");
+  check(
+    "DDL da fixture não referencia caminhos do host (~/.local/share/opencode)",
+    !/\.local\/share\/opencode|opencode\.db/.test(sqlOnly),
+  );
+
+  const probe = new DatabaseSync(":memory:");
+  probe.exec(SESSION_SCHEMA_SQL);
+  const cols = new Set(probe.prepare("PRAGMA table_info(session)").all().map((c) => c.name));
+  probe.close();
+  const required = ["id", "project_id", "title", "version", "agent", "time_created", "time_updated", "time_compacting"];
+  const missing = required.filter((c) => !cols.has(c));
+  check("fixture reproduz as colunas de contrato da tabela session", missing.length === 0, missing.join(",") || `${required.length}/${cols.size} colunas`);
+}
 
 const distMods = await import(HARNESS);
 EXPECTED_MIGRATIONS = distMods.MIGRATIONS.length;

@@ -4,7 +4,7 @@
  *
  * Executa, em sequência estrita (fail-report, sem aborte antecipado):
  *
- *   1. test_watchdog_heartbeat.mjs     — Heartbeat ativo + imunidade a compaction (53 checks)
+ *   1. test_watchdog_heartbeat.mjs     — Heartbeat ativo + imunidade a compaction (55 checks)
  *   2. test_standby_lifecycle.mjs      — Spawn em standby + blindagem de nudge/fast-idle (130 checks,
  *                                        re-executa a suíte 1 como regressão)
  *   3. test_silent_lead_board_wake.mjs — Silent lead + despertar sistemático por board (151 checks,
@@ -12,8 +12,9 @@
  *
  * Regras:
  *   - SEM MOCKS: toda suíte roda contra src/ e dist/ REAIS deste repositório,
- *     SQLite real (node:sqlite) e, para o schema `session`, leitura read-only
- *     de ~/.local/share/opencode/opencode.db (pré-requisito documentado no README).
+ *     SQLite real (node:sqlite) e, para o schema `session`, o DDL versionado em
+ *     tests/fixtures/session_schema.sql (TICKET-RELEASE-01: a suíte é hermética
+ *     e não lê ~/.local/share/opencode/opencode.db).
  *   - Scratch isolado em <repo>/.test-scratch (gitignore), recriado a cada execução.
  *   - Exit 0 apenas quando TODAS as suítes retornarem status 0 e nenhuma linha
  *     "FAIL" tiver sido emitida; caso contrário exit 1.

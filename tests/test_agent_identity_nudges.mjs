@@ -14,8 +14,9 @@
  *   (a) cada nudge dispara promptAsync com `agent` PRESENTE e igual ao
  *       `team_member.agent` do alvo; quando o alvo é a sessão do lead
  *       (`session_id === team.lead_session_id`) o `agent` é `team.lead_agent`;
- *   (b) a coluna `session.agent` (store real, schema extraído read-only do
- *       opencode.db de produção) NÃO é reescrita após os nudges. Honestidade:
+ *   (b) a coluna `session.agent` (store real, schema da fixture determinística
+ *       tests/fixtures/session_schema.sql — TICKET-RELEASE-01, zero dependência
+ *       do opencode.db do host) NÃO é reescrita após os nudges. Honestidade:
  *       a sobrescrita para o default ("dante") ocorre no SERVIDOR OpenCode quando
  *       o payload não traz `agent`; esta suíte não roda o servidor. O que é
  *       provado é (i) toda requisição dos 4 nudges carrega `agent` não vazio —
@@ -49,7 +50,10 @@ mkdirSync(TMP, { recursive: true });
 const HARNESS = path.join(TMP, "_agent_identity_harness.mjs");
 const SRC_COPY = path.join(TMP, "ensemble_src_agent_identity");
 const ROOT = path.join(TMP, "agent_identity_suite");
-const PROD_SESSION_DB = path.join(process.env.HOME, ".local", "share", "opencode", "opencode.db");
+// Fixture determinística do store de sessões (TICKET-RELEASE-01): nenhum
+// caminho do host é lido, o DDL vive versionado junto da suíte.
+const SESSION_SCHEMA = path.join(REPO, "tests", "fixtures", "session_schema.sql");
+const SESSION_SCHEMA_SQL = readFileSync(SESSION_SCHEMA, "utf8");
 
 const results = [];
 const check = (name, ok, detail) => {
@@ -184,17 +188,33 @@ check("2.3 cópia do src preparada (só resolução de extensão)", prepareSrcCo
 /* ================================================================== *
  * 4. FIXTURES — session store real + bancos SQLite reais              *
  * ================================================================== */
-/** Store `session` com schema real extraído read-only do produção. */
+{
+  const sqlOnly = SESSION_SCHEMA_SQL.split("\n").filter((l) => !/^\s*--/.test(l)).join("\n");
+  const probe = new DatabaseSync(":memory:");
+  probe.exec(sqlOnly);
+  const cols = new Set(probe.prepare("PRAGMA table_info(session)").all().map((c) => c.name));
+  probe.close();
+  check("4.0 fixture de schema presente (fonte única do DDL)", existsSync(SESSION_SCHEMA), SESSION_SCHEMA);
+  check(
+    "4.0 DDL hermético: sem caminho do host e com as colunas de contrato",
+    !/\.local\/share\/opencode|opencode\.db/.test(sqlOnly) && ["id", "agent", "time_updated"].every((c) => cols.has(c)),
+    `colunas=${cols.size}`,
+  );
+}
+/** Store `session`/`project` com o schema da fixture determinística. */
 function buildSessionStore(home, rows) {
-  const prod = new DatabaseSync(PROD_SESSION_DB, { readOnly: true });
-  const ddl = prod.prepare(`SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('project','session') ORDER BY CASE name WHEN 'project' THEN 0 ELSE 1 END`).all();
-  prod.close();
-  if (ddl.length !== 2) throw new Error(`schema real incompleto: ${ddl.map((d) => d.name).join(",")}`);
   const storePath = path.join(home, ".local", "share", "opencode", "opencode.db");
   mkdirSync(path.dirname(storePath), { recursive: true });
   rmSync(storePath, { force: true });
   const store = new DatabaseSync(storePath);
-  for (const { sql } of ddl) store.exec(sql);
+  store.exec(SESSION_SCHEMA_SQL);
+  // Falha explícita se a fixture regredir (a FK de session exige project).
+  const names = store
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('project','session') ORDER BY name")
+    .all()
+    .map((d) => d.name)
+    .join(",");
+  if (names !== "project,session") throw new Error(`fixture incompleta (${SESSION_SCHEMA}): ${names}`);
   const now = Date.now();
   store.prepare(`INSERT INTO project (id, worktree, vcs, name, sandboxes, time_created, time_updated, time_active) VALUES (?,?,?,?,?,?,?,?)`)
     .run("proj_aid", "", null, "agent-identity", "[]", now, now, 0);
