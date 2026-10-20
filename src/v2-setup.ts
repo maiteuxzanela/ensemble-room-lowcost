@@ -25,7 +25,7 @@ import { isWorktreeInstance } from "./util"
 import { Watchdog } from "./watchdog"
 import { vlog } from "./log"
 
-/** V2 setup context subset (structural, mock-friendly). */
+/** Structural subset of the REAL V2 setup context provided by the runtime. */
 export interface V2SetupContext {
   location: { directory: string }
   options: Record<string, unknown>

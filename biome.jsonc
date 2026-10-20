@@ -1,0 +1,70 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+
+  // Scope: src/ only. dist/ is a generated bundle (esbuild) and tests/ are
+  // plain .mjs with their own conventions — neither is linted here.
+  "files": {
+    "includes": ["src/**/*.ts", "src/**/*.tsx"]
+  },
+
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+
+  // LINTER: ON (the real code-quality signal). The recommended preset is kept
+  // at its default severities (warnings/infos) so it can never fail the
+  // deterministic gate on style preference, EXCEPT `noExplicitAny`, which is
+  // escalated to `error` because the anti-mock/strict-typing governance
+  // forbids `as any` in src/. This rule is the enforcement point for that
+  // invariant and currently passes with zero violations.
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "suspicious": {
+        "noExplicitAny": "error"
+      }
+    }
+  },
+
+  // ASSIST: OFF. `source.organizeImports` rewrites every import block in src/,
+  // which churns files and breaks the src<->dist text-parity assertions in the
+  // deterministic suite. Import order is not a correctness signal here.
+  "assist": {
+    "enabled": false
+  },
+
+  // FORMATTER: deliberately DISABLED, and the style knobs below are recorded
+  // only as documentation of the project's house style — they are inert while
+  // `enabled: false`.
+  //
+  // WHY: this repo's deterministic test suite (tests/*.mjs) asserts EXACT
+  // source substrings to guarantee safety constructs survive in BOTH src/ and
+  // dist/ — e.g. `this.check().catch((err) => {`, `text: resolveStandbyWake(db,
+  // member.team_id, member.name,`, `status IN ('in_progress', 'in_review')`.
+  // A repo-wide `biome check --write` (formatter on) reflows these call sites
+  // (wraps long lines, drops arrow parens, reorders imports) and broke 37 of
+  // those assertions across 6 suites when measured against a clean baseline.
+  // Adopting the formatter is therefore a SEPARATE work item that must first
+  // audit and de-brittle those parity assertions; it is not smuggled into a
+  // lint-hygiene change where it would silently weaken the quality gate.
+  "formatter": {
+    "enabled": false,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 120,
+    "lineEnding": "lf",
+    "includes": []
+  },
+  "javascript": {
+    "formatter": {
+      "enabled": false,
+      "quoteStyle": "double",
+      "semicolons": "asNeeded",
+      "arrowParentheses": "always",
+      "trailingCommas": "all"
+    }
+  }
+}

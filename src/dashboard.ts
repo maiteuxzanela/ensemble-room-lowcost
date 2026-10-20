@@ -223,37 +223,182 @@ function localOrigins(port: number): string[] {
   return [`http://localhost:${port}`, `http://127.0.0.1:${port}`, `http://[::1]:${port}`]
 }
 
+/** Hostnames that resolve to this machine's loopback interface. */
+const LOOPBACK_HOSTNAMES: readonly string[] = ["localhost", "127.0.0.1", "[::1]"]
+
+/** HTTP verbs that mutate server state and are therefore CSRF-relevant. */
+const STATE_CHANGING_METHODS: readonly string[] = ["POST", "PUT", "PATCH", "DELETE"]
+
+/** Collapse a possibly-repeated HTTP header into its first scalar value. */
+function headerValue(header: string | string[] | undefined): string | undefined {
+  return Array.isArray(header) ? header[0] : header
+}
+
 /** Resolve the concrete `Access-Control-Allow-Origin` value for one request. */
 function corsOriginFor(port: number, origin: string | string[] | undefined): string {
-  const raw = Array.isArray(origin) ? origin[0] : origin
+  const raw = headerValue(origin)
   if (raw && localOrigins(port).includes(raw)) return raw
   return `http://localhost:${port}`
 }
 
 /**
- * DEF-5 — Origin/Host gate for state-changing routes (`POST /api/chat/send`).
+ * TICKET-RELEASE-03 — Split an HTTP `Host` authority into hostname + optional
+ * port. Returns `null` for anything malformed (whitespace, path, credentials,
+ * userinfo delimiters, unbracketed IPv6), so a hostile `Host` can never smuggle
+ * extra components into the URL base or match a loopback name by prefix.
+ */
+function parseHostAuthority(value: string): { hostname: string, port: string | null } | null {
+  const raw = value.trim()
+  if (!raw || raw.length > 255 || /[\s/\\@?#]/.test(raw)) return null
+
+  if (raw.startsWith("[")) {
+    // IPv6 literal: `[::1]` or `[::1]:4747`.
+    const end = raw.indexOf("]")
+    if (end < 0) return null
+    const hostname = raw.slice(0, end + 1).toLowerCase()
+    const rest = raw.slice(end + 1)
+    if (rest === "") return { hostname, port: null }
+    if (!rest.startsWith(":")) return null
+    const port = rest.slice(1)
+    return /^\d{1,5}$/.test(port) ? { hostname, port } : null
+  }
+
+  const colon = raw.lastIndexOf(":")
+  if (colon === -1) return { hostname: raw.toLowerCase(), port: null }
+  // More than one colon outside brackets is not a valid IPv4/name authority.
+  if (raw.indexOf(":") !== colon) return null
+  const hostname = raw.slice(0, colon).toLowerCase()
+  const port = raw.slice(colon + 1)
+  if (!hostname || !/^\d{1,5}$/.test(port)) return null
+  return { hostname, port }
+}
+
+/**
+ * TICKET-RELEASE-03 — `Host` must name a loopback address this listener owns.
  *
- * `Host` must name this very port on a loopback address and, when the browser
- * sends one, `Origin` must be a loopback origin on the same port. A missing
- * `Origin` (curl, the TUI, other non-browser clients) is accepted — the Host
- * gate still binds the request to this listener.
+ * The port may be omitted (local tooling such as `curl -H 'Host: localhost'`
+ * and the TUI send a bare hostname), but when present it must match the
+ * configured port exactly: a different port is either a proxy hop or a
+ * DNS-rebinding attempt and is refused.
+ */
+function isTrustedLocalHost(port: number, header: string | string[] | undefined): boolean {
+  const raw = headerValue(header)
+  if (!raw) return false
+  const authority = parseHostAuthority(raw)
+  if (!authority) return false
+  if (!LOOPBACK_HOSTNAMES.includes(authority.hostname)) return false
+  if (authority.port === null) return true
+  return Number(authority.port) === port
+}
+
+/** True for the JSON media types the dashboard API accepts. */
+function isJsonContentType(header: string | string[] | undefined): boolean {
+  const raw = headerValue(header)
+  if (!raw) return false
+  const mediaType = (raw.split(";")[0] ?? "").trim().toLowerCase()
+  return mediaType === "application/json" || mediaType.endsWith("+json")
+}
+
+/** True when `method` mutates state (the CSRF-relevant verbs). */
+function isStateChangingMethod(method: string | undefined): boolean {
+  return STATE_CHANGING_METHODS.includes((method ?? "").toUpperCase())
+}
+
+/**
+ * TICKET-RELEASE-03 — `Origin` allow-list.
+ *
+ * Accepts the three loopback origins on this exact port plus the literal
+ * `null` that direct local tooling emits. `null` is honoured on mutating verbs
+ * only when the body is JSON: an HTML form (the classic cross-site CSRF
+ * primitive) can only emit `text/plain` / form encodings, so a sandboxed
+ * iframe — whose origin collapses to `null` — still cannot forge a state
+ * change while `curl`/SDK clients keep working.
+ */
+function isTrustedLocalOrigin(port: number, origin: string, req: IncomingMessage): boolean {
+  if (origin === "null") {
+    return !isStateChangingMethod(req.method) || isJsonContentType(req.headers["content-type"])
+  }
+  return localOrigins(port).includes(origin)
+}
+
+/**
+ * TICKET-RELEASE-03 — `Referer` fallback.
+ *
+ * Some non-browser and legacy clients omit `Origin` but still send a
+ * `Referer`. When one is present it must resolve to a loopback origin on this
+ * port; `file://`, `data:` and any remote page are refused instead of being
+ * silently treated as a direct local call.
+ */
+function isTrustedLocalReferer(port: number, referer: string): boolean {
+  try {
+    const parsed = new URL(referer)
+    if (parsed.protocol !== "http:") return false
+    return localOrigins(port).includes(parsed.origin)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * DEF-5 / TICKET-RELEASE-03 — Host/Origin/Referer gate for EVERY route.
+ *
+ * `Host` must be a loopback authority for this port. When the client sends an
+ * `Origin` it must be loopback on this same port (or JSON-`null` as above);
+ * when `Origin` is absent but a `Referer` is present, the referer must be
+ * loopback too. A request with neither header is a direct non-browser client
+ * (curl, the TUI, the SDK) and is accepted — the Host gate still binds it to
+ * this listener. Anything else is refused with 403 before any handler runs.
  */
 function isTrustedLocalRequest(port: number, req: IncomingMessage): boolean {
-  const host = req.headers.host
-  if (!host || ![`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`].includes(host)) return false
-  const origin = req.headers.origin
-  if (origin === undefined) return true
-  return localOrigins(port).includes(Array.isArray(origin) ? (origin[0] ?? "") : origin)
+  if (!isTrustedLocalHost(port, req.headers.host)) return false
+
+  const origin = headerValue(req.headers.origin)
+  if (origin !== undefined) return isTrustedLocalOrigin(port, origin, req)
+
+  const referer = headerValue(req.headers.referer)
+  if (referer !== undefined) return isTrustedLocalReferer(port, referer)
+
+  return true
+}
+
+/**
+ * TICKET-RELEASE-03 — Resolve `req.url` against a fixed loopback base.
+ *
+ * The request target is parsed without ever touching the attacker-controlled
+ * `Host` header: a malformed authority must not be able to throw inside the
+ * request handler (or inject a foreign base) before the gate has run.
+ */
+function safeRequestUrl(rawUrl: string | undefined, port: number): URL {
+  try {
+    return new URL(rawUrl ?? "/", `http://127.0.0.1:${port}`)
+  } catch {
+    return new URL("/", `http://127.0.0.1:${port}`)
+  }
 }
 
 /** Max accepted HTTP body for `POST /api/chat/send` (DEF-7): 64 KiB. */
 export const MAX_CHAT_BODY_BYTES = 64 * 1024
+
+/**
+ * TICKET-RELEASE-03 — Security headers shared by every dashboard response.
+ *
+ * The console is a local operator surface that renders live team state, so the
+ * responses must never be sniffed as another type, never leak the loopback URL
+ * through `Referer` when they link out, and never be cached by an intermediary
+ * or a shared browser session.
+ */
+const DASHBOARD_SECURITY_HEADERS = {
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+  "Cache-Control": "no-store",
+} as const
 
 function sendJson(res: ServerResponse, data: unknown, corsOrigin: string, status: number = 200): void {
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": corsOrigin,
     "Vary": "Origin",
+    ...DASHBOARD_SECURITY_HEADERS,
   })
   res.end(JSON.stringify(data))
 }
@@ -647,17 +792,19 @@ function handleDashboardRequest(
   res: ServerResponse,
   options?: DashboardOptions,
 ): void {
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? `localhost:${port}`}`)
+  const url = safeRequestUrl(req.url, port)
   const corsOrigin = corsOriginFor(port, req.headers.origin)
 
-  // HARNESS-35 (A4) — DNS rebinding / host spoofing gate applied to EVERY
-  // route, not just the state-changing POST. The dashboard only ever runs on a
-  // loopback listener, so `Host` must name this exact port on a loopback
-  // address (and, when the browser sends one, `Origin` must be loopback too).
-  // Anything else is refused before any GET (/api/health, /api/state,
-  // activity, /) or POST handler runs — no state is read or mutated.
+  // HARNESS-35 (A4) / TICKET-RELEASE-03 — DNS rebinding + CSRF gate applied to
+  // EVERY route, not just the state-changing POST. The dashboard only ever runs
+  // on a loopback listener, so `Host` must name a loopback authority for this
+  // port, `Origin` (when sent) must be loopback on the same port, and `Referer`
+  // (only when `Origin` is absent) must be loopback too. Anything else — the
+  // emergency kill-switch routes included — is refused before any GET
+  // (/api/health, /api/state, activity, /) or mutating handler runs: no state
+  // is read or mutated.
   if (!isTrustedLocalRequest(port, req)) {
-    log(`dashboard:forbidden path=${url.pathname} method=${req.method ?? "-"} host=${req.headers.host ?? "-"} origin=${req.headers.origin ?? "-"}`)
+    log(`dashboard:forbidden path=${url.pathname} method=${req.method ?? "-"} host=${headerValue(req.headers.host) ?? "-"} origin=${headerValue(req.headers.origin) ?? "-"} referer=${headerValue(req.headers.referer) ?? "-"}`)
     sendJson(res, { ok: false, error: "Forbidden" }, corsOrigin, 403)
     return
   }
@@ -881,7 +1028,7 @@ function handleDashboardRequest(
   }
 
   if (url.pathname === "/") {
-    res.writeHead(200, { "Content-Type": "text/html" })
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", ...DASHBOARD_SECURITY_HEADERS })
     res.end(DASHBOARD_HTML)
     return
   }

@@ -1,3 +1,4 @@
+import { log } from "../log"
 import type { ToolDeps } from "../types"
 import { requireTeamMember } from "./shared"
 
@@ -84,8 +85,8 @@ export async function executeTeamStatus(
       // Additive provider-retry annotation (Fix 4) — derived at read time from the
       // retry_until TTL (Fix 3), same annotation pattern as `nudged` above. Generic
       // "retrying" label, no rate-limit-specific wording (Fix 2).
-      const isRetrying = m.retry_until !== null && m.retry_until > now
-      const retrying = isRetrying ? `, retrying (attempt ${m.retry_attempt}, ~${formatDuration(m.retry_until! - now)})` : ""
+      const retryRemainingMs = m.retry_until !== null && m.retry_until > now ? m.retry_until - now : null
+      const retrying = retryRemainingMs !== null ? `, retrying (attempt ${m.retry_attempt}, ~${formatDuration(retryRemainingMs)})` : ""
 
       // Last message time
       const lastMsg = deps.db.query("SELECT MAX(time_created) as last_msg FROM team_message WHERE team_id = ? AND from_name = ?")
@@ -136,8 +137,11 @@ export async function executeTeamStatus(
         variant: "info",
         duration: 4000,
       })
-    } catch {
-      // TUI may not be available — silently ignore
+    } catch (err) {
+      // The TUI is an optional surface: headless/embedded runtimes expose no
+      // toast, so the failure must not break the textual status. It is still
+      // logged (never swallowed) so a genuinely broken client stays visible.
+      log(`team_status:toast:failed msg=${err instanceof Error ? err.message : String(err)}`)
     }
   }
 
