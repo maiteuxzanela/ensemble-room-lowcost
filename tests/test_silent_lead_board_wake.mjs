@@ -27,7 +27,7 @@
  *   (d) última tarefa do board concluída (completed === total) → promptAsync do
  *       lead disparado EXATAMENTE 1x com
  *       "[System: All team tasks completed on board by <who>]" (synthetic:true).
- *   (e) zero regressões: Standby (130 checks) e Watchdog (53 checks).
+ *   (e) zero regressões: Standby (130 checks) e Watchdog (55 checks).
  *   (f) node --check dist/index.js → exit 0.
  *
  * Único ponto de emenda: o TRANSPORTE DE SAÍDA (promptAsync / showToast) é
@@ -665,7 +665,7 @@ function runSuite(file, expectedLine) {
   );
 }
 runSuite(STANDBY_SUITE, "130/130 checks passed");
-runSuite(WATCHDOG_SUITE, "53/53 checks passed");
+runSuite(WATCHDOG_SUITE, "55/55 checks passed");
 
 check("f) ZERO unhandledRejection ao longo de toda a suíte", unhandled.length === 0, `${unhandled.length}`);
 
