@@ -1,4 +1,5 @@
 # Dependências
+node_modules
 node_modules/
 
 # Artefatos de build / typecheck

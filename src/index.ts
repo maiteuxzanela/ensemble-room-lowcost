@@ -47,7 +47,7 @@ import { findTeamBySession } from "./types"
 import { loadConfig } from "./config"
 import { ProgressTracker } from "./progress"
 import { ActivityBuffer, recordFromV2Event, recordFromToolBefore, recordFromToolAfter } from "./activity"
-import { recordFileFromToolCall } from "./modified-files"
+import { captureShellBaseline, recordFileFromToolCall } from "./modified-files"
 import { startDashboard } from "./dashboard"
 import { executeTeamCreate } from "./tools/team-create"
 import { executeTeamSpawn } from "./tools/team-spawn"
@@ -549,6 +549,19 @@ const plugin: Plugin = async (input) => {
       }
       // Record tool call activity for team member sessions
       recordFromToolBefore(input, registry, activityBuffer)
+      // TICKET-RELEASE-05: snapshot the repo(s) a shell call may touch, so the
+      // `after` hook can ledger every artifact it generated (npm/sed/builders).
+      // V1 does not type `args` on this hook (the runtime still forwards them),
+      // so read it defensively; cwd falls back to worktree_dir → deps.directory.
+      captureShellBaseline(
+        db,
+        registry,
+        input.sessionID,
+        input.tool,
+        (input as unknown as { args?: unknown }).args,
+        deps.directory,
+        input.callID,
+      )
     },
 
     "tool.execute.after": async (input, output) => {
@@ -558,7 +571,16 @@ const plugin: Plugin = async (input) => {
       // TICKET-32A: ledger every file this room's session mutates
       // (edit/write/patch/...) so the Portão 1 auto-commit can commit a repo
       // strictly with the room-touched files — never a blind `git add -A`.
-      recordFileFromToolCall(db, registry, input.sessionID, input.tool, input.args)
+      // TICKET-RELEASE-05: shell calls are diffed against their baseline here.
+      recordFileFromToolCall(
+        db,
+        registry,
+        input.sessionID,
+        input.tool,
+        input.args,
+        deps.directory,
+        (input as unknown as { callID?: string }).callID,
+      )
       // Record tool result activity for team member sessions
       recordFromToolAfter(input, output, registry, activityBuffer)
     },

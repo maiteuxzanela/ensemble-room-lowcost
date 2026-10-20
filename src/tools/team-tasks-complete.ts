@@ -309,6 +309,14 @@ function normalizeDir(dir: string): string {
  * parent (e.g. the room repo) stages the nested repo's path so the parent tree
  * ends clean and records the nested repo's FINAL HEAD.
  *
+ * TICKET-RELEASE-05 — the ledger now also captures SHELL-generated artifacts
+ * (`bash`/`shell` before/after `git status` diff in modified-files.ts), so
+ * `npm install`, `sed -i`, generators and bundlers are no longer omitted. As a
+ * fail-safe, after committing, every repo this run touched is re-read and any
+ * file left dirty but absent from the ledger is logged as
+ * `tasks-complete:autocommit:ledger-gap` — the omission becomes observable
+ * without ever relaxing the surgical staging (`git add -A` stays forbidden).
+ *
  * Returns the suffix appended to the completion message:
  *   - " Task completed and locally committed: <repo> (<hash>), <repo2> (<hash2>)"
  *   - " Task completed; working tree already clean (no commit needed)"
@@ -622,6 +630,31 @@ async function autoCommitApprovedTask(deps: ToolDeps, teamId: string, taskConten
         log(`tasks-complete:autocommit:committed dir=${repo} repo=${path.basename(repo)} hash=${hash || "?"} files=${addList.length} (gitlink) task="${taskContent}"`)
       } catch (err) {
         log(`tasks-complete:autocommit:error dir=${repo} err=${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+
+    // TICKET-RELEASE-05 — fail-safe ledger audit (observability, never auto-add).
+    // The staging above is strictly surgical, so an artifact the room generated
+    // through a path that did NOT reach the ledger (shell/CLI work, a tool the
+    // hooks do not cover) stays dirty silently — exactly the RELEASE-01
+    // incident. Re-read every repo this run touched and log what was left
+    // behind. `git add -A` remains FORBIDDEN: this branch only reports.
+    const auditRepos = [...new Set([...targets.map((t) => t.path), ...committedPaths.map((p) => normalizeDir(p))])]
+    for (const repo of auditRepos) {
+      try {
+        const status = await runCommand(["git", "status", "--porcelain", "-uall"], { cwd: repo })
+        if (status.exitCode !== 0) continue
+        const remaining = status.stdout
+          .split("\n")
+          .filter((line) => line.trim().length > 3)
+          .map((line) => line.slice(3).trim())
+          .filter((p) => p.length > 0)
+        if (remaining.length === 0) continue
+        log(
+          `tasks-complete:autocommit:ledger-gap dir=${repo} omitted=${remaining.length} sample=${remaining.slice(0, 5).join(",")} task="${taskContent}"`,
+        )
+      } catch (err) {
+        log(`tasks-complete:autocommit:ledger-gap-check-failed dir=${repo} err=${err instanceof Error ? err.message : String(err)}`)
       }
     }
 

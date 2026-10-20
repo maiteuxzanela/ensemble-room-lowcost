@@ -2,6 +2,8 @@ import type { Database } from "./db"
 import type { MemberRegistry } from "./state"
 import { findTeamBySession } from "./types"
 import path from "node:path"
+import { spawnSync } from "node:child_process"
+import { statSync } from "node:fs"
 import { log } from "./log"
 
 /**
@@ -18,6 +20,12 @@ import { log } from "./log"
  * into the caller's promise chain. A ledger failure is logged and swallowed —
  * the worst case is a file the room touched that does not get auto-committed
  * (the human can still `git add` it manually).
+ *
+ * TICKET-RELEASE-05: shell commands (`bash` / `shell`) mutate files WITHOUT
+ * naming them in their args. They are captured by a `git status --porcelain`
+ * snapshot diff around the call, so generators, `sed -i`, bundlers and
+ * `npm install` artifacts enter the very same ledger — keeping the Portão 1
+ * commit surgical (`git add -- <files>`) while no longer omitting them.
  */
 
 /**
@@ -34,6 +42,253 @@ const FILE_MUTATING_TOOLS = new Set([
   "notebookEdit",
   "insert",
 ])
+
+/**
+ * TICKET-RELEASE-05 — shell tools that can mutate ANY file in the repository
+ * without naming it in their args (`npm install` regenerating package-lock.json,
+ * `sed -i`, code generators, bundlers, CLI scaffolding...). The allow-list of
+ * direct file tools alone left those artifacts OUT of the ledger, so the Portão
+ * 1 auto-commit (strictly ledger-gated) never staged them and the tree ended
+ * dirty after a "successful" completion. Shell calls are handled by a
+ * before/after snapshot diff (see captureShellBaseline / recordShellDiff).
+ */
+const SHELL_TOOLS = new Set(["bash", "shell"])
+
+/** Path segments that must never enter the ledger from a shell diff. */
+const LEDGER_IGNORED_SEGMENTS = new Set([".git", "node_modules", ".test-scratch"])
+
+/** Hard cap on files recorded per shell call (a runaway generator cannot flood SQLite). */
+const MAX_SHELL_LEDGER_FILES = 400
+
+/** Timeout for the read-only git probes (never blocks a tool hook for long). */
+const SHELL_GIT_TIMEOUT_MS = 5000
+
+/** A pending baseline older than this is discarded (hook pairing lost / crashed call). */
+const SHELL_BASELINE_TTL_MS = 10 * 60 * 1000
+
+/** One `git status --porcelain` view of a repository: path → cheap change signature. */
+interface RepoSnapshot {
+  root: string
+  entries: Map<string, string>
+}
+
+interface PendingShellBaseline {
+  /** Tool-call id when the runtime provides one (`tool.execute.before`). */
+  callId?: string
+  at: number
+  snapshot: RepoSnapshot | null
+}
+
+/** sessionId → FIFO of pending shell baselines (concurrent calls in one session pair in order). */
+const pendingShellBaselines = new Map<string, PendingShellBaseline[]>()
+
+/** True when any path segment is on the ledger deny-list. */
+function isLedgerIgnoredPath(relPath: string): boolean {
+  return relPath
+    .split(/[\\/]+/)
+    .some((segment) => LEDGER_IGNORED_SEGMENTS.has(segment))
+}
+
+/** Cheap change signature for a dirty/untracked path (missing file = deletion). */
+function changeSignature(absPath: string): string {
+  try {
+    const st = statSync(absPath)
+    if (!st.isFile()) return st.isDirectory() ? "dir" : "other"
+    return `${st.size}:${st.mtimeMs}:${st.ino}`
+  } catch {
+    return "missing"
+  }
+}
+
+/**
+ * Normalize the value `git status --porcelain -z` uses for a path: dropped
+ * quoting (the `-z` form never quotes) and C-escapes are already raw.
+ */
+function porcelainEntries(root: string, raw: string): Array<[string, string]> {
+  const out: Array<[string, string]> = []
+  const tokens = raw.split("\u0000")
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]
+    if (!token || token.length < 4) continue
+    const status = token.slice(0, 2)
+    const rel = token.slice(3)
+    // Rename/copy entries carry the ORIGINAL path as the next NUL token.
+    if (status.startsWith("R") || status.startsWith("C")) i += 1
+    if (!rel || isLedgerIgnoredPath(rel)) continue
+    out.push([path.resolve(root, rel), status])
+  }
+  return out
+}
+
+/**
+ * Read-only snapshot of every dirty/untracked file in the git repository that
+ * contains `cwd`. Returns null when `cwd` is not inside a work tree or git is
+ * unavailable/too slow — the caller degrades to "record nothing".
+ *
+ * `-uall` expands untracked DIRECTORIES into individual files (a ledger row must
+ * name a file, never a directory), and the pathspec exclusions keep the probe
+ * fast and the ledger clean (`node_modules`, `.test-scratch`).
+ */
+function gitStatusSnapshot(cwd: string): RepoSnapshot | null {
+  const top = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+    cwd,
+    encoding: "utf8",
+    timeout: SHELL_GIT_TIMEOUT_MS,
+  })
+  if (top.error || top.status !== 0) return null
+  const root = top.stdout.trim()
+  if (!root) return null
+
+  const statusRes = spawnSync(
+    "git",
+    [
+      "status",
+      "--porcelain",
+      "-z",
+      "-uall",
+      "--",
+      ".",
+      ":(exclude)node_modules",
+      ":(exclude).test-scratch",
+      ":(exclude).git",
+    ],
+    { cwd: root, encoding: "utf8", timeout: SHELL_GIT_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 },
+  )
+  if (statusRes.error || statusRes.status !== 0) return null
+
+  const entries = new Map<string, string>()
+  for (const [abs, status] of porcelainEntries(root, statusRes.stdout ?? "")) {
+    entries.set(abs, `${status}:${changeSignature(abs)}`)
+  }
+  return { root, entries }
+}
+
+/** Resolve the working directory a shell command runs in: args.cwd → member worktree → plugin dir. */
+function resolveShellCwd(
+  db: Database,
+  sessionId: string,
+  args: unknown,
+  workspaceDir: string | undefined,
+): string | null {
+  if (args && typeof args === "object") {
+    const raw = (args as Record<string, unknown>).cwd
+    if (typeof raw === "string" && raw.length > 0) return path.resolve(raw)
+  }
+  const row = db.query("SELECT worktree_dir FROM team_member WHERE session_id = ?").get(sessionId) as
+    | { worktree_dir: string | null }
+    | null
+  if (row?.worktree_dir) return row.worktree_dir
+  return workspaceDir ? path.resolve(workspaceDir) : null
+}
+
+/** Drop expired baselines and bound the per-session queue. */
+function prunePendingShellBaselines(now: number): void {
+  for (const [sessionId, queue] of pendingShellBaselines) {
+    const fresh = queue.filter((entry) => now - entry.at <= SHELL_BASELINE_TTL_MS)
+    if (fresh.length === 0) pendingShellBaselines.delete(sessionId)
+    else pendingShellBaselines.set(sessionId, fresh)
+  }
+}
+
+/**
+ * `tool.execute.before` half of the shell capture: snapshot the repos the shell
+ * call may touch, keyed by session (and call id when the runtime supplies one).
+ *
+ * Fail-graceful and synchronous: the probe is a read-only `git status` (spawnSync
+ * with timeout); a non-git directory or a missing binary yields a null snapshot,
+ * which simply means that call records nothing.
+ */
+export function captureShellBaseline(
+  db: Database,
+  registry: MemberRegistry,
+  sessionId: string,
+  tool: string,
+  args: unknown,
+  workspaceDir?: string,
+  callId?: string,
+): void {
+  try {
+    if (!SHELL_TOOLS.has(tool)) return
+    const teamInfo = findTeamBySession(db, registry, sessionId)
+    if (!teamInfo) return
+    const cwd = resolveShellCwd(db, sessionId, args, workspaceDir)
+    if (!cwd) return
+
+    const now = Date.now()
+    prunePendingShellBaselines(now)
+    const queue = pendingShellBaselines.get(sessionId) ?? []
+    queue.push({ callId, at: now, snapshot: gitStatusSnapshot(cwd) })
+    // Bound the queue: a lost `after` must not grow memory forever.
+    while (queue.length > 8) queue.shift()
+    pendingShellBaselines.set(sessionId, queue)
+  } catch (err) {
+    log(`modified-file:shell-baseline-failed tool=${tool} err=${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+/** Pop the baseline that pairs with this shell call (call id match wins, else FIFO). */
+export function consumeShellBaseline(
+  db: Database,
+  registry: MemberRegistry,
+  sessionId: string,
+  tool: string,
+  args: unknown,
+  workspaceDir?: string,
+  callId?: string,
+): { baseline: RepoSnapshot | null; current: RepoSnapshot | null } | null {
+  const teamInfo = findTeamBySession(db, registry, sessionId)
+  if (!teamInfo) return null
+  const cwd = resolveShellCwd(db, sessionId, args, workspaceDir)
+  if (!cwd) return null
+
+  const queue = pendingShellBaselines.get(sessionId) ?? []
+  let idx = -1
+  if (callId) idx = queue.findIndex((entry) => entry.callId === callId)
+  if (idx < 0) idx = 0
+  const pending = queue.length > 0 ? queue.splice(idx, 1)[0] : undefined
+  if (queue.length === 0) pendingShellBaselines.delete(sessionId)
+  else pendingShellBaselines.set(sessionId, queue)
+
+  return { baseline: pending?.snapshot ?? null, current: gitStatusSnapshot(cwd) }
+}
+
+/**
+ * Diff two snapshots and record every file the shell command actually changed.
+ *
+ * A path is "touched" when it is new (absent from the baseline), changed (its
+ * size/mtime/inode signature differs — this catches an ALREADY dirty file that
+ * the command rewrote, the package-lock.json incident) or deleted. Files that
+ * were already dirty before the command and were not touched again stay out of
+ * the ledger, so pre-existing unrelated dirt is never swept into the Portão 1
+ * commit.
+ */
+export function recordShellDiff(
+  db: Database,
+  teamId: string,
+  baseline: RepoSnapshot | null,
+  current: RepoSnapshot | null,
+): string[] {
+  if (!current) return []
+  const before = baseline && baseline.root === current.root ? baseline.entries : new Map<string, string>()
+  const touched: string[] = []
+  for (const [abs, signature] of current.entries) {
+    if (before.get(abs) === signature) continue
+    touched.push(abs)
+  }
+  // Deletions performed by the command (present before, gone now).
+  for (const abs of before.keys()) {
+    if (!current.entries.has(abs)) touched.push(abs)
+  }
+
+  const limited = touched.length > MAX_SHELL_LEDGER_FILES ? touched.slice(0, MAX_SHELL_LEDGER_FILES) : touched
+  if (touched.length > limited.length) {
+    log(
+      `modified-file:shell-truncated team=${teamId} touched=${touched.length} recorded=${limited.length} max=${MAX_SHELL_LEDGER_FILES}`,
+    )
+  }
+  for (const abs of limited) recordModifiedFile(db, teamId, abs)
+  return limited
+}
 
 /**
  * Normalize a file path for the ledger: absolute, resolved against the CWD,
@@ -90,14 +345,23 @@ function extractFilePath(tool: string, args: unknown): string | null {
 }
 
 /**
- * Hook-side entry point: record the file a session just mutated.
+ * Hook-side entry point: record the files a session just mutated.
  *
  * Called from tool.execute.after (V1 index.ts and V2 v2-setup.ts). No-ops
  * when:
- *   - the tool is not file-mutating (read/grep/team_* never reach the ledger);
+ *   - the tool is not file-mutating and not a shell tool (read/grep/team_*
+ *     never reach the ledger);
  *   - the args carry no recognizable file path;
  *   - the session is not a registered room member nor a lead (isolated
  *     sessions — e.g. Diana's blind review — never touch a room's ledger).
+ *
+ * TICKET-RELEASE-05: `bash`/`shell` calls carry no file path — their artifacts
+ * come from the before/after snapshot diff (captureShellBaseline →
+ * recordShellDiff) and cover `npm install`, `sed -i`, generators and bundlers.
+ *
+ * `workspaceDir` (the plugin's project directory) is the fallback cwd for a
+ * shell call when neither `args.cwd` nor a member worktree is available.
+ * `callId` (when the runtime exposes it) pairs a baseline with its exact call.
  *
  * Never throws — safe to call from a promise-chain hook.
  */
@@ -107,8 +371,32 @@ export function recordFileFromToolCall(
   sessionId: string,
   tool: string,
   args: unknown,
+  workspaceDir?: string,
+  callId?: string,
 ): void {
   try {
+    // TICKET-RELEASE-05 — shell-generated artifacts. The before hook captured a
+    // repo snapshot (captureShellBaseline); here we diff it against the current
+    // state and ledger every file the command created, rewrote or deleted. The
+    // staging itself stays surgical (`git add -- <ledger files>`), so capturing
+    // a broader surface never weakens the "never `git add -A`" invariant.
+    if (SHELL_TOOLS.has(tool)) {
+      const teamInfo = findTeamBySession(db, registry, sessionId)
+      if (!teamInfo) return
+      const snapshots = consumeShellBaseline(db, registry, sessionId, tool, args, workspaceDir, callId)
+      if (!snapshots) return
+      if (!snapshots.baseline) {
+        log(`modified-file:shell-baseline-missing team=${teamInfo.teamId} tool=${tool}`)
+        return
+      }
+      const recorded = recordShellDiff(db, teamInfo.teamId, snapshots.baseline, snapshots.current)
+      log(
+        `modified-file:shell-recorded team=${teamInfo.teamId} tool=${tool} files=${recorded.length}` +
+          (recorded.length > 0 ? ` first=${recorded[0]}` : ""),
+      )
+      return
+    }
+
     if (!FILE_MUTATING_TOOLS.has(tool)) return
     const filePath = extractFilePath(tool, args)
     if (!filePath) return
