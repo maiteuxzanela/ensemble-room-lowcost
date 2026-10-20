@@ -5,7 +5,8 @@ import type { ProgressTracker } from "./progress"
 
 /**
  * Shared dependencies injected into every tool's execute function.
- * This avoids global state and makes tools testable with mocks.
+ * This avoids global state and keeps every tool dependency explicit and
+ * injectable from the real runtime (deterministic tests, no mocks).
  */
 export interface ToolDeps {
   db: Database
@@ -79,7 +80,8 @@ export interface PermissionRule {
 /**
  * Minimal interface for the OpenCode v2 SDK client methods we actually use.
  * Uses flat params matching the v2 SDK (imported from @opencode-ai/sdk/v2).
- * Makes mocking trivial in tests.
+ * This is a real SDK boundary: tests capture what was called at the transport
+ * seam, never a simulated implementation (anti-mock governance).
  */
 export interface PluginClient {
   session: {

@@ -4,7 +4,7 @@ function toggleMsg(id){if(expMsgs.has(id))expMsgs.delete(id);else expMsgs.add(id
 
 function toggleVerbose(){
   verbose=!verbose;
-  try{localStorage.setItem('ensemble-verbose',verbose?'1':'0')}catch(e){}
+  try{localStorage.setItem('ensemble-verbose',verbose?'1':'0')}catch(e){/* storage unavailable (private mode/quota): preference stays session-only */}
   var btn=document.getElementById('verbose-toggle');
   if(btn){
     btn.textContent='verbose: '+(verbose?'on':'off');

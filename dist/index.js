@@ -5109,6 +5109,7 @@ async function executeTeamMerge(deps, args, sessionId, merge = mergeBranch, delB
 }
 
 // src/tools/team-status.ts
+init_log();
 var lastCallTime = /* @__PURE__ */ new Map();
 var lastKnownState = /* @__PURE__ */ new Map();
 var RATE_LIMIT_MS = 3e4;
@@ -5156,8 +5157,8 @@ async function executeTeamStatus(deps, sessionId) {
       const branch = m.worktree_branch ? `  branch: ${m.worktree_branch}` : "";
       const plan = m.plan_approval !== "none" ? `, plan: ${m.plan_approval}` : "";
       const nudged = m.last_nudged_at ? `, nudged ${formatDuration(now - m.last_nudged_at)} ago` : "";
-      const isRetrying = m.retry_until !== null && m.retry_until > now;
-      const retrying = isRetrying ? `, retrying (attempt ${m.retry_attempt}, ~${formatDuration(m.retry_until - now)})` : "";
+      const retryRemainingMs = m.retry_until !== null && m.retry_until > now ? m.retry_until - now : null;
+      const retrying = retryRemainingMs !== null ? `, retrying (attempt ${m.retry_attempt}, ~${formatDuration(retryRemainingMs)})` : "";
       const lastMsg = deps.db.query("SELECT MAX(time_created) as last_msg FROM team_message WHERE team_id = ? AND from_name = ?").get(teamInfo.teamId, m.name);
       const msgInfo = lastMsg?.last_msg ? `last msg: ${formatDuration(now - lastMsg.last_msg)} ago` : "no messages yet";
       lines.push(`  ${m.name}  [${statusIcon} ${duration}, ${msgInfo}${plan}${nudged}${retrying}]  agent: ${m.agent}${branch}`);
@@ -5198,7 +5199,8 @@ async function executeTeamStatus(deps, sessionId) {
         variant: "info",
         duration: 4e3
       });
-    } catch {
+    } catch (err) {
+      log(`team_status:toast:failed msg=${err instanceof Error ? err.message : String(err)}`);
     }
   }
   return lines.join("\n");
@@ -6143,7 +6145,7 @@ function toggleMsg(id){if(expMsgs.has(id))expMsgs.delete(id);else expMsgs.add(id
 
 function toggleVerbose(){
   verbose=!verbose;
-  try{localStorage.setItem('ensemble-verbose',verbose?'1':'0')}catch(e){}
+  try{localStorage.setItem('ensemble-verbose',verbose?'1':'0')}catch(e){/* storage unavailable (private mode/quota): preference stays session-only */}
   var btn=document.getElementById('verbose-toggle');
   if(btn){
     btn.textContent='verbose: '+(verbose?'on':'off');
@@ -6842,24 +6844,97 @@ function buildState(db) {
 function localOrigins(port) {
   return [`http://localhost:${port}`, `http://127.0.0.1:${port}`, `http://[::1]:${port}`];
 }
+var LOOPBACK_HOSTNAMES = ["localhost", "127.0.0.1", "[::1]"];
+var STATE_CHANGING_METHODS = ["POST", "PUT", "PATCH", "DELETE"];
+function headerValue(header) {
+  return Array.isArray(header) ? header[0] : header;
+}
 function corsOriginFor(port, origin) {
-  const raw = Array.isArray(origin) ? origin[0] : origin;
+  const raw = headerValue(origin);
   if (raw && localOrigins(port).includes(raw)) return raw;
   return `http://localhost:${port}`;
 }
+function parseHostAuthority(value) {
+  const raw = value.trim();
+  if (!raw || raw.length > 255 || /[\s/\\@?#]/.test(raw)) return null;
+  if (raw.startsWith("[")) {
+    const end = raw.indexOf("]");
+    if (end < 0) return null;
+    const hostname2 = raw.slice(0, end + 1).toLowerCase();
+    const rest = raw.slice(end + 1);
+    if (rest === "") return { hostname: hostname2, port: null };
+    if (!rest.startsWith(":")) return null;
+    const port2 = rest.slice(1);
+    return /^\d{1,5}$/.test(port2) ? { hostname: hostname2, port: port2 } : null;
+  }
+  const colon = raw.lastIndexOf(":");
+  if (colon === -1) return { hostname: raw.toLowerCase(), port: null };
+  if (raw.indexOf(":") !== colon) return null;
+  const hostname = raw.slice(0, colon).toLowerCase();
+  const port = raw.slice(colon + 1);
+  if (!hostname || !/^\d{1,5}$/.test(port)) return null;
+  return { hostname, port };
+}
+function isTrustedLocalHost(port, header) {
+  const raw = headerValue(header);
+  if (!raw) return false;
+  const authority = parseHostAuthority(raw);
+  if (!authority) return false;
+  if (!LOOPBACK_HOSTNAMES.includes(authority.hostname)) return false;
+  if (authority.port === null) return true;
+  return Number(authority.port) === port;
+}
+function isJsonContentType(header) {
+  const raw = headerValue(header);
+  if (!raw) return false;
+  const mediaType = (raw.split(";")[0] ?? "").trim().toLowerCase();
+  return mediaType === "application/json" || mediaType.endsWith("+json");
+}
+function isStateChangingMethod(method) {
+  return STATE_CHANGING_METHODS.includes((method ?? "").toUpperCase());
+}
+function isTrustedLocalOrigin(port, origin, req) {
+  if (origin === "null") {
+    return !isStateChangingMethod(req.method) || isJsonContentType(req.headers["content-type"]);
+  }
+  return localOrigins(port).includes(origin);
+}
+function isTrustedLocalReferer(port, referer) {
+  try {
+    const parsed = new URL(referer);
+    if (parsed.protocol !== "http:") return false;
+    return localOrigins(port).includes(parsed.origin);
+  } catch {
+    return false;
+  }
+}
 function isTrustedLocalRequest(port, req) {
-  const host = req.headers.host;
-  if (!host || ![`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`].includes(host)) return false;
-  const origin = req.headers.origin;
-  if (origin === void 0) return true;
-  return localOrigins(port).includes(Array.isArray(origin) ? origin[0] ?? "" : origin);
+  if (!isTrustedLocalHost(port, req.headers.host)) return false;
+  const origin = headerValue(req.headers.origin);
+  if (origin !== void 0) return isTrustedLocalOrigin(port, origin, req);
+  const referer = headerValue(req.headers.referer);
+  if (referer !== void 0) return isTrustedLocalReferer(port, referer);
+  return true;
+}
+function safeRequestUrl(rawUrl, port) {
+  try {
+    return new URL(rawUrl ?? "/", `http://127.0.0.1:${port}`);
+  } catch {
+    return new URL("/", `http://127.0.0.1:${port}`);
+  }
 }
 var MAX_CHAT_BODY_BYTES = 64 * 1024;
+var DASHBOARD_SECURITY_HEADERS = {
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+  "Cache-Control": "no-store"
+};
 function sendJson(res, data, corsOrigin, status = 200) {
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": corsOrigin,
-    "Vary": "Origin"
+    "Vary": "Origin",
+    ...DASHBOARD_SECURITY_HEADERS
   });
   res.end(JSON.stringify(data));
 }
@@ -7103,10 +7178,10 @@ function sendEmergencyFailure(res, corsOrigin, err) {
   sendJson(res, { ok: false, code: "internal_error", error: msg }, corsOrigin, 500);
 }
 function handleDashboardRequest(db, port, req, res, options) {
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? `localhost:${port}`}`);
+  const url = safeRequestUrl(req.url, port);
   const corsOrigin = corsOriginFor(port, req.headers.origin);
   if (!isTrustedLocalRequest(port, req)) {
-    log(`dashboard:forbidden path=${url.pathname} method=${req.method ?? "-"} host=${req.headers.host ?? "-"} origin=${req.headers.origin ?? "-"}`);
+    log(`dashboard:forbidden path=${url.pathname} method=${req.method ?? "-"} host=${headerValue(req.headers.host) ?? "-"} origin=${headerValue(req.headers.origin) ?? "-"} referer=${headerValue(req.headers.referer) ?? "-"}`);
     sendJson(res, { ok: false, error: "Forbidden" }, corsOrigin, 403);
     return;
   }
@@ -7286,7 +7361,7 @@ function handleDashboardRequest(db, port, req, res, options) {
     return;
   }
   if (url.pathname === "/") {
-    res.writeHead(200, { "Content-Type": "text/html" });
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", ...DASHBOARD_SECURITY_HEADERS });
     res.end(DASHBOARD_HTML);
     return;
   }

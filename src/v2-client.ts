@@ -1,7 +1,7 @@
 import type { PluginClient } from "./types"
 import { runCommand } from "./process"
 
-/** V2 plugin context subset Ensemble needs (structural, mock-friendly). */
+/** Structural subset of the REAL V2 plugin context that Ensemble consumes. */
 export interface V2Context {
   session: {
     create(input: Record<string, unknown>): Promise<{ id: string }>
