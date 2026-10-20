@@ -57,5 +57,5 @@ export async function executeTeamCreate(
   // TICKET-HARNESS-55 (Camada C): the tool result is the lead's first post-create
   // read, so it carries a direct reminder of the SAME sizing scaffold injected in
   // the system prompt (single source of truth: leadTopologySizingReminder).
-  return `Team "${args.name}" created. You are the lead. Para demandas de engenharia, convoque o squad canônico via team_spawn: Implementador, Hugo (testes determinísticos) e Clara (Quality Gate). Use team_tasks_add para planejar as frentes.\n\n${leadTopologySizingReminder()}`
+  return `Team "${args.name}" created. You are the lead. Para demandas de engenharia, convoque o squad canônico via team_spawn: implementadores especializados, engenheiro de testes determinísticos (SDET) e revisor de Quality Gate. Use team_tasks_add para planejar as frentes.\n\n${leadTopologySizingReminder()}`
 }

@@ -57,7 +57,7 @@ const TEAM_A = { name: "thsquad", lead: "ses_lead_hugo_a" };
 const TEAM_B = { name: "thactive", lead: "ses_lead_hugo_b" };
 const TEAM_C = { name: "thmulti", lead: "ses_lead_hugo_c" };
 
-const SQUAD_MARKER = "Implementador, Hugo (deterministic tests) and Clara (Quality Gate)";
+const SQUAD_MARKER = "specialized implementers, deterministic test engineer (SDET), and Quality Gate reviewer";
 const DISPATCH_MARKER =
   "Dispatch Hugo for deterministic tests (born in standby by default) and Clara for the Quality Gate.";
 const SDET_MSG = (team, name = "hugo") =>
@@ -220,8 +220,8 @@ async function runSuite() {
   const B = teamB.id;
   const C = teamC.id;
   check(
-    "Retorno de team_create menciona o squad canônico (Implementador, Hugo, Clara)",
-    createdC.includes("Implementador") && createdC.includes("Hugo") && createdC.includes("Clara"),
+    "Retorno de team_create menciona o squad canônico agnóstico",
+    createdC.includes("implementadores especializados") && createdC.includes("SDET") && createdC.includes("Quality Gate"),
     createdC.slice(0, 80) + "…",
   );
   check(

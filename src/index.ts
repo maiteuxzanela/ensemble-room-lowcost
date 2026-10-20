@@ -608,7 +608,7 @@ const plugin: Plugin = async (input) => {
     tool: {
       team_create: tool({
         description: "Create a new agent team. You become the team lead. Use this before spawning teammates. " +
-          "For engineering demands, convoke the canonical squad via team_spawn: Implementador, Hugo (deterministic tests) and Clara (Quality Gate).",
+          "For engineering demands, convoke the canonical squad via team_spawn: specialized implementers, deterministic test engineer (SDET), and Quality Gate reviewer.",
         args: {
           name: tool.schema.string().describe("Team name (lowercase alphanumeric with hyphens, 1-64 chars)"),
           project_name: tool.schema.string().optional().describe("Project display name for first use of this working directory. If omitted, a short random name is generated."),

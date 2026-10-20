@@ -83,7 +83,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
     editor.add({
       name: "team_create",
       description: "Create a new agent team. You become the team lead. Use this before spawning teammates. " +
-        "For engineering demands, convoke the canonical squad via team_spawn: Implementador, Hugo (deterministic tests) and Clara (Quality Gate).",
+        "For engineering demands, convoke the canonical squad via team_spawn: specialized implementers, deterministic test engineer (SDET), and Quality Gate reviewer.",
       input: {
         type: "object",
         properties: {

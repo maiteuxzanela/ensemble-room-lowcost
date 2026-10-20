@@ -2689,7 +2689,7 @@ async function executeTeamCreate(deps, args, sessionId) {
     "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)",
     [id, args.name, projectId, sessionId, now, now]
   );
-  return `Team "${args.name}" created. You are the lead. Para demandas de engenharia, convoque o squad can\xF4nico via team_spawn: Implementador, Hugo (testes determin\xEDsticos) e Clara (Quality Gate). Use team_tasks_add para planejar as frentes.
+  return `Team "${args.name}" created. You are the lead. Para demandas de engenharia, convoque o squad can\xF4nico via team_spawn: implementadores especializados, engenheiro de testes determin\xEDsticos (SDET) e revisor de Quality Gate. Use team_tasks_add para planejar as frentes.
 
 ${leadTopologySizingReminder()}`;
 }
@@ -5246,7 +5246,7 @@ async function registerV2Tools(domain, deps) {
   await domain.transform((editor) => {
     editor.add({
       name: "team_create",
-      description: "Create a new agent team. You become the team lead. Use this before spawning teammates. For engineering demands, convoke the canonical squad via team_spawn: Implementador, Hugo (deterministic tests) and Clara (Quality Gate).",
+      description: "Create a new agent team. You become the team lead. Use this before spawning teammates. For engineering demands, convoke the canonical squad via team_spawn: specialized implementers, deterministic test engineer (SDET), and Quality Gate reviewer.",
       input: {
         type: "object",
         properties: {
@@ -8544,7 +8544,7 @@ var plugin = async (input) => {
     // Register all team tools
     tool: {
       team_create: tool({
-        description: "Create a new agent team. You become the team lead. Use this before spawning teammates. For engineering demands, convoke the canonical squad via team_spawn: Implementador, Hugo (deterministic tests) and Clara (Quality Gate).",
+        description: "Create a new agent team. You become the team lead. Use this before spawning teammates. For engineering demands, convoke the canonical squad via team_spawn: specialized implementers, deterministic test engineer (SDET), and Quality Gate reviewer.",
         args: {
           name: tool.schema.string().describe("Team name (lowercase alphanumeric with hyphens, 1-64 chars)"),
           project_name: tool.schema.string().optional().describe("Project display name for first use of this working directory. If omitted, a short random name is generated.")
