@@ -34,7 +34,7 @@ Por isso, este repositório em `/mnt/94CCB337CCB3130A/ensemble-room-lowcost` exi
 
 ## 2. As 5 Blindagens Implementadas (sobre o upstream 0.18.0)
 
-O upstream `@hueyexe/opencode-ensemble@0.18.0` é funcional, mas **não foi projetado para operação de baixo custo de tokens**. As 5 melhorias abaixo foram implementadas em `src/` e homologadas com `326 checks determinísticos sem mocks` (`npm test`).
+O upstream `@hueyexe/opencode-ensemble@0.18.0` é funcional, mas **não foi projetado para operação de baixo custo de tokens**. As 5 melhorias abaixo foram implementadas em `src/` e homologadas pela **suíte determinística sem mocks** deste repositório — **46 arquivos de teste, milhares de verificações** (`npm test`, runner `tests/run_all.mjs`).
 
 ### Blindagem 1 — Standby Nativo (`standby: true`, spawn_context, zero tokens no spawn, despertar atômico)
 
@@ -44,7 +44,7 @@ O upstream `@hueyexe/opencode-ensemble@0.18.0` é funcional, mas **não foi proj
   - O **primeiro** `team_message`/`team_broadcast` destinado ao membro é o acordador: o texto de entrega recebe o `spawn_context` **prependado** e a transição `standby → starting` acontece via `UPDATE … WHERE execution_status = 'standby'` — **guarda idempotente de um-só-consumidor**: duas mensagens simultâneas não duplicam o init.
   - **Fail-safe**: se o `promptAsync` do wake falhar, o hook devolve a janela (`execution_status` volta a `'standby'`) para que uma retentativa ou a passada de recuperação de mensagens não entregues replayer o `spawn_context` em vez de um prompt vazio.
   - Nenhuma mensagem perdida: mensagens que chegam antes do wake ficam na fila e entram no mesmo turno.
-- **Garantia:** `tests/test_standby_lifecycle.mjs` (122 checks) — nascer em standby sem prompt, wake exatamente 1×, revert em falha de transporte, retentativas `retry_until` concluindo `standby → starting`.
+- **Garantia:** `tests/test_standby_lifecycle.mjs` (130 checks) — nascer em standby sem prompt, wake exatamente 1×, revert em falha de transporte, retentativas `retry_until` concluindo `standby → starting`.
 
 ### Blindagem 2 — Migration 12 (rebuild idempotente de schema com CHECK aceitando `'standby'`)
 
@@ -53,7 +53,7 @@ O upstream `@hueyexe/opencode-ensemble@0.18.0` é funcional, mas **não foi proj
   - Rebuild no padrão consolidado pela Migration 8: `RENAME → CREATE → copiar → DROP`, carregando **todas** as colunas adicionadas pelas Migrations 3–11 (`worktree_*`, `plan_approval`, `workspace_id`, `reported_to_lead`, `last_nudged_at`, `retry_*`, `spawn_context`) e **recriando os dois índices** que morrem junto com a tabela antiga.
   - O novo `CHECK` passa a aceitar `'standby'` entre os literais (`idle, starting, running, cancel_requested, cancelling, cancelled, completing, completed, failed, timed_out, standby`).
   - Executa em transação única no fluxo de `createDb`, portanto é **idempotente e atômica**: upgrade de banco legado e bootstrap limpo convergem para o mesmo schema.
-- **Garantia:** as três suítes aplicam o `MIGRATIONS` real num SQLite real (fresh e upgrade de banco de produção) e verificam contagem/paridade `src ↔ dist`.
+- **Garantia:** as suítes aplicam o `MIGRATIONS` real num SQLite real (fresh e upgrade de banco de produção) e verificam contagem/paridade `src ↔ dist`; a regressão encadeada das três suítes históricas cobre o caminho de spawn em standby.
 
 ### Blindagem 3 — Blindagem de Hooks (`shouldNudgeIdleMember` e `shouldAlarmFastIdle` suprimindo falsos alarmes para standby ou tarefas bloqueadas)
 
@@ -74,7 +74,7 @@ O upstream `@hueyexe/opencode-ensemble@0.18.0` é funcional, mas **não foi proj
   - **Imunidade a compaction:** `isSessionCompacting(sessionId)` lê `session.time_compacting` do store do OpenCode **read-only**; se `> 0`, a sessão não é abortada neste tick e é reavaliada no próximo (`watchdog:heartbeat:compacting`).
   - Compaction com valor `0` **não** goza da imunidade (corrida decidida corretamente); sessões genuinamente idle continuam transicionando para `error/timed_out` com aviso ao lead, toast e limpeza de worktree.
   - `ttlMs = 0` desliga o TTL mantendo o GC de worktrees; resiliência a store ausente/corrompido retorna `false` sem exceção.
-- **Garantia:** `tests/test_watchdog_heartbeat.mjs` (53 checks) — 4 cenários (active, compacting, idle, compaction=0) rodados **tanto contra `dist` quanto contra `src`**, com store `session` real extraído do `opencode.db` de produção.
+- **Garantia:** `tests/test_watchdog_heartbeat.mjs` (55 checks) — 4 cenários (active, compacting, idle, compaction=0) rodados **tanto contra `dist` quanto contra `src`**, com store `session` real materializado a partir da fixture versionada `tests/fixtures/session_schema.sql` (suíte hermética; não lê `~/.local/share/opencode/opencode.db`).
 
 ### Blindagem 5 — Silent Lead & Board Wake (`silentLead` default `true`, acúmulo passivo em SQLite `delivered=0`, supressão de `promptAsync` intermediário, despertar único sistemático quando `completed === total`)
 
@@ -103,12 +103,16 @@ Toda alteração neste repositório segue **obrigatoriamente** o ciclo abaixo, n
    ```bash
    npm run build
    ```
-   Gera `dist/index.js` (bundle via `bun build src/index.ts --outdir dist --target node`).
+   Gera `dist/index.js` via esbuild:
+   ```bash
+   esbuild src/index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/index.js
+   ```
+   `--packages=external` mantém as dependências npm (`@opencode-ai/*`, `solid-js`, `@opentui/*`) fora do bundle; `--format=esm` preserva o `"type": "module"` do `package.json`.
 
 3. **Testes determinísticos (sem mocks):**
    ```bash
    npm run check   # node --check dist/index.js
-   npm test        # node tests/run_all.mjs → 326 checks
+   npm test        # node tests/run_all.mjs → 46 suítes, milhares de checks
    ```
    Ambos devem sair com exit 0. Nenhum commit é permitido com teste falhando.
 
