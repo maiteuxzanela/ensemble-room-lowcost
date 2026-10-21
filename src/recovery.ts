@@ -214,28 +214,31 @@ export async function recoverUndeliveredMessages(
     for (const msg of messages) {
       // Resolve recipient session ID
       let recipientSessionId: string | undefined
+      // Bound once: every non-`continue` path below proves `toName` is a real
+      // string, so the delivery calls no longer need non-null assertions.
+      const toName = msg.to_name
 
-      if (msg.to_name === "lead") {
+      if (toName === "lead") {
         // Skip lead-bound messages — the system prompt transform delivers them
         continue
-      } else if (msg.to_name) {
-        const entry = registry.getByName(team.id, msg.to_name)
+      } else if (toName) {
+        const entry = registry.getByName(team.id, toName)
         recipientSessionId = entry?.sessionId
       } else {
         // Broadcast — skip for now, broadcasts are best-effort
         continue
       }
 
-      if (!recipientSessionId) continue
+      if (!recipientSessionId || !toName) continue
 
       // Skip delivery to teammates who have already reported completion (issue #3)
-      if (hasReportedCompletion(db, team.id, msg.to_name!)) {
+      if (hasReportedCompletion(db, team.id, toName)) {
         markDelivered(db, msg.id)
         continue
       }
 
       try {
-        const recipientModel = getMemberModel(db, team.id, msg.to_name)
+        const recipientModel = getMemberModel(db, team.id, toName)
         // TICKET-HARNESS-36 (P3): a recovered message must be able to wake a
         // member that is still in standby WITHOUT amnesia. resolveStandbyWake
         // prepends the member's spawn_context and atomically flips
@@ -245,7 +248,7 @@ export async function recoverUndeliveredMessages(
         const wake = resolveStandbyWake(
           db,
           team.id,
-          msg.to_name!,
+          toName,
           `[Recovered team message from ${msg.from_name}]: ${msg.content}`,
         )
         await client.session.promptAsync({

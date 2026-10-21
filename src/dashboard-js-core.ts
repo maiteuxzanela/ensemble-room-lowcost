@@ -12,7 +12,7 @@ async function sendChatMessage(text, target) {
     const teamId = t ? t.id : '';
     const res = await fetch('/api/chat/send', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-ensemble-token': (typeof window !== 'undefined' && window.__ENSEMBLE_TOKEN__) || '' },
       body: JSON.stringify({ teamId, text, to: target })
     });
     if (!res.ok) throw new Error('Chat send failed: ' + res.statusText);

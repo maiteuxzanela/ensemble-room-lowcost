@@ -72,7 +72,10 @@ function writePendingDecisions(db: Database, teamId: string, entries: PendingLea
     )
     return
   }
-  const latest = entries[entries.length - 1]!
+  // Defensive re-check (the empty case returns above): `latest` must exist
+  // before its fields are written into the mirror columns.
+  const latest = entries[entries.length - 1]
+  if (!latest) return
   db.run(
     "UPDATE team SET awaiting_lead_decision = 1, awaiting_decision_members = ?, awaiting_decision_member = ?, awaiting_decision_at = ?, time_updated = ? WHERE id = ?",
     [JSON.stringify(entries), latest.member, latest.at, now, teamId],
@@ -100,8 +103,10 @@ export function markAwaitingLeadDecision(
   const idx = entries.findIndex((e) => e.member === memberName)
   const incomingPayload = payload ?? ""
   let duplicate = false
-  if (idx >= 0) {
-    const existing = entries[idx]!
+  // `entries[idx]` is only material when findIndex located it; the else path
+  // (idx === -1) appends the fresh raise — same behaviour as before, minus `!`.
+  const existing = idx >= 0 ? entries[idx] : undefined
+  if (existing) {
     duplicate = incomingPayload.length > 0 && existing.payload === incomingPayload
     entries[idx] = { member: memberName, at: now, payload: incomingPayload || existing.payload }
   } else {
@@ -246,7 +251,8 @@ export async function executeDecisionLead(
   const ctx = resolveLeadWakeContext(deps.db, teamInfo.teamId)
   if (ctx) {
     const chain = resolveFallbackChainForAgent(deps.config, ctx.leadAgent)
-    const primaryModel = chain.length > 0 ? formatModelSelector(chain[0]!) : undefined
+    const firstModel = chain[0]
+    const primaryModel = firstModel !== undefined ? formatModelSelector(firstModel) : undefined
     promptModelAwareWake(deps.client, {
       sessionID: ctx.leadSessionId,
       text: payload,

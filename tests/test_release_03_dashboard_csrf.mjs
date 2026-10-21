@@ -16,7 +16,7 @@
  * OpenCode reduzido a um recorder de `session.abort` / `session.promptAsync`.
  * Nenhuma decisão de produção é substituída.
  *
- * Cobertura do gate Host/Origin/Referer:
+ * Cobertura do gate Host/Origin/Referer + session token:
  *   (A) Host: loopback desta porta (com/sem porta) aceito; host remoto, porta
  *       divergente, sufixo (`localhost.evil.com`), userinfo e path recusados
  *       com 403 ANTES de qualquer handler.
@@ -31,6 +31,12 @@
  *   (F) Paridade src↔dist dos literais do gate + varredura anti-mock.
  *   (G) Prova de mutação M1..M7 no bundle dist: cada mutante derruba as
  *       sentinelas do seu alvo e preserva os fluxos legítimos intactos.
+ *   (H) TICKET-RELEASE-08 — session token: endpoint /api/session-token (48
+ *       hex, estável por servidor), 401 em mutação sem/ com token inválido
+ *       sem efeito colateral, os três canais de aceitação (Bearer,
+ *       x-ensemble-token, ?token=) com sucesso, reads sem token, token
+ *       injetado no HTML do console, 401 sem vazar o token; mutação M8 prova
+ *       a sensibilidade do gate.
  *
  * Uso: node tests/test_release_03_dashboard_csrf.mjs
  * Exit: 0 = todos os checks PASS; 1 = existe FAIL / rejection não tratada.
@@ -87,18 +93,25 @@ const REAL = await import(path.join(TMP, "_release03_harness.mjs"));
 // ---------------------------------------------------------------------------
 // 1. Transporte HTTP real (socket cru: Host forjável).
 // ---------------------------------------------------------------------------
-function dechunk(body) {
-  let out = "";
+/**
+ * Dechunk HTTP/1.1 em BYTES (Buffer) — nunca em string decodificada.
+ * O tamanho declarado do chunk é contagem de BYTES: com corpo UTF-8 multibyte
+ * (acentos nas mensagens do sistema), dechunk em caracteres estoura o limite
+ * do chunk e engole o terminador final (`0\r\n\r\n`), deixando o JSON.parse
+ * com "non-whitespace character after JSON".
+ */
+function dechunk(buf) {
+  const parts = [];
   let i = 0;
-  while (i < body.length) {
-    const nl = body.indexOf("\r\n", i);
+  while (i < buf.length) {
+    const nl = buf.indexOf("\r\n", i);
     if (nl < 0) break;
-    const size = Number.parseInt(body.slice(i, nl).trim(), 16);
+    const size = Number.parseInt(buf.subarray(i, nl).toString("latin1").trim(), 16);
     if (!Number.isFinite(size) || size <= 0) break;
-    out += body.slice(nl + 2, nl + 2 + size);
+    parts.push(buf.subarray(nl + 2, nl + 2 + size));
     i = nl + 2 + size + 2;
   }
-  return out;
+  return Buffer.concat(parts);
 }
 
 function parseHeaders(headPart) {
@@ -114,6 +127,8 @@ function parseHeaders(headPart) {
 /**
  * Requisição HTTP/1.1 crua. `host: undefined` OMITE o cabeçalho Host (o parser
  * do Node responde 400 antes do handler — não é um caminho do nosso gate).
+ * `headers` adiciona cabeçalhos extras (ex.: Authorization Bearer,
+ * x-ensemble-token) — usado pelo TICKET-RELEASE-08.
  */
 function rawRequest(port, {
   method = "GET",
@@ -123,10 +138,10 @@ function rawRequest(port, {
   referer,
   contentType,
   body,
+  headers,
 } = {}) {
   return new Promise((resolve) => {
     const socket = net.connect(port, "127.0.0.1");
-    let raw = "";
     let settled = false;
     const fin = (val) => {
       if (settled) return;
@@ -134,12 +149,12 @@ function rawRequest(port, {
       try { socket.destroy(); } catch { /* já fechado */ }
       resolve(val);
     };
-    socket.setEncoding("utf8");
     socket.on("connect", () => {
       const head = [`${method} ${reqPath} HTTP/1.1`];
       if (host !== undefined) head.push(`Host: ${host}`);
       if (origin !== undefined) head.push(`Origin: ${origin}`);
       if (referer !== undefined) head.push(`Referer: ${referer}`);
+      for (const [name, value] of Object.entries(headers ?? {})) head.push(`${name}: ${value}`);
       if (body !== undefined) {
         if (contentType !== undefined) head.push(`Content-Type: ${contentType}`);
         head.push(`Content-Length: ${Buffer.byteLength(body)}`);
@@ -147,17 +162,31 @@ function rawRequest(port, {
       head.push("Connection: close");
       socket.write(head.join("\r\n") + "\r\n\r\n" + (body ?? ""));
     });
-    socket.on("data", (d) => { raw += d; });
+    // Bytes crus (sem setEncoding): cabeçalho e dechunk operam sobre o
+    // comprimento em BYTES — só o corpo final é decodificado em UTF-8.
+    const buffers = [];
+    socket.on("data", (d) => { buffers.push(Buffer.isBuffer(d) ? d : Buffer.from(d)); });
     socket.on("end", () => {
-      const idx = raw.indexOf("\r\n\r\n");
-      const headPart = idx >= 0 ? raw.slice(0, idx) : raw;
-      let bodyPart = idx >= 0 ? raw.slice(idx + 4) : "";
+      const rawBuf = Buffer.concat(buffers);
+      const rawStr = rawBuf.toString("latin1");
+      const idx = rawStr.indexOf("\r\n\r\n");
+      const headPart = idx >= 0 ? rawStr.slice(0, idx) : rawStr;
+      let bodyBuf = idx >= 0 ? rawBuf.subarray(idx + 4) : Buffer.alloc(0);
       const headers = parseHeaders(headPart);
-      if (/chunked/i.test(headers.get("transfer-encoding") ?? "")) bodyPart = dechunk(bodyPart);
+      const rawBodyHead = bodyBuf.subarray(0, 24).toString("latin1");
+      const crlfCount = (rawStr.match(/\r\n/g) ?? []).length;
+      if (/chunked/i.test(headers.get("transfer-encoding") ?? "")) bodyBuf = dechunk(bodyBuf);
+      const bodyPart = bodyBuf.toString("utf8");
       const status = Number((headPart.split("\r\n")[0] || "").split(" ")[1] ?? 0);
       let json = null;
-      try { json = JSON.parse(bodyPart); } catch { /* html/plain */ }
-      fin({ status, body: bodyPart, json, headers });
+      let parseErr = null;
+      try { json = JSON.parse(bodyPart); } catch (e) { parseErr = e?.message ?? String(e); }
+      fin({
+        status, body: bodyPart, json, headers, parseErr,
+        rawTail: rawBuf.subarray(-50).toString("latin1"),
+        rawHead: rawStr.slice(0, 80),
+        rawBodyHead, crlfCount,
+      });
     });
     socket.on("error", () => fin({ status: 0, body: "", json: null, headers: new Map() }));
     setTimeout(() => fin({ status: 0, body: "", json: null, headers: new Map() }), 5000);
@@ -237,8 +266,91 @@ async function runFlow(mod) {
     const PAUSE_MEMBER = JSON.stringify({ teamId: "t1", memberName: "hugo" });
     const PAUSE_ROOM = JSON.stringify({ teamId: "t1" });
 
-    // ---------------- (A) Host gate: aceitos legítimos ----------------
+    // ---------------- (H) TICKET-RELEASE-08 — session token ----------------
+    // O token é obtido pelo MESMO canal que o tooling local usa (leitura com
+    // gate Host/Origin loopback) e nunca é presumido pelo teste.
+    let rrToken = await rawRequest(port, { method: "GET", path: "/api/session-token", host: localHost });
+    R("token.endpoint-200", rrToken.status === 200 && typeof rrToken.json?.token === "string", `status=${rrToken.status}`);
+    const TOKEN = rrToken.json?.token ?? "";
+    // 24 bytes via crypto.randomBytes(24).toString("hex") → 48 chars hex.
+    R("token.entropy-192bit", /^[0-9a-f]{48}$/.test(TOKEN), `len=${TOKEN.length}`);
+    rrToken = await rawRequest(port, { method: "GET", path: "/api/session-token", host: localHost });
+    R("token.stable-per-server", rrToken.json?.token === TOKEN, "token muda entre chamadas ao mesmo servidor");
+
+    // Leitura segue SEM token (contrato: gate Host/Origin basta para reads).
     let rr = await rawRequest(port, { method: "GET", path: "/api/health", host: localHost });
+    R("token.read-health-without-token-200", rr.status === 200, `status=${rr.status}`);
+    rr = await rawRequest(port, { method: "GET", path: "/api/state", host: localHost });
+    R("token.read-state-without-token-200", rr.status === 200 && rr.json?.version === 1, `status=${rr.status}`);
+
+    // 401 em toda mutação sem token ou com token inválido — ANTES de efeito
+    // colateral (nenhuma mensagem persistida, nenhum abort disparado).
+    const beforeTokChat = countMessages();
+    rr = await rawRequest(port, { method: "POST", path: "/api/chat/send", host: localHost, contentType: "application/json", body: CHAT });
+    R("token.chat-missing-401", rr.status === 401 && rr.json?.ok === false && rr.json?.code === "unauthorized", `status=${rr.status} body=${rr.body}`);
+    R("token.chat-missing-no-persist", countMessages() === beforeTokChat, `before=${beforeTokChat} after=${countMessages()}`);
+    R("token.401-no-leak", !rr.body.includes(TOKEN), "a resposta 401 não pode vazar o token real");
+
+    rr = await rawRequest(port, {
+      method: "POST", path: "/api/chat/send", host: localHost,
+      headers: { Authorization: `Bearer deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbe` },
+      contentType: "application/json", body: CHAT,
+    });
+    R("token.chat-invalid-401", rr.status === 401 && rr.json?.code === "unauthorized", `status=${rr.status}`);
+    R("token.chat-invalid-no-persist", countMessages() === beforeTokChat, `before=${beforeTokChat} after=${countMessages()}`);
+
+    const abortsBeforeTok = aborts.length;
+    rr = await rawRequest(port, {
+      method: "POST", path: "/api/emergency/pause-member", host: localHost,
+      contentType: "application/json", body: PAUSE_MEMBER,
+    });
+    R("token.emergency-missing-401", rr.status === 401 && rr.json?.code === "unauthorized", `status=${rr.status}`);
+    R("token.emergency-missing-no-abort", aborts.length === abortsBeforeTok && memberExec() === "idle", `aborts=${aborts.length} exec=${memberExec()}`);
+
+    rr = await rawRequest(port, {
+      method: "POST", path: "/api/emergency/pause-room", host: localHost,
+      headers: { "x-ensemble-token": `00000000000000000000000000000000000000000000000${TOKEN.slice(0, -1)}` },
+      contentType: "application/json", body: PAUSE_ROOM,
+    });
+    R("token.emergency-invalid-401", rr.status === 401 && rr.json?.code === "unauthorized", `status=${rr.status}`);
+    R("token.emergency-invalid-no-abort", aborts.length === abortsBeforeTok && taskStatus() === "in_progress", `aborts=${aborts.length} task=${taskStatus()}`);
+
+    // Os três canais de aceitação (Authorization Bearer, x-ensemble-token e
+    // ?token=) devem autenticar a MESMA mutação com sucesso — um por canal.
+    const beforeBearer = countMessages();
+    rr = await rawRequest(port, {
+      method: "POST", path: "/api/chat/send", host: localHost,
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      contentType: "application/json", body: CHAT,
+    });
+    R("token.valid-bearer-200", rr.status === 200 && rr.json?.ok === true && countMessages() === beforeBearer + 1, `status=${rr.status}`);
+
+    const beforeHeader = countMessages();
+    rr = await rawRequest(port, {
+      method: "POST", path: "/api/chat/send", host: localHost,
+      headers: { "x-ensemble-token": TOKEN },
+      contentType: "application/json", body: CHAT,
+    });
+    R("token.valid-header-200", rr.status === 200 && rr.json?.ok === true && countMessages() === beforeHeader + 1, `status=${rr.status}`);
+
+    const beforeQuery = countMessages();
+    rr = await rawRequest(port, {
+      method: "POST", path: `/api/chat/send?token=${TOKEN}`, host: localHost,
+      contentType: "application/json", body: CHAT,
+    });
+    R("token.valid-query-200", rr.status === 200 && countMessages() === beforeQuery + 1, `status=${rr.status}`);
+
+    // O console HTML carrega o token injetado (window.__ENSEMBLE_TOKEN__) para
+    // o script embutido autenticar o chat — e apenas para o cliente loopback.
+    rr = await rawRequest(port, { method: "GET", path: "/", host: localHost });
+    R(
+      "token.html-injected",
+      rr.status === 200 && rr.body.includes(`window.__ENSEMBLE_TOKEN__=${JSON.stringify(TOKEN)}`),
+      `status=${rr.status} injecao=${rr.body.includes("window.__ENSEMBLE_TOKEN__")}`,
+    );
+
+    // ---------------- (A) Host gate: aceitos legítimos ----------------
+    rr = await rawRequest(port, { method: "GET", path: "/api/health", host: localHost });
     R("host.ipv4-200", rr.status === 200 && rr.json?.ensemble === true, `status=${rr.status}`);
 
     rr = await rawRequest(port, { method: "GET", path: "/api/health", host: "localhost" });
@@ -252,7 +364,7 @@ async function runFlow(mod) {
 
     // Cliente local direto (curl/TUI/SDK): sem Origin e sem Referer.
     rr = await rawRequest(port, { method: "GET", path: "/api/state", host: localHost });
-    R("state.no-origin-200", rr.status === 200 && rr.json?.version === 1, `status=${rr.status}`);
+    R("state.no-origin-200", rr.status === 200 && rr.json?.version === 1, `status=${rr.status} ver=${rr.json?.version} len=${rr.body.length} err=${rr.parseErr ?? "-"} bodyHead=${JSON.stringify(rr.rawBodyHead ?? "")} crlfs=${rr.crlfCount} rawTail=${JSON.stringify(rr.rawTail ?? "")}`);
 
     // ---------------- (A) Host gate: recusados ----------------
     rr = await rawRequest(port, { method: "GET", path: "/api/state", host: `evil.example.com:${port}` });
@@ -294,7 +406,7 @@ async function runFlow(mod) {
     R("origin.https-local-403", rr.status === 403, `status=${rr.status}`);
 
     rr = await rawRequest(port, { method: "GET", path: "/api/state", host: localHost, origin: localOrigins[0] });
-    R("origin.localhost-200", rr.status === 200 && rr.json?.version === 1, `status=${rr.status}`);
+    R("origin.localhost-200", rr.status === 200 && rr.json?.version === 1, `status=${rr.status} ver=${rr.json?.version} len=${rr.body.length}`);
     R(
       "origin.cors-reflects-local",
       rr.headers.get("access-control-allow-origin") === localOrigins[0],
@@ -321,6 +433,7 @@ async function runFlow(mod) {
     const beforeMessages = countMessages();
     rr = await rawRequest(port, {
       method: "POST", path: "/api/chat/send", host: localHost, origin: "null",
+      headers: { "x-ensemble-token": TOKEN },
       contentType: "application/json", body: CHAT,
     });
     R("origin.null-json-post-200", rr.status === 200 && rr.json?.ok === true, `status=${rr.status}`);
@@ -329,6 +442,7 @@ async function runFlow(mod) {
     const beforeText = countMessages();
     rr = await rawRequest(port, {
       method: "POST", path: "/api/chat/send", host: localHost, origin: "null",
+      headers: { "x-ensemble-token": TOKEN },
       contentType: "text/plain", body: CHAT,
     });
     R("origin.null-text-plain-403", rr.status === 403, `status=${rr.status}`);
@@ -336,6 +450,7 @@ async function runFlow(mod) {
 
     rr = await rawRequest(port, {
       method: "POST", path: "/api/chat/send", host: localHost, origin: "null",
+      headers: { "x-ensemble-token": TOKEN },
       contentType: "application/x-www-form-urlencoded", body: CHAT,
     });
     R("origin.null-form-403", rr.status === 403, `status=${rr.status}`);
@@ -343,6 +458,7 @@ async function runFlow(mod) {
     const beforeSuffix = countMessages();
     rr = await rawRequest(port, {
       method: "POST", path: "/api/chat/send", host: localHost, origin: "null",
+      headers: { "x-ensemble-token": TOKEN },
       contentType: "application/vnd.api+json", body: CHAT,
     });
     R("origin.null-json-suffix-200", rr.status === 200 && countMessages() === beforeSuffix + 1, `status=${rr.status}`);
@@ -367,23 +483,33 @@ async function runFlow(mod) {
     R("referer.origin-precedence-200", rr.status === 200, `status=${rr.status}`);
 
     // ---------------- (E) Rotas de emergência herdam o gate ----------------
+    // As requisições hostis carregam o token válido de PROPÓSITO: cada prova
+    // de mutação isola UM gate (o outro permanece intacto), então remover o
+    // gate de origem/host sem token seria mascarado pelo gate de token — e
+    // vice-versa. Aqui (fluxo real) o gate de origem/host responde 403 ANTES
+    // do token ser sequer olhado.
     const abortsBefore = aborts.length;
     rr = await rawRequest(port, {
       method: "POST", path: "/api/emergency/pause-member", host: localHost,
-      origin: "http://evil.example.com", contentType: "application/json", body: PAUSE_MEMBER,
+      origin: "http://evil.example.com",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      contentType: "application/json", body: PAUSE_MEMBER,
     });
     R("origin.remote-emergency-403", rr.status === 403, `status=${rr.status}`);
     R("origin.remote-emergency-no-abort", aborts.length === abortsBefore, `aborts=${aborts.length}`);
 
     rr = await rawRequest(port, {
       method: "POST", path: "/api/emergency/pause-room", host: `evil.example.com:${port}`,
+      headers: { Authorization: `Bearer ${TOKEN}` },
       contentType: "application/json", body: PAUSE_ROOM,
     });
     R("host.forged-emergency-403", rr.status === 403, `status=${rr.status}`);
 
     rr = await rawRequest(port, {
       method: "POST", path: "/api/emergency/pause-room", host: localHost,
-      referer: "http://evil.example.com/page", contentType: "application/json", body: PAUSE_ROOM,
+      referer: "http://evil.example.com/page",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      contentType: "application/json", body: PAUSE_ROOM,
     });
     R("referer.remote-emergency-403", rr.status === 403, `status=${rr.status}`);
 
@@ -440,9 +566,12 @@ async function runFlow(mod) {
     R("gate.forged-activity-403", rr.status === 403, `status=${rr.status}`);
 
     // ---------------- Legítimos NÃO são over-blocked ----------------
+    // Cada mutação legítima usa um CANAL de token diferente (Bearer, header
+    // x-ensemble-token, query ?token=) — os três canais ficam cobertos.
     const beforeChatLegit = countMessages();
     rr = await rawRequest(port, {
       method: "POST", path: "/api/chat/send", host: localHost,
+      headers: { Authorization: `Bearer ${TOKEN}` },
       contentType: "application/json", body: CHAT,
     });
     R("chat.legit-no-origin-200", rr.status === 200 && countMessages() === beforeChatLegit + 1, `status=${rr.status}`);
@@ -450,13 +579,15 @@ async function runFlow(mod) {
     const abortsBeforeLegit = aborts.length;
     rr = await rawRequest(port, {
       method: "POST", path: "/api/emergency/pause-member", host: localHost,
-      origin: localOrigins[1], contentType: "application/json", body: PAUSE_MEMBER,
+      origin: localOrigins[1],
+      headers: { "x-ensemble-token": TOKEN },
+      contentType: "application/json", body: PAUSE_MEMBER,
     });
     R("emergency.legit-member-200", rr.status === 200 && rr.json?.paused === "hugo", `status=${rr.status}`);
     R("emergency.legit-member-aborted", aborts.includes("ses_hugo") && aborts.length === abortsBeforeLegit + 1, `aborts=${aborts.length}`);
 
     rr = await rawRequest(port, {
-      method: "POST", path: "/api/emergency/pause-room", host: localHost,
+      method: "POST", path: `/api/emergency/pause-room?token=${TOKEN}`, host: localHost,
       referer: `http://localhost:${port}/dash`, contentType: "application/json", body: PAUSE_ROOM,
     });
     R("emergency.legit-room-200", rr.status === 200 && Array.isArray(rr.json?.pausedMembers), `status=${rr.status}`);
@@ -495,6 +626,14 @@ const PARITY_LITERALS = [
   "STATE_CHANGING_METHODS",
   'res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", ...DASHBOARD_SECURITY_HEADERS })',
   "if (!isTrustedLocalRequest(port, req)) {",
+  // TICKET-RELEASE-08 — session token.
+  "mintSessionToken",
+  "extractSessionToken",
+  "isSessionTokenValid",
+  "MUTATING_ROUTES",
+  "/api/session-token",
+  "window.__ENSEMBLE_TOKEN__",
+  "Unauthorized: valid session token required",
 ];
 for (const literal of PARITY_LITERALS) {
   check(
@@ -595,6 +734,22 @@ const MUTATIONS = [
     ],
     unaffected: ["host.ipv4-200", "root.200-html-charset", "origin.localhost-200", "chat.legit-no-origin-200", "emergency.legit-member-200"],
   },
+  {
+    id: "M8",
+    desc: "gate do session token removido (mutação sem token passa a executar)",
+    from: "if (isStateChangingMethod(req.method) && isMutatingRoute(url.pathname) && !isSessionTokenValid(extractSessionToken(req, url), sessionToken)) {",
+    to: "if (false) {",
+    detect: [
+      "token.chat-missing-401", "token.chat-missing-no-persist",
+      "token.chat-invalid-401", "token.chat-invalid-no-persist",
+      "token.emergency-missing-401", "token.emergency-missing-no-abort",
+      "token.emergency-invalid-401", "token.emergency-invalid-no-abort",
+    ],
+    unaffected: [
+      "token.endpoint-200", "token.entropy-192bit", "token.read-health-without-token-200",
+      "host.ipv4-200", "state.no-origin-200", "token.html-injected", "origin.localhost-200",
+    ],
+  },
 ];
 
 for (const m of MUTATIONS) {
@@ -629,7 +784,9 @@ for (const m of MUTATIONS) {
   check(
     `${m.id}: mutação cirúrgica — fluxos intactos preservados`,
     broken.length === 0,
-    broken.length ? `quebrou: ${broken.join(", ")}` : `${m.unaffected.length}/${m.unaffected.length} verdes preservados`,
+    broken.length
+      ? `quebrou: ${broken.map((n) => `${n}(${mutatedFlow.get(n)?.detail || "sem detalhe"})`).join(", ")}`
+      : `${m.unaffected.length}/${m.unaffected.length} verdes preservados`,
   );
 }
 

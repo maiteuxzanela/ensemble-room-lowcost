@@ -14,7 +14,7 @@ export function parseTaskResult(content: string): TaskResult | null {
   const match = content.match(/<task-result>([\s\S]*?)<\/task-result>/)
   if (!match) return null
 
-  const inner = match[1]!
+  const inner = match[1] ?? ""
   const status = inner.match(/<status>([\s\S]*?)<\/status>/)?.[1]?.trim()
   const summary = inner.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.trim()
   const details = inner.match(/<details>([\s\S]*?)<\/details>/)?.[1]?.trim()

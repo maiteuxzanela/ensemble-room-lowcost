@@ -509,11 +509,14 @@ for (const [scn, map] of Object.entries(DIST_MAPS)) {
     const diana = cfg.fallbackModelsByAgent?.diana ?? [];
     const hugo = cfg.fallbackModelsByAgent?.hugo ?? [];
     const clara = cfg.fallbackModelsByAgent?.clara ?? [];
+    // Cadeia canônica de Hugo e Clara (1º salto pago deepseek#low). A entrada
+    // "opencode/glm-5.3-flash-free" foi REMOVIDA por diretriz da Fundadora
+    // (glm removido das cadeias de Diana, Hugo e Clara) — o config vivo desta
+    // máquina já reflete a cadeia sem glm (5 entradas).
     const HUGO_CLARA_CHAIN = [
       "opencode/deepseek-v4.1-flash-free",
       "opencode-go/deepseek-v4.1-flash#low",
       "opencode/mimo-v2.6-flash-free",
-      "opencode/glm-5.3-flash-free",
       "opencode-go/mimo-v2.6-flash",
       "google/antigravity-gemini-3.8-flash#low",
     ];

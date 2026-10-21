@@ -104,31 +104,40 @@ function tcpProbe(port, host) {
   });
 }
 
-function dechunk(body) {
-  let out = "";
+/**
+ * Dechunk HTTP/1.1 em BYTES (Buffer) — nunca em string decodificada: o tamanho
+ * do chunk é contagem de BYTES e corpo UTF-8 multibyte (acentos) estouraria o
+ * limite da fatia em caracteres, engolindo o terminador final do chunked.
+ */
+function dechunk(buf) {
+  const parts = [];
   let i = 0;
-  while (i < body.length) {
-    const nl = body.indexOf("\r\n", i);
+  while (i < buf.length) {
+    const nl = buf.indexOf("\r\n", i);
     if (nl < 0) break;
-    const size = Number.parseInt(body.slice(i, nl).trim(), 16);
+    const size = Number.parseInt(buf.subarray(i, nl).toString("latin1").trim(), 16);
     if (!Number.isFinite(size) || size <= 0) break;
-    out += body.slice(nl + 2, nl + 2 + size);
+    parts.push(buf.subarray(nl + 2, nl + 2 + size));
     i = nl + 2 + size + 2;
   }
-  return out;
+  return Buffer.concat(parts);
 }
 
-function rawRequest(port, { method = "GET", path: reqPath = "/", host, origin, body } = {}) {
+/**
+ * Requisição HTTP/1.1 crua via socket — permite forjar o cabeçalho Host.
+ * `headers` adiciona cabeçalhos extras (x-ensemble-token do TICKET-RELEASE-08).
+ * Recepção em BYTES (sem setEncoding) para dechunk/cabeçalho precisos.
+ */
+function rawRequest(port, { method = "GET", path: reqPath = "/", host, origin, body, headers } = {}) {
   return new Promise((resolve) => {
     const socket = net.connect(port, "127.0.0.1");
-    let raw = "";
     let settled = false;
     const fin = (val) => { if (!settled) { settled = true; try { socket.destroy(); } catch { /* já fechado */ } resolve(val); } };
-    socket.setEncoding("utf8");
     socket.on("connect", () => {
       const head = [`${method} ${reqPath} HTTP/1.1`];
       if (host !== undefined) head.push(`Host: ${host}`);
       if (origin !== undefined) head.push(`Origin: ${origin}`);
+      for (const [name, value] of Object.entries(headers ?? {})) head.push(`${name}: ${value}`);
       if (body !== undefined) {
         head.push("Content-Type: application/json");
         head.push(`Content-Length: ${Buffer.byteLength(body)}`);
@@ -136,12 +145,16 @@ function rawRequest(port, { method = "GET", path: reqPath = "/", host, origin, b
       head.push("Connection: close");
       socket.write(head.join("\r\n") + "\r\n\r\n" + (body ?? ""));
     });
-    socket.on("data", (d) => { raw += d; });
+    const buffers = [];
+    socket.on("data", (d) => { buffers.push(Buffer.isBuffer(d) ? d : Buffer.from(d)); });
     socket.on("end", () => {
-      const idx = raw.indexOf("\r\n\r\n");
-      const headPart = idx >= 0 ? raw.slice(0, idx) : raw;
-      let bodyPart = idx >= 0 ? raw.slice(idx + 4) : "";
-      if (/transfer-encoding:\s*chunked/i.test(headPart)) bodyPart = dechunk(bodyPart);
+      const rawBuf = Buffer.concat(buffers);
+      const rawStr = rawBuf.toString("latin1");
+      const idx = rawStr.indexOf("\r\n\r\n");
+      const headPart = idx >= 0 ? rawStr.slice(0, idx) : rawStr;
+      let bodyBuf = idx >= 0 ? rawBuf.subarray(idx + 4) : Buffer.alloc(0);
+      if (/transfer-encoding:\s*chunked/i.test(headPart)) bodyBuf = dechunk(bodyBuf);
+      const bodyPart = bodyBuf.toString("utf8");
       const status = Number((headPart.split("\r\n")[0] || "").split(" ")[1] ?? 0);
       let json = null;
       try { json = JSON.parse(bodyPart); } catch { /* html/plain */ }
@@ -328,10 +341,14 @@ async function runFlow(mod) {
     seedTask("t-progress", "Implementar dashboard H52", "in_progress", "medium", "cris");
     seedTask("t-pending", "Aguardando claims", "pending", "low", null);
     seedTask("t-done", "Concluir migracao 19", "completed", "medium", "cris");
+    // TICKET-RELEASE-08/QG: query 100% estática içada para fora do template
+    // (mensagem do check reutiliza a variável — mesma asserção, zero SQL em
+    // template literal).
+    const inReviewCount = db.query("SELECT COUNT(*) c FROM team_task WHERE status = 'in_review'").get().c;
     R(
       "m19.in-review-insert-accepted",
-      db.query("SELECT COUNT(*) c FROM team_task WHERE status = 'in_review'").get().c === 1,
-      `in_review=${db.query("SELECT COUNT(*) c FROM team_task WHERE status = 'in_review'").get().c}`,
+      inReviewCount === 1,
+      `in_review=${inReviewCount}`,
     );
 
     // Atividade real no buffer.
@@ -339,6 +356,11 @@ async function runFlow(mod) {
 
     server = await startDashboard(db, port, { client, activityBuffer });
     R("server.started", server !== null, `port=${port}`);
+
+    // TICKET-RELEASE-08 — session token exigido em toda mutação (/api/chat/send).
+    const tokRes = await rawRequest(port, { method: "GET", path: "/api/session-token", host: `127.0.0.1:${port}` });
+    const TOKEN = tokRes.json?.token ?? "";
+    R("token.session-endpoint", tokRes.status === 200 && /^[0-9a-f]{48}$/.test(TOKEN), `status=${tokRes.status}`);
 
     // ---------------- (1/3) Endpoints + serialização in_review ----------------
     let rr = await rawRequest(port, { method: "GET", path: "/api/health", host: `127.0.0.1:${port}` });
@@ -396,7 +418,7 @@ async function runFlow(mod) {
       try {
         const res = await fetch(`http://127.0.0.1:${port}/api/chat/send`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "x-ensemble-token": TOKEN },
           body: JSON.stringify(payload),
         });
         const text = await res.text();
@@ -501,8 +523,11 @@ async function runFlow(mod) {
     R("gate.origin-mismatch-403", rr.status === 403, `status=${rr.status}`);
 
     const before = countMessages();
+    // Hostil carrega o token VÁLIDO de propósito: cada mutação isola UM gate
+    // (Host/Origin × session token — no fluxo real o Host responde 403 ANTES).
     rr = await rawRequest(port, {
       method: "POST", path: "/api/chat/send", host: `evil.example.com:${port}`,
+      headers: { Authorization: `Bearer ${TOKEN}` },
       body: JSON.stringify({ teamId: "t1", to: "hugo", text: "invasao" }),
     });
     R("gate.chat-forged-403", rr.status === 403, `status=${rr.status}`);

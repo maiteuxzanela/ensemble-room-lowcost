@@ -111,33 +111,40 @@ function tcpProbe(port, host) {
   });
 }
 
-/** Decodifica um corpo HTTP/1.1 com Transfer-Encoding: chunked. */
-function dechunk(body) {
-  let out = "";
+/**
+ * Decodifica um corpo HTTP/1.1 com Transfer-Encoding: chunked em BYTES
+ * (Buffer): o tamanho declarado do chunk é contagem de BYTES — dechunk em
+ * string decodificada estoura o limite com corpo UTF-8 multibyte (acentos).
+ */
+function dechunk(buf) {
+  const parts = [];
   let i = 0;
-  while (i < body.length) {
-    const nl = body.indexOf("\r\n", i);
+  while (i < buf.length) {
+    const nl = buf.indexOf("\r\n", i);
     if (nl < 0) break;
-    const size = Number.parseInt(body.slice(i, nl).trim(), 16);
+    const size = Number.parseInt(buf.subarray(i, nl).toString("latin1").trim(), 16);
     if (!Number.isFinite(size) || size <= 0) break;
-    out += body.slice(nl + 2, nl + 2 + size);
+    parts.push(buf.subarray(nl + 2, nl + 2 + size));
     i = nl + 2 + size + 2; // pula o CRLF final do chunk
   }
-  return out;
+  return Buffer.concat(parts);
 }
 
-/** Requisição HTTP/1.1 crua via socket — permite forjar o cabeçalho Host. */
-function rawRequest(port, { method = "GET", path: reqPath = "/", host, origin, body } = {}) {
+/**
+ * Requisição HTTP/1.1 crua via socket — permite forjar o cabeçalho Host.
+ * `headers` adiciona cabeçalhos extras (Authorization/x-ensemble-token do
+ * TICKET-RELEASE-08). Recepção em BYTES para dechunk/cabeçalho precisos.
+ */
+function rawRequest(port, { method = "GET", path: reqPath = "/", host, origin, body, headers } = {}) {
   return new Promise((resolve) => {
     const socket = net.connect(port, "127.0.0.1");
-    let raw = "";
     let settled = false;
     const fin = (val) => { if (!settled) { settled = true; try { socket.destroy(); } catch { /* já fechado */ } resolve(val); } };
-    socket.setEncoding("utf8");
     socket.on("connect", () => {
       const head = [`${method} ${reqPath} HTTP/1.1`];
       if (host !== undefined) head.push(`Host: ${host}`);
       if (origin !== undefined) head.push(`Origin: ${origin}`);
+      for (const [name, value] of Object.entries(headers ?? {})) head.push(`${name}: ${value}`);
       if (body !== undefined) {
         head.push("Content-Type: application/json");
         head.push(`Content-Length: ${Buffer.byteLength(body)}`);
@@ -145,12 +152,16 @@ function rawRequest(port, { method = "GET", path: reqPath = "/", host, origin, b
       head.push("Connection: close");
       socket.write(head.join("\r\n") + "\r\n\r\n" + (body ?? ""));
     });
-    socket.on("data", (d) => { raw += d; });
+    const buffers = [];
+    socket.on("data", (d) => { buffers.push(Buffer.isBuffer(d) ? d : Buffer.from(d)); });
     socket.on("end", () => {
-      const idx = raw.indexOf("\r\n\r\n");
-      const headPart = idx >= 0 ? raw.slice(0, idx) : raw;
-      let bodyPart = idx >= 0 ? raw.slice(idx + 4) : "";
-      if (/transfer-encoding:\s*chunked/i.test(headPart)) bodyPart = dechunk(bodyPart);
+      const rawBuf = Buffer.concat(buffers);
+      const rawStr = rawBuf.toString("latin1");
+      const idx = rawStr.indexOf("\r\n\r\n");
+      const headPart = idx >= 0 ? rawStr.slice(0, idx) : rawStr;
+      let bodyBuf = idx >= 0 ? rawBuf.subarray(idx + 4) : Buffer.alloc(0);
+      if (/transfer-encoding:\s*chunked/i.test(headPart)) bodyBuf = dechunk(bodyBuf);
+      const bodyPart = bodyBuf.toString("utf8");
       const status = Number((headPart.split("\r\n")[0] || "").split(" ")[1] ?? 0);
       let json = null;
       try { json = JSON.parse(bodyPart); } catch { /* html/plain */ }
@@ -235,11 +246,17 @@ async function runFlow(mod) {
   server = await startDashboard(db, port, { client });
   R("server.started", server !== null, `port=${port}`);
 
+  // TICKET-RELEASE-08 — session token exigido em toda mutação (/api/chat/send).
+  const tokRes = await fetch(`http://127.0.0.1:${port}/api/session-token`).catch(() => null);
+  const tokJson = tokRes ? await tokRes.json().catch(() => null) : null;
+  const TOKEN = tokJson?.token ?? "";
+  R("token.session-endpoint", tokRes?.status === 200 && /^[0-9a-f]{48}$/.test(TOKEN), `status=${tokRes?.status ?? 0}`);
+
   const post = async (payload) => {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/api/chat/send`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "x-ensemble-token": TOKEN },
         body: JSON.stringify(payload),
       });
       const text = await res.text();
@@ -252,8 +269,12 @@ async function runFlow(mod) {
   // Guardas de id ausente: um mutante que faça a rota falhar devolve
   // messageId undefined; a consulta deve devolver null em vez de lançar
   // (necessário para a fase de mutação não abortar o fluxo inteiro).
+  // TICKET-RELEASE-08/QG: SELECTs FIXOS por projeção (allow-list estática de
+  // colunas, ZERO interpolação em SQL) — behavior-preserving vs. o antigo
+  // rowById(id, cols), cujos únicos call sites usavam literais.
   const isId = (id) => typeof id === "string" && id.length > 0;
-  const rowById = (id, cols) => (isId(id) ? db.query(`SELECT ${cols} FROM team_message WHERE id = ?`).get(id) : null);
+  const rowFull = (id) => (isId(id) ? db.query("SELECT from_name, to_name, content FROM team_message WHERE id = ?").get(id) : null);
+  const rowPartial = (id) => (isId(id) ? db.query("SELECT to_name, content FROM team_message WHERE id = ?").get(id) : null);
   const waitDelivered = async (id) => {
     if (!isId(id)) return false;
     for (let i = 0; i < 120; i++) {
@@ -300,10 +321,13 @@ async function runFlow(mod) {
     rr = await rawRequest(port, { method: "GET", path: "/api/health", host: undefined });
     R("gate.no-host-rejected", rr.status === 400 || rr.status === 403, `status=${rr.status} (400 do parser Node ou 403 do gate)`);
 
-    // POST forjado não persiste nada.
+    // POST forjado não persiste nada. Carrega o token VÁLIDO de propósito:
+    // cada mutação isola UM gate (Host/Origin × session token — o forjado é
+    // barrado pelo Host ANTES de o token ser olhado no fluxo real).
     const beforeForged = countMessages("t1");
     rr = await rawRequest(port, {
       method: "POST", path: "/api/chat/send", host: `evil.example.com:${port}`,
+      headers: { Authorization: `Bearer ${TOKEN}` },
       body: JSON.stringify({ teamId: "t1", to: "cris", text: "invasão" }),
     });
     R("gate.chat-forged-403", rr.status === 403, `status=${rr.status}`);
@@ -325,7 +349,7 @@ async function runFlow(mod) {
     calls.length = 0;
     let r = await post({ teamId: "t1", to: "lead", text: "coordenada-alpha" });
     R("lead.200", r.status === 200 && r.data?.ok === true && Array.isArray(r.data.recipients) && r.data.recipients.includes("lead"), `status=${r.status} data=${JSON.stringify(r.data)}`);
-    let leadRow = rowById(r.data?.messageId, "from_name, to_name, content");
+    let leadRow = rowFull(r.data?.messageId);
     R("lead.row-to-name", leadRow?.from_name === "human" && leadRow?.to_name === "lead" && leadRow?.content === "coordenada-alpha", JSON.stringify(leadRow));
     let lc = callFor("ses_lead_t1");
     R("lead.prompt-session-agent", !!lc && lc.agent === "dante" && lc.synthetic === true, `agent=${lc?.agent} synthetic=${lc?.synthetic}`);
@@ -336,7 +360,7 @@ async function runFlow(mod) {
     calls.length = 0;
     r = await post({ teamId: "t1", text: "@lead item-mention" });
     R("lead.mention-200", r.status === 200 && r.data?.ok === true && r.data.recipients.includes("lead"), `status=${r.status} recipients=${JSON.stringify(r.data?.recipients)}`);
-    leadRow = rowById(r.data?.messageId, "to_name, content");
+    leadRow = rowPartial(r.data?.messageId);
     R("lead.mention-row", leadRow?.to_name === "lead" && leadRow?.content === "item-mention", JSON.stringify(leadRow));
     lc = callFor("ses_lead_t1");
     R("lead.mention-prompt", !!lc && lc.agent === "dante" && textOf(lc).includes("item-mention"), `agent=${lc?.agent}`);
@@ -389,7 +413,7 @@ async function runFlow(mod) {
     calls.length = 0;
     r = await post({ teamId: "t1", text: "broadcast-h35" });
     R("broadcast.200", r.status === 200 && r.data?.ok === true, `status=${r.status}`);
-    const bRow = rowById(r.data?.messageId, "to_name, content");
+    const bRow = rowPartial(r.data?.messageId);
     R("broadcast.shared-row", bRow?.to_name === null && bRow?.content === "broadcast-h35", JSON.stringify(bRow));
     const recSet = new Set(r.data?.recipients ?? []);
     R(

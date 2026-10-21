@@ -27,15 +27,17 @@
  *        sessão vazia, tarefas in_progress -> pending (completed/blocked
  *        intactas), ready/standby no SQLite, mensagem de sistema persistida e
  *        wake forçado ao Lead mesmo com silentLead:true.
- *   B) Contrato do proxy da extensão (TICKET-HARNESS-56-B)
- *      N/A explícito quando a extensão não está neste repositório (pré-merge):
- *      resolução portável apenas via ENSEMBLE_EXTENSION_DIR ou
- *      <repo>/extensions/ensemble-dashboard — nenhum caminho absoluto de host
- *      (SDET reject do TICKET-RELEASE-01).
+ *   B) Contrato do proxy da extensão (TICKET-HARNESS-56-B) — HERMÉTICO
+ *      (TICKET-RELEASE-08): roda SEMPRE, sem N/A/SKIP, porque o guest service
+ *      versionado em tests/fixtures/ensemble-dashboard-extension é o fallback
+ *      local (subprocesso HTTP real, não mock); ENSEMBLE_EXTENSION_DIR
+ *      continua aceito como override para o checkout canônico. Nenhum caminho
+ *      absoluto de host (SDET reject do TICKET-RELEASE-01).
  *      - Bearer gate global (401), validação local (400/400 missing_team_id),
  *        relay verbatim de 404/409, 413 no teto de 16 KiB, 200 com trim e
  *        atualização real do SQLite via upstream, 502 honesto com dashboard
- *        indisponível.
+ *        indisponível. O guest obtém o session token do dashboard via
+ *        GET /api/session-token (TICKET-RELEASE-08) antes de proxyar.
  *   C) Paridade src↔dist dos literais das rotas + thread do config + anti-mock.
  *   D) Prova de mutação: 11 mutantes cirúrgicos no bundle dist.
  *
@@ -58,19 +60,21 @@ const TMP = path.join(REPO, ".test-scratch", "h56");
 mkdirSync(TMP, { recursive: true });
 
 /**
- * Guest service da extensão (frente B). Resolução DETERMINÍSTICA e portável
+ * Guest service da extensão (frente B) — resolução DETERMINÍSTICA e portável
  * (SDET reject do TICKET-RELEASE-01): zero caminho absoluto de host.
  *   1. ENSEMBLE_EXTENSION_DIR — override explícito (checkout canônico da
- *      extensão, que ainda vive fora deste repositório, pré-merge);
- *   2. <repo>/extensions/ensemble-dashboard — local futuro pós-merge.
- * Se NENHUM candidato existir no ambiente, a frente B é reportada como N/A
- * explícito (SKIP, nunca PASS falso e nunca FAIL): o runner limpo do CI não
- * depende de caminho do host, e quem tiver a extensão pode optar pelo
- * ENSEMBLE_EXTENSION_DIR para exercitar a frente B de ponta a ponta.
+ *      extensão, quando atualizado para o session token do TICKET-RELEASE-08);
+ *   2. <repo>/extensions/ensemble-dashboard — local futuro pós-merge;
+ *   3. <repo>/tests/fixtures/ensemble-dashboard-extension — fixture VERSIONADO
+ *      (TICKET-RELEASE-08): o fallback hermético que garante que a frente B
+ *      roda em QUALQUER CI sem depender de diretório externo do OpenChamber —
+ *      nunca N/A, nunca SKIP. O fixture é um guest HTTP REAL (subprocesso),
+ *      não um mock: contra o dashboard REAL, de ponta a ponta.
  */
 const EXT_CANDIDATES = [
   process.env.ENSEMBLE_EXTENSION_DIR,
   path.join(REPO, "extensions", "ensemble-dashboard"),
+  path.join(REPO, "tests", "fixtures", "ensemble-dashboard-extension"),
 ].filter(Boolean);
 const EXT_DIR = EXT_CANDIDATES.find((dir) => {
   try { return readFileSync(path.join(dir, "service", "main.js"), "utf8").includes("/api/emergency/pause-member"); } catch { return false; }
@@ -117,31 +121,41 @@ const REAL = await import(path.join(TMP, "_h56_harness.mjs"));
 // ---------------------------------------------------------------------------
 // 1. Transporte HTTP real.
 // ---------------------------------------------------------------------------
-function dechunk(body) {
-  let out = "";
+/**
+ * Dechunk HTTP/1.1 em BYTES (Buffer) — nunca em string decodificada.
+ * O tamanho declarado do chunk é contagem de BYTES: com corpo UTF-8 multibyte
+ * (acentos nas mensagens do sistema), dechunk em caracteres estoura o limite
+ * do chunk e engole o terminador final (`0\r\n\r\n`), quebrando o JSON.parse.
+ */
+function dechunk(buf) {
+  const parts = [];
   let i = 0;
-  while (i < body.length) {
-    const nl = body.indexOf("\r\n", i);
+  while (i < buf.length) {
+    const nl = buf.indexOf("\r\n", i);
     if (nl < 0) break;
-    const size = Number.parseInt(body.slice(i, nl).trim(), 16);
+    const size = Number.parseInt(buf.subarray(i, nl).toString("latin1").trim(), 16);
     if (!Number.isFinite(size) || size <= 0) break;
-    out += body.slice(nl + 2, nl + 2 + size);
+    parts.push(buf.subarray(nl + 2, nl + 2 + size));
     i = nl + 2 + size + 2;
   }
-  return out;
+  return Buffer.concat(parts);
 }
 
-/** Requisição HTTP/1.1 crua via socket — permite forjar o cabeçalho Host. */
-function rawRequest(port, { method = "GET", path: reqPath = "/", host, body } = {}) {
+/**
+ * Requisição HTTP/1.1 crua via socket — permite forjar o cabeçalho Host.
+ * `headers` adiciona cabeçalhos extras (Authorization/x-ensemble-token do
+ * TICKET-RELEASE-08). Recepção em BYTES (sem setEncoding) para dechunk e
+ * cabeçalhos operarem sobre comprimento em bytes.
+ */
+function rawRequest(port, { method = "GET", path: reqPath = "/", host, body, headers } = {}) {
   return new Promise((resolve) => {
     const socket = net.connect(port, "127.0.0.1");
-    let raw = "";
     let settled = false;
     const fin = (val) => { if (!settled) { settled = true; try { socket.destroy(); } catch { /* já fechado */ } resolve(val); } };
-    socket.setEncoding("utf8");
     socket.on("connect", () => {
       const head = [`${method} ${reqPath} HTTP/1.1`];
       if (host !== undefined) head.push(`Host: ${host}`);
+      for (const [name, value] of Object.entries(headers ?? {})) head.push(`${name}: ${value}`);
       if (body !== undefined) {
         head.push("Content-Type: application/json");
         head.push(`Content-Length: ${Buffer.byteLength(body)}`);
@@ -149,12 +163,16 @@ function rawRequest(port, { method = "GET", path: reqPath = "/", host, body } = 
       head.push("Connection: close");
       socket.write(head.join("\r\n") + "\r\n\r\n" + (body ?? ""));
     });
-    socket.on("data", (d) => { raw += d; });
+    const buffers = [];
+    socket.on("data", (d) => { buffers.push(Buffer.isBuffer(d) ? d : Buffer.from(d)); });
     socket.on("end", () => {
-      const idx = raw.indexOf("\r\n\r\n");
-      const headPart = idx >= 0 ? raw.slice(0, idx) : raw;
-      let bodyPart = idx >= 0 ? raw.slice(idx + 4) : "";
-      if (/transfer-encoding:\s*chunked/i.test(headPart)) bodyPart = dechunk(bodyPart);
+      const rawBuf = Buffer.concat(buffers);
+      const rawStr = rawBuf.toString("latin1");
+      const idx = rawStr.indexOf("\r\n\r\n");
+      const headPart = idx >= 0 ? rawStr.slice(0, idx) : rawStr;
+      let bodyBuf = idx >= 0 ? rawBuf.subarray(idx + 4) : Buffer.alloc(0);
+      if (/transfer-encoding:\s*chunked/i.test(headPart)) bodyBuf = dechunk(bodyBuf);
+      const bodyPart = bodyBuf.toString("utf8");
       const status = Number((headPart.split("\r\n")[0] || "").split(" ")[1] ?? 0);
       let json = null;
       try { json = JSON.parse(bodyPart); } catch { /* html/plain */ }
@@ -276,7 +294,13 @@ async function runFlow(mod) {
   } catch { server = null; }
   R("server.started", server !== null, `port=${port}`);
 
-  const post = (route, payload) => rawJsonPost(port, route, payload);
+  // TICKET-RELEASE-08 — session token do dashboard, obtido pelo canal real
+  // (leitura com gate loopback) e anexado a toda mutação desta suíte.
+  const tokRes = await fetchJson(`http://127.0.0.1:${port}/api/session-token`);
+  const TOKEN = tokRes.json?.token ?? "";
+  R("token.session-endpoint", tokRes.status === 200 && /^[0-9a-f]{48}$/.test(TOKEN), `status=${tokRes.status} tokenLen=${TOKEN.length}`);
+
+  const post = (route, payload) => rawJsonPost(port, route, payload, TOKEN);
   const memberRow = (teamId, name) => db.query("SELECT status, execution_status, time_updated FROM team_member WHERE team_id = ? AND name = ?").get(teamId, name);
   const taskRow = (id) => db.query("SELECT status FROM team_task WHERE id = ?").get(id)?.status;
   const leadMessages = (teamId) => db.query("SELECT from_name, to_name, content FROM team_message WHERE team_id = ? AND to_name = 'lead'").all(teamId);
@@ -284,10 +308,14 @@ async function runFlow(mod) {
 
   try {
     // =================== A1. PAUSA INDIVIDUAL — GUARDAS ====================
+    // Hostil carrega o token VÁLIDO de propósito: cada mutação isola UM gate
+    // (Host/Origin × token), então remover o gate Host sem token seria
+    // mascarado pelo gate de token. No fluxo real o Host responde 403 ANTES.
     let rr = await rawRequest(port, {
       method: "POST",
       path: "/api/emergency/pause-member",
       host: `evil.example.com:${port}`,
+      headers: { Authorization: `Bearer ${TOKEN}` },
       body: JSON.stringify({ teamId: "t1", memberName: "cris" }),
     });
     R("member.forged-host-403", rr.status === 403, `status=${rr.status}`);
@@ -321,7 +349,9 @@ async function runFlow(mod) {
 
     const huge = JSON.stringify({ teamId: "t1", memberName: "cris", pad: "x".repeat(17 * 1024) });
     rr = await rawRequest(port, {
-      method: "POST", path: "/api/emergency/pause-member", host: `127.0.0.1:${port}`, body: huge,
+      method: "POST", path: "/api/emergency/pause-member", host: `127.0.0.1:${port}`,
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: huge,
     });
     R(
       "member.body-413",
@@ -364,6 +394,7 @@ async function runFlow(mod) {
       method: "POST",
       path: "/api/emergency/pause-room",
       host: `evil.example.com:${port}`,
+      headers: { Authorization: `Bearer ${TOKEN}` },
       body: JSON.stringify({ teamId: "t3" }),
     });
     R("room.forged-host-403", rr.status === 403, `status=${rr.status}`);
@@ -445,11 +476,11 @@ async function runFlow(mod) {
   return got;
 }
 
-/** POST JSON real com Host legítimo (fetch põe 127.0.0.1:port). */
-async function rawJsonPost(port, route, body) {
+/** POST JSON real com Host legítimo (fetch põe 127.0.0.1:port) + session token. */
+async function rawJsonPost(port, route, body, token) {
   return fetchJson(`http://127.0.0.1:${port}${route}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "x-ensemble-token": token ?? "" },
     body,
   });
 }
@@ -596,14 +627,20 @@ async function runExtensionContract() {
     try { return readFileSync(EXT_SERVICE, "utf8").length > 0; } catch { return false; }
   })();
   if (!serviceExists) {
-    // N/A explícito (nunca PASS falso, nunca FAIL): a extensão ainda não está
-    // neste repositório e nenhum caminho absoluto de host é aceito aqui.
-    return {
-      available: false,
-      reason: `service/main.js não encontrado em ${EXT_SERVICE} — exporte ENSEMBLE_EXTENSION_DIR ou traga a extensão para extensions/ensemble-dashboard`,
-    };
+    // TICKET-RELEASE-08: a frente B NÃO é mais N/A/SKIP — o fixture versionado
+    // em tests/fixtures garante presença. Se nem ele existir, é FAIL explícito
+    // de infraestrutura (nunca PASS falso, nunca SKIP silencioso).
+    R("ext.service.present", false, `service/main.js ausente em ${EXT_SERVICE} — fixture versionado obrigatório`);
+    return got;
   }
   R("ext.service.present", serviceExists, EXT_SERVICE);
+  // Hermetismo: o fixture versionado deve ser a base do CI (sem ENSEMBLE_EXTENSION_DIR).
+  if (!process.env.ENSEMBLE_EXTENSION_DIR) {
+    const fixtureService = path.join(REPO, "tests", "fixtures", "ensemble-dashboard-extension", "service", "main.js");
+    let fixtureOk = false;
+    try { fixtureOk = readFileSync(fixtureService, "utf8").includes("/api/emergency/pause-member"); } catch { fixtureOk = false; }
+    R("ext.fixture.versionado", fixtureOk, fixtureService);
+  }
 
   const base = mkdtempSync(path.join(os.tmpdir(), `ensemble-h56-ext-${process.pid}-`));
   mkdirSync(path.join(base, "db"), { recursive: true });
@@ -759,20 +796,10 @@ async function runExtensionContract() {
 }
 
 const extFlow = await runExtensionContract();
-if (extFlow?.available === false) {
-  // N/A EXPLÍCITO: o contrato do proxy (frente B) não é executado neste
-  // ambiente porque a extensão não faz parte deste repositório (pré-merge).
-  // O check abaixo atesta o fato "frente B N/A aqui" — ele NÃO atesta o
-  // contrato da extensão, que continua coberto quando ENSEMBLE_EXTENSION_DIR
-  // aponta para o checkout canônico (aí a frente B roda de ponta a ponta).
-  check(
-    "ext.frente-B N/A: extensão fora deste repositório (contrato do proxy NÃO executado neste ambiente)",
-    true,
-    extFlow.reason,
-  );
-} else {
-  for (const [name, { ok, detail }] of extFlow) check(name, ok, detail);
-}
+// TICKET-RELEASE-08: a frente B roda SEMPRE (fixture versionado como fallback
+// hermético — nunca N/A/SKIP no CI). O contrato do proxy é exercitado de
+// ponta a ponta contra o dashboard REAL do plugin.
+for (const [name, { ok, detail }] of extFlow) check(name, ok, detail);
 
 // ---------------------------------------------------------------------------
 // 6. Paridade src↔dist + thread do config + anti-mock / anti-segredo trivial.
@@ -788,6 +815,10 @@ if (extFlow?.available === false) {
     "execution_status = 'standby'",
     "status = 'pending'",
     "forceWake: true",
+    // TICKET-RELEASE-08 — gate de session token nas rotas de mutação.
+    "/api/session-token",
+    "isSessionTokenValid",
+    "mintSessionToken",
   ];
   const missingSrc = markers.filter((m) => !src.includes(m));
   const missingDist = markers.filter((m) => !distRaw.includes(m));

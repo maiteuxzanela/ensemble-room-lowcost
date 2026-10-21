@@ -107,11 +107,17 @@ async function runSuite() {
   const server = await startDashboard(db, port, { client: mc.client });
   
   check("startDashboard retornou server", server !== null, `port=${port}`);
+
+  // TICKET-RELEASE-08 — session token exigido em toda mutação (/api/chat/send).
+  const tokRes = await fetch(`http://localhost:${port}/api/session-token`);
+  const tokJson = await tokRes.json().catch(() => null);
+  const TOKEN = tokJson?.token ?? "";
+  check("session token obtido via /api/session-token", tokRes.status === 200 && /^[0-9a-f]{48}$/.test(TOKEN), `status=${tokRes.status}`);
   
   const post = async (payload) => {
     const res = await fetch(`http://localhost:${port}/api/chat/send`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-ensemble-token": TOKEN },
       body: JSON.stringify(payload)
     });
     const text = await res.text();

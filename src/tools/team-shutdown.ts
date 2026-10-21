@@ -205,7 +205,7 @@ async function shutdownWholeTeam(
   )
   const failed = settled
     .map((result, i) => result.status === "rejected"
-      ? `${active[i]!.name}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`
+      ? `${active[i]?.name ?? "unknown"}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`
       : null)
     .filter((value): value is string => value !== null)
 

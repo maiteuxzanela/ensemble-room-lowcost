@@ -94,7 +94,9 @@ function resolvePurgeTargets(deps: ToolDeps, purge: string[]): PurgeTarget[] {
   if (active.length > 0) throw new Error(`Cannot purge active team: ${active.join(", ")}`)
 
   return rows
-    .map(row => row.teams[0]!)
+    // `.slice(0, 1)` yields a 0-or-1 array (teams.length === 0 was thrown as
+    // "Team not found" above), so no `teams[0]!` is needed.
+    .flatMap(row => row.teams.slice(0, 1))
     .sort((a, b) => b.time_updated - a.time_updated || a.name.localeCompare(b.name))
 }
 
@@ -200,8 +202,13 @@ function validatePurgeResources(deps: ToolDeps, targets: PurgeTarget[]): void {
 function collectStaleEnsembleBranches(deps: ToolDeps, targets: PurgeTarget[]): string[] {
   return [...new Set(
     getPurgeMemberResources(deps, targets)
-      .filter(isStaleEnsembleBranch)
-      .map(resource => resource.worktree_branch!)
+      // isStaleEnsembleBranch already implies a non-null branch, but the
+      // explicit re-check gives TypeScript the string narrowing without `!`.
+      .flatMap(resource =>
+        resource.worktree_branch !== null && isStaleEnsembleBranch(resource)
+          ? [resource.worktree_branch]
+          : [],
+      ),
   )]
 }
 
@@ -510,7 +517,10 @@ export async function executeTeamCleanup(
 
   if (unmerged.length > 0 && mergeOnCleanup) {
     for (const member of unmerged) {
-      const branch = member.worktree_branch!
+      // Type guard: `unmerged` filters non-null branches, but re-check here so
+      // the merge path can never dereference a null branch.
+      const branch = member.worktree_branch
+      if (!branch) continue
       // Warn (but don't block) if lead has local changes to overlapping files
       try {
         const overlap = await overlapCheck(branch, deps.directory)

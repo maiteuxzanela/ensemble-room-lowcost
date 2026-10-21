@@ -2237,25 +2237,26 @@ async function recoverUndeliveredMessages(db, client, registry) {
     const messages = getUndeliveredMessages(db, team.id);
     for (const msg of messages) {
       let recipientSessionId;
-      if (msg.to_name === "lead") {
+      const toName = msg.to_name;
+      if (toName === "lead") {
         continue;
-      } else if (msg.to_name) {
-        const entry = registry.getByName(team.id, msg.to_name);
+      } else if (toName) {
+        const entry = registry.getByName(team.id, toName);
         recipientSessionId = entry?.sessionId;
       } else {
         continue;
       }
-      if (!recipientSessionId) continue;
-      if (hasReportedCompletion(db, team.id, msg.to_name)) {
+      if (!recipientSessionId || !toName) continue;
+      if (hasReportedCompletion(db, team.id, toName)) {
         markDelivered(db, msg.id);
         continue;
       }
       try {
-        const recipientModel = getMemberModel(db, team.id, msg.to_name);
+        const recipientModel = getMemberModel(db, team.id, toName);
         const wake = resolveStandbyWake(
           db,
           team.id,
-          msg.to_name,
+          toName,
           `[Recovered team message from ${msg.from_name}]: ${msg.content}`
         );
         await client.session.promptAsync({
@@ -2321,7 +2322,7 @@ async function recoverOrphanedBranches(db, cwd) {
 function parseTaskResult(content) {
   const match = content.match(/<task-result>([\s\S]*?)<\/task-result>/);
   if (!match) return null;
-  const inner = match[1];
+  const inner = match[1] ?? "";
   const status = inner.match(/<status>([\s\S]*?)<\/status>/)?.[1]?.trim();
   const summary = inner.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.trim();
   const details = inner.match(/<details>([\s\S]*?)<\/details>/)?.[1]?.trim();
@@ -3367,6 +3368,7 @@ function writePendingDecisions(db, teamId, entries) {
     return;
   }
   const latest = entries[entries.length - 1];
+  if (!latest) return;
   db.run(
     "UPDATE team SET awaiting_lead_decision = 1, awaiting_decision_members = ?, awaiting_decision_member = ?, awaiting_decision_at = ?, time_updated = ? WHERE id = ?",
     [JSON.stringify(entries), latest.member, latest.at, now, teamId]
@@ -3378,8 +3380,8 @@ function markAwaitingLeadDecision(db, teamId, memberName, payload) {
   const idx = entries.findIndex((e) => e.member === memberName);
   const incomingPayload = payload ?? "";
   let duplicate = false;
-  if (idx >= 0) {
-    const existing = entries[idx];
+  const existing = idx >= 0 ? entries[idx] : void 0;
+  if (existing) {
     duplicate = incomingPayload.length > 0 && existing.payload === incomingPayload;
     entries[idx] = { member: memberName, at: now, payload: incomingPayload || existing.payload };
   } else {
@@ -3446,7 +3448,8 @@ ${context}${optionsBlock}`;
   const ctx = resolveLeadWakeContext(deps.db, teamInfo.teamId);
   if (ctx) {
     const chain = resolveFallbackChainForAgent(deps.config, ctx.leadAgent);
-    const primaryModel = chain.length > 0 ? formatModelSelector(chain[0]) : void 0;
+    const firstModel = chain[0];
+    const primaryModel = firstModel !== void 0 ? formatModelSelector(firstModel) : void 0;
     promptModelAwareWake(deps.client, {
       sessionID: ctx.leadSessionId,
       text: payload,
@@ -4674,7 +4677,7 @@ function resolvePurgeTargets(deps, purge) {
   if (missing.length > 0) throw new Error(`Team not found: ${missing.join(", ")}`);
   const active = rows.filter((row) => row.teams.some((team) => team.status === "active")).map((row) => row.name);
   if (active.length > 0) throw new Error(`Cannot purge active team: ${active.join(", ")}`);
-  return rows.map((row) => row.teams[0]).sort((a, b) => b.time_updated - a.time_updated || a.name.localeCompare(b.name));
+  return rows.flatMap((row) => row.teams.slice(0, 1)).sort((a, b) => b.time_updated - a.time_updated || a.name.localeCompare(b.name));
 }
 function deleteArchivedTeams(deps, targets) {
   const transaction = deps.db.transaction((teams) => {
@@ -4761,7 +4764,9 @@ function validatePurgeResources(deps, targets) {
 }
 function collectStaleEnsembleBranches(deps, targets) {
   return [...new Set(
-    getPurgeMemberResources(deps, targets).filter(isStaleEnsembleBranch).map((resource) => resource.worktree_branch)
+    getPurgeMemberResources(deps, targets).flatMap(
+      (resource) => resource.worktree_branch !== null && isStaleEnsembleBranch(resource) ? [resource.worktree_branch] : []
+    )
   )];
 }
 function countStaleResourceRefs(deps, target) {
@@ -5010,6 +5015,7 @@ Commit or merge their work first, then call team_cleanup with acknowledge_uncomm
   if (unmerged.length > 0 && mergeOnCleanup) {
     for (const member of unmerged) {
       const branch = member.worktree_branch;
+      if (!branch) continue;
       try {
         const overlap = await overlapCheck(branch, deps.directory);
         if (overlap.length > 0) {
@@ -5160,7 +5166,7 @@ Commit or merge their work first, then call team_shutdown with acknowledge_uncom
   const settled = await Promise.allSettled(
     active.map((member) => preserveAndAbort(deps, teamInfo.teamId, member.name, member.session_id, member.worktree_branch, preserve))
   );
-  const failed = settled.map((result, i) => result.status === "rejected" ? `${active[i].name}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}` : null).filter((value) => value !== null);
+  const failed = settled.map((result, i) => result.status === "rejected" ? `${active[i]?.name ?? "unknown"}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}` : null).filter((value) => value !== null);
   const cleanupResult = await executeTeamCleanup(
     deps,
     { force: false, acknowledge_uncommitted: true },
@@ -5827,7 +5833,8 @@ var ProgressTracker = class {
   /** Latest activity timestamp across all tracked signals (0 when nothing recorded). */
   lastActivityAt(sessionId) {
     const records = this.steps.get(sessionId);
-    const lastStepAt = records && records.length > 0 ? records[records.length - 1].timestamp : 0;
+    const lastRecord = records && records.length > 0 ? records[records.length - 1] : void 0;
+    const lastStepAt = lastRecord?.timestamp ?? 0;
     return Math.max(
       this.lastMessageAt.get(sessionId) ?? 0,
       this.lastTaskAt.get(sessionId) ?? 0,
@@ -6019,6 +6026,7 @@ function recordFromToolAfter(input, output, registry, buffer) {
 
 // src/dashboard.ts
 import { createServer } from "node:http";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 
 // src/dashboard-html.ts
 var DASHBOARD_HEAD = `<!DOCTYPE html>
@@ -6159,7 +6167,7 @@ async function sendChatMessage(text, target) {
     const teamId = t ? t.id : '';
     const res = await fetch('/api/chat/send', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-ensemble-token': (typeof window !== 'undefined' && window.__ENSEMBLE_TOKEN__) || '' },
       body: JSON.stringify({ teamId, text, to: target })
     });
     if (!res.ok) throw new Error('Chat send failed: ' + res.statusText);
@@ -7080,6 +7088,14 @@ function isJsonContentType(header) {
 function isStateChangingMethod(method) {
   return STATE_CHANGING_METHODS.includes((method ?? "").toUpperCase());
 }
+var MUTATING_ROUTES = [
+  "/api/chat/send",
+  "/api/emergency/pause-member",
+  "/api/emergency/pause-room"
+];
+function isMutatingRoute(pathname) {
+  return MUTATING_ROUTES.includes(pathname);
+}
 function isTrustedLocalOrigin(port, origin, req) {
   if (origin === "null") {
     return !isStateChangingMethod(req.method) || isJsonContentType(req.headers["content-type"]);
@@ -7124,6 +7140,37 @@ function sendJson(res, data, corsOrigin, status = 200) {
     ...DASHBOARD_SECURITY_HEADERS
   });
   res.end(JSON.stringify(data));
+}
+var SESSION_TOKEN_BYTES = 24;
+function mintSessionToken() {
+  return randomBytes(SESSION_TOKEN_BYTES).toString("hex");
+}
+function extractSessionToken(req, url) {
+  const authorization = headerValue(req.headers.authorization);
+  if (authorization) {
+    const match = authorization.match(/^Bearer\s+(\S+)$/i);
+    if (match) return match[1];
+  }
+  const headerToken = headerValue(req.headers["x-ensemble-token"]);
+  if (headerToken) {
+    const trimmed = headerToken.trim();
+    if (trimmed) return trimmed;
+  }
+  return url.searchParams.get("token") ?? void 0;
+}
+function isSessionTokenValid(presented, expected) {
+  if (!presented) return false;
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+function renderDashboardHtml(sessionToken) {
+  return DASHBOARD_HTML.replace(
+    "<body",
+    `<script>window.__ENSEMBLE_TOKEN__=${JSON.stringify(sessionToken)};</script>
+<body`
+  );
 }
 function parseMessageTime(time) {
   if (typeof time === "object" && time !== null) {
@@ -7364,7 +7411,7 @@ function sendEmergencyFailure(res, corsOrigin, err) {
   const msg = err instanceof Error ? err.message : String(err);
   sendJson(res, { ok: false, code: "internal_error", error: msg }, corsOrigin, 500);
 }
-function handleDashboardRequest(db, port, req, res, options) {
+function handleDashboardRequest(db, port, req, res, sessionToken, options) {
   const url = safeRequestUrl(req.url, port);
   const corsOrigin = corsOriginFor(port, req.headers.origin);
   if (!isTrustedLocalRequest(port, req)) {
@@ -7372,8 +7419,17 @@ function handleDashboardRequest(db, port, req, res, options) {
     sendJson(res, { ok: false, error: "Forbidden" }, corsOrigin, 403);
     return;
   }
+  if (isStateChangingMethod(req.method) && isMutatingRoute(url.pathname) && !isSessionTokenValid(extractSessionToken(req, url), sessionToken)) {
+    log(`dashboard:unauthorized path=${url.pathname} method=${req.method ?? "-"} host=${headerValue(req.headers.host) ?? "-"}`);
+    sendJson(res, { ok: false, code: "unauthorized", error: "Unauthorized: valid session token required" }, corsOrigin, 401);
+    return;
+  }
   if (url.pathname === "/api/health") {
     sendJson(res, { ensemble: true, pid: process.pid }, corsOrigin);
+    return;
+  }
+  if (url.pathname === "/api/session-token") {
+    sendJson(res, { token: sessionToken }, corsOrigin);
     return;
   }
   if (url.pathname === "/api/state") {
@@ -7419,8 +7475,9 @@ function handleDashboardRequest(db, port, req, res, options) {
           return;
         }
         const mentionMatch = text.match(/^@([a-zA-Z0-9_-]+)\s+/);
-        if (mentionMatch) {
-          to = mentionMatch[1];
+        const mentioned = mentionMatch?.[1];
+        if (mentionMatch && mentioned) {
+          to = mentioned;
           text = text.slice(mentionMatch[0].length);
         }
         let teamId = payload.teamId ? String(payload.teamId) : "";
@@ -7447,12 +7504,13 @@ function handleDashboardRequest(db, port, req, res, options) {
           const members = db.query("SELECT session_id, name, agent FROM team_member WHERE team_id = ? AND status NOT IN ('shutdown', 'error')").all(teamId);
           const pending = members.filter((m) => !hasReportedCompletion(db, teamId, m.name));
           for (const m of pending) recipients.push(m.name);
-          if (options?.client && pending.length) {
+          const client = options?.client;
+          if (client && pending.length) {
             const deliveries = pending.map((m) => {
               const wake = resolveStandbyWake(db, teamId, m.name, `[Team broadcast from human]: ${text}`);
               const model = getMemberModel(db, teamId, m.name);
               const agent = wake.agent ?? m.agent ?? void 0;
-              return { name: m.name, promise: options.client.session.promptAsync({
+              return { name: m.name, promise: client.session.promptAsync({
                 sessionID: m.session_id,
                 parts: [{ type: "text", text: wake.text }],
                 synthetic: true,
@@ -7461,7 +7519,7 @@ function handleDashboardRequest(db, port, req, res, options) {
               }) };
             });
             Promise.allSettled(deliveries.map((d) => d.promise)).then((settled) => {
-              const failed = settled.map((s, i) => ({ s, name: deliveries[i].name })).filter(({ s }) => s.status === "rejected");
+              const failed = settled.map((s, i) => ({ s, name: deliveries[i]?.name ?? "unknown" })).filter(({ s }) => s.status === "rejected");
               if (failed.length === 0) {
                 markDelivered(db, messageId);
               } else {
@@ -7534,7 +7592,12 @@ function handleDashboardRequest(db, port, req, res, options) {
   }
   const activityMatch = url.pathname?.match(/^\/api\/session\/([^/]+)\/activity$/);
   if (activityMatch) {
-    const sessionId = decodeURIComponent(activityMatch[1]);
+    const rawSessionId = activityMatch[1];
+    if (rawSessionId === void 0) {
+      sendJson(res, { ok: false, error: "Missing session id" }, corsOrigin, 400);
+      return;
+    }
+    const sessionId = decodeURIComponent(rawSessionId);
     handleActivityRoute(db, sessionId, options, res, corsOrigin).catch(() => {
       if (!res.headersSent) {
         res.writeHead(500, {
@@ -7549,7 +7612,7 @@ function handleDashboardRequest(db, port, req, res, options) {
   }
   if (url.pathname === "/") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", ...DASHBOARD_SECURITY_HEADERS });
-    res.end(DASHBOARD_HTML);
+    res.end(renderDashboardHtml(sessionToken));
     return;
   }
   res.writeHead(404, { "Content-Type": "text/plain" });
@@ -7568,7 +7631,8 @@ function toDashboardServer(server) {
 }
 async function startDashboard(db, port, options) {
   return new Promise((resolve) => {
-    const server = createServer((req, res) => handleDashboardRequest(db, port, req, res, options));
+    const sessionToken = mintSessionToken();
+    const server = createServer((req, res) => handleDashboardRequest(db, port, req, res, sessionToken, options));
     server.once("error", async (err) => {
       if (err.code === "EADDRINUSE") {
         try {
@@ -7874,7 +7938,7 @@ var Watchdog = class _Watchdog {
         agent: stallAgent,
         ...stallModel ? { model: stallModel } : {}
       }).then(() => {
-        this.progressTracker.markReported(member.session_id);
+        this.progressTracker?.markReported(member.session_id);
       }).catch((err) => {
         log(`watchdog:stall:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`);
       });

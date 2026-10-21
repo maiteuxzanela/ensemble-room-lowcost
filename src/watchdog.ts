@@ -328,7 +328,10 @@ export class Watchdog {
         agent: stallAgent,
         ...(stallModel ? { model: stallModel } : {}),
       }).then(() => {
-        this.progressTracker!.markReported(member.session_id)
+        // Type guard: progressTracker is optional (constructed without one in
+        // legacy/test harnesses) — optional chaining keeps the nudge-ack from
+        // throwing into the .catch below when no tracker was threaded.
+        this.progressTracker?.markReported(member.session_id)
       }).catch((err) => {
         log(`watchdog:stall:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`)
       })

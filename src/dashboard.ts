@@ -1,5 +1,6 @@
 import { createServer } from "node:http"
 import type { IncomingMessage, Server, ServerResponse } from "node:http"
+import { randomBytes, timingSafeEqual } from "node:crypto"
 import type { Database } from "./db"
 import { DASHBOARD_HEAD } from "./dashboard-html"
 import { DASHBOARD_JS_CORE } from "./dashboard-js-core"
@@ -305,6 +306,23 @@ function isStateChangingMethod(method: string | undefined): boolean {
 }
 
 /**
+ * TICKET-RELEASE-08 — Routes that carry a side effect and therefore demand the
+ * session token in addition to the loopback Host/Origin gate. Read routes
+ * (`/api/health`, `/api/state`, `/api/session-token`, session activity, `/`)
+ * are intentionally NOT listed: they stay protected by the gate alone.
+ */
+const MUTATING_ROUTES: readonly string[] = [
+  "/api/chat/send",
+  "/api/emergency/pause-member",
+  "/api/emergency/pause-room",
+]
+
+/** True when `pathname` is one of the session-token-protected routes. */
+function isMutatingRoute(pathname: string): boolean {
+  return MUTATING_ROUTES.includes(pathname)
+}
+
+/**
  * TICKET-RELEASE-03 — `Origin` allow-list.
  *
  * Accepts the three loopback origins on this exact port plus the literal
@@ -401,6 +419,76 @@ function sendJson(res: ServerResponse, data: unknown, corsOrigin: string, status
     ...DASHBOARD_SECURITY_HEADERS,
   })
   res.end(JSON.stringify(data))
+}
+
+/**
+ * TICKET-RELEASE-08 — Session token for state-changing routes.
+ *
+ * The loopback Host/Origin gate (TICKET-RELEASE-03) refuses cross-origin and
+ * DNS-rebinding traffic, but a same-machine page that slips past it (or any
+ * future embedding that weakens the gate) would still be able to forge a
+ * mutation. A per-start random token — generated with `crypto.randomBytes(24)`
+ * (192 bits) — is therefore required on top of the gate for every mutating
+ * route. Read routes stay reachable without the token so the loopback-only
+ * Host/Origin gate remains their (sufficient) protection, matching the task
+ * contract: `/api/state`, `/api/health` and the console HTML do not leak the
+ * token to cross-origin callers (no CORS reflection), while `/api/chat/send`,
+ * `/api/emergency/pause-member` and `/api/emergency/pause-room` demand it.
+ */
+const SESSION_TOKEN_BYTES = 24
+
+/** Mint a fresh 192-bit session token (48 lowercase hex chars). */
+function mintSessionToken(): string {
+  return randomBytes(SESSION_TOKEN_BYTES).toString("hex")
+}
+
+/**
+ * Extract the session token a client presented, accepting the three channels
+ * agreed for the dashboard surface: `Authorization: Bearer <token>`, the
+ * `x-ensemble-token` header (used by the console HTML and the extension
+ * proxy), and the `?token=` query parameter (curl ergonomics).
+ */
+function extractSessionToken(req: IncomingMessage, url: URL): string | undefined {
+  const authorization = headerValue(req.headers.authorization)
+  if (authorization) {
+    const match = authorization.match(/^Bearer\s+(\S+)$/i)
+    if (match) return match[1]
+  }
+  const headerToken = headerValue(req.headers["x-ensemble-token"])
+  if (headerToken) {
+    const trimmed = headerToken.trim()
+    if (trimmed) return trimmed
+  }
+  return url.searchParams.get("token") ?? undefined
+}
+
+/**
+ * Constant-time comparison of the presented token against the live session
+ * token. Length is compared first (timingSafeEqual requires equal lengths);
+ * a length mismatch cannot leak the secret because the comparison never runs.
+ */
+function isSessionTokenValid(presented: string | undefined, expected: string): boolean {
+  if (!presented) return false
+  const a = Buffer.from(presented)
+  const b = Buffer.from(expected)
+  if (a.length !== b.length) return false
+  return timingSafeEqual(a, b)
+}
+
+/**
+ * Render the console HTML with the session token injected as the first
+ * statement of the document — right before `<body>`, i.e. inside the `<head>`
+ * so the inline dashboard script (which runs at the end of the body) always
+ * sees `window.__ENSEMBLE_TOKEN__` already populated. The token never leaves
+ * the loopback surface: the Host/Origin gate refuses any cross-origin or
+ * DNS-rebinding fetch of this page, and the response is never reflected into
+ * another origin's CORS.
+ */
+function renderDashboardHtml(sessionToken: string): string {
+  return DASHBOARD_HTML.replace(
+    "<body",
+    `<script>window.__ENSEMBLE_TOKEN__=${JSON.stringify(sessionToken)};<\/script>\n<body`,
+  )
 }
 
 /**
@@ -790,6 +878,7 @@ function handleDashboardRequest(
   port: number,
   req: IncomingMessage,
   res: ServerResponse,
+  sessionToken: string,
   options?: DashboardOptions,
 ): void {
   const url = safeRequestUrl(req.url, port)
@@ -809,8 +898,26 @@ function handleDashboardRequest(
     return
   }
 
+  // TICKET-RELEASE-08 — session-token gate for every state-changing route.
+  // Runs after the Host/Origin gate (hostile origins are already refused with
+  // 403 above) and BEFORE any body read or side effect: an unauthenticated
+  // mutation never reaches the chat fan-out or the emergency abort paths.
+  if (isStateChangingMethod(req.method) && isMutatingRoute(url.pathname) && !isSessionTokenValid(extractSessionToken(req, url), sessionToken)) {
+    log(`dashboard:unauthorized path=${url.pathname} method=${req.method ?? "-"} host=${headerValue(req.headers.host) ?? "-"}`)
+    sendJson(res, { ok: false, code: "unauthorized", error: "Unauthorized: valid session token required" }, corsOrigin, 401)
+    return
+  }
+
   if (url.pathname === "/api/health") {
     sendJson(res, { ensemble: true, pid: process.pid }, corsOrigin)
+    return
+  }
+
+  // TICKET-RELEASE-08 — the session token itself is a loopback-only read
+  // (same Host/Origin gate as /api/state): local tooling (curl, the TUI) and
+  // the extension's guest service fetch it here before proxying mutations.
+  if (url.pathname === "/api/session-token") {
+    sendJson(res, { token: sessionToken }, corsOrigin)
     return
   }
 
@@ -869,8 +976,9 @@ function handleDashboardRequest(
         }
 
         const mentionMatch = text.match(/^@([a-zA-Z0-9_-]+)\s+/)
-        if (mentionMatch) {
-          to = mentionMatch[1]!
+        const mentioned = mentionMatch?.[1]
+        if (mentionMatch && mentioned) {
+          to = mentioned
           text = text.slice(mentionMatch[0].length)
         }
 
@@ -904,7 +1012,10 @@ function handleDashboardRequest(
           const pending = members.filter((m) => !hasReportedCompletion(db, teamId, m.name))
           for (const m of pending) recipients.push(m.name)
 
-          if (options?.client && pending.length) {
+          // Bound once so the closure below can narrow it: property narrowing
+          // on `options.client` does not survive into the .map callback.
+          const client = options?.client
+          if (client && pending.length) {
             // HARNESS-35 — same model/agent/standby preservation as the DM path.
             // The raw promises are kept UNWRAPPED: attaching `.catch()` here would
             // turn every rejection into a `fulfilled` allSettled entry and make
@@ -913,7 +1024,7 @@ function handleDashboardRequest(
               const wake = resolveStandbyWake(db, teamId, m.name, `[Team broadcast from human]: ${text}`)
               const model = getMemberModel(db, teamId, m.name)
               const agent = wake.agent ?? m.agent ?? undefined
-              return { name: m.name, promise: options.client!.session.promptAsync({
+              return { name: m.name, promise: client.session.promptAsync({
                 sessionID: m.session_id,
                 parts: [{ type: "text", text: wake.text }],
                 synthetic: true,
@@ -929,7 +1040,7 @@ function handleDashboardRequest(
             // per-recipient delivered tracking intent).
             Promise.allSettled(deliveries.map((d) => d.promise)).then((settled) => {
               const failed = settled
-                .map((s, i) => ({ s, name: deliveries[i]!.name }))
+                .map((s, i) => ({ s, name: deliveries[i]?.name ?? "unknown" }))
                 .filter(({ s }) => s.status === "rejected")
               if (failed.length === 0) {
                 markDelivered(db, messageId)
@@ -1013,7 +1124,12 @@ function handleDashboardRequest(
 
   const activityMatch = url.pathname?.match(/^\/api\/session\/([^/]+)\/activity$/)
   if (activityMatch) {
-    const sessionId = decodeURIComponent(activityMatch[1]!)
+    const rawSessionId = activityMatch[1]
+    if (rawSessionId === undefined) {
+      sendJson(res, { ok: false, error: "Missing session id" }, corsOrigin, 400)
+      return
+    }
+    const sessionId = decodeURIComponent(rawSessionId)
     handleActivityRoute(db, sessionId, options, res, corsOrigin).catch(() => {
       if (!res.headersSent) {
         res.writeHead(500, {
@@ -1029,7 +1145,11 @@ function handleDashboardRequest(
 
   if (url.pathname === "/") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", ...DASHBOARD_SECURITY_HEADERS })
-    res.end(DASHBOARD_HTML)
+    // TICKET-RELEASE-08 — the console HTML must carry the session token so its
+    // inline script can authenticate the chat POST. The token is injected per
+    // request (never baked into the module constant), so it always matches the
+    // token minted for THIS server start.
+    res.end(renderDashboardHtml(sessionToken))
     return
   }
 
@@ -1061,7 +1181,12 @@ function toDashboardServer(server: Server): DashboardServer {
  */
 export async function startDashboard(db: Database, port: number, options?: DashboardOptions): Promise<DashboardServer | null> {
   return new Promise((resolve) => {
-    const server = createServer((req, res) => handleDashboardRequest(db, port, req, res, options))
+    // TICKET-RELEASE-08 — a fresh 192-bit session token per server start. It
+    // gates every state-changing route and is handed to the console HTML; a
+    // restart invalidates the previous token, so a leaked token dies with the
+    // process that minted it.
+    const sessionToken = mintSessionToken()
+    const server = createServer((req, res) => handleDashboardRequest(db, port, req, res, sessionToken, options))
 
     server.once("error", async (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
