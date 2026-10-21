@@ -9,6 +9,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.18.2] - 2026-10-20
+
+Release-governance patch on top of `0.18.1`: the runtime code is unchanged, but the **published
+artifact** is now correct for plain Node consumers, the dependency tree is audited and the package
+lineage is documented. Everything shipped by TICKET-RELEASE-01 through TICKET-RELEASE-06 is recorded
+here, because those changes landed after the `0.18.1` tag.
+
+### Added
+
+- **Conditional `exports` map with a compiled runtime target.** `exports["."]` now resolves through
+  `"types": "./src/index.ts"` and `"default": "./dist/index.js"`, so a regular Node consumer importing
+  `ensemble-room-lowcost` loads the ESM bundle instead of failing with a TypeScript syntax error. The
+  top-level `"types"` field was added for editors that do not read conditional exports, and the legacy
+  `"module"` field now points at the same compiled bundle so bundlers that ignore `exports` no longer
+  receive TypeScript either.
+- **`./package.json` subpath export**, so tooling (npm, bundlers, SBOM scanners) can read package
+  metadata without bypassing the `exports` gate.
+- **Hermetic test fixtures** (TICKET-RELEASE-01): the `session`/`project` DDL lives in
+  `tests/fixtures/session_schema.sql` and is replayed into a throwaway database under `.test-scratch/`;
+  the suite no longer reads `~/.local/share/opencode/opencode.db`.
+- **Continuous integration workflow** (TICKET-RELEASE-01): `.github/workflows/ci.yml` runs `npm ci`,
+  `npm run build`, `npm run check`, `npm run typecheck` and `npm test` on Node 22 and 24 for pushes and
+  pull requests to `main`; `publish.yml` gates `npm publish --provenance` behind the same steps.
+- **Regression suites** added during the batch: `tests/test_release_03_dashboard_csrf.mjs` (dashboard
+  CSRF/Host-Origin contracts) and `tests/test_release05_shell_ledger.mjs` (shell ledger capture,
+  `workdir` resolution, `git mv` renames), bringing the deterministic suite to **48 files**.
+- **Release gates in CI** (TICKET-RELEASE-07): `ci.yml` now runs `npx biome check src` (static gate
+  first), `git diff --exit-code dist/` (the committed bundle must be byte-identical to a fresh build)
+  and `npm pack --dry-run` (packaging smoke test) before the deterministic suite, on Node 22 and 24.
+
+### Changed
+
+- **Package version** bumped to `0.18.2`, with `package-lock.json` regenerated so the root entry matches.
+- **`peerDependenciesMeta`** now marks `typescript` optional, alongside `@opentui/core`, `@opentui/solid`
+  and `solid-js`. A headless server-only install pulls neither the compiler nor any TUI runtime; the
+  peers are declared only so that TUI/companion users get a compatible range.
+- **Dependency hygiene** (TICKET-RELEASE-02): `solid-js` raised to `1.9.12` in both dev and peer ranges,
+  `@babel/core` pinned to `7.29.7` via `overrides`, `seroval`/`seroval-plugins` pinned to `1.6.11`,
+  `typescript` aligned to `~5.8.3` and `@types/bun` frozen instead of `latest`.
+- **Code quality** (TICKET-RELEASE-03): Biome adopted as the repository linter/formatter; `as any`
+  assertions and empty `catch` blocks in `hooks.ts`, `team-status.ts`, `types.ts` and `v2-*` removed or
+  replaced with typed guards; comments referring to mocks were purged.
+- **Documentation sync** (TICKET-RELEASE-06): every document now states **48** deterministic suites and
+  describes failover exhaustion as a silent, zero-noise outcome — matching HARNESS-13 behaviour instead
+  of the older "wake the lead" wording.
+
+### Fixed
+
+- **`exports` served TypeScript to Node.** `import "ensemble-room-lowcost"` no longer depends on a
+  TypeScript-capable loader; Node resolves `dist/index.js` through the `default` condition. The
+  `./rpc` and `./tui` companion subpaths remain TypeScript entrypoints and are documented as requiring
+  Bun or Node's native type stripping.
+- **Gate 1 auto-commit dropped shell artifacts** (TICKET-RELEASE-05). The modified-file ledger now
+  captures files produced by shell commands and `npm install` (diffing repository state around the
+  command), so a regenerated `package-lock.json` or a `sed`/generator output is committed instead of
+  being left dirty. The `git add -A` ban and per-card ledger scope are unchanged, and a fail-safe warns
+  the Quality Gate when card-scoped files are still dirty at completion.
+- **Shell `cwd` vs `workdir`** (TICKET-RELEASE-06): `resolveShellCwd` accepts `args.workdir` as well as
+  `args.cwd`, so calls targeting a sibling repository capture their diff in the right tree.
+- **`git mv` / copy entries** (TICKET-RELEASE-06): porcelain `R`/`C` records now register **both** the
+  source and destination paths, so renames no longer leave the origin out of the ledger.
+
+### Security
+
+- **`npm audit --omit=dev` reports 0 vulnerabilities** (TICKET-RELEASE-02) for the runtime tree.
+- **Dashboard hardening** (TICKET-RELEASE-03): the `:4747` loopback server validates `Host`/`Origin` on
+  every mutating route (`/api/chat/send`, `/api/emergency/*`) and rejects cross-origin requests, closing
+  the CSRF/DNS-rebinding gap; contract tests assert the rejections.
+- **Package lineage documented** (TICKET-RELEASE-07): `SECURITY.md` and `README.md` now record that
+  `@opencode/plugin` (v2 plugin SDK, maintained by Dax Raad / `thdxr`, creator and architect of OpenCode)
+  and `@opencode-ai/plugin` (v1 SDK namespace) are both first-party and serve different SDK generations.
+  `@opencode/plugin` is pinned to the exact version `2.0.16` with a lockfile `sha512` integrity hash, so
+  the coexistence is not typosquatting.
+- **Packaging gate**: `npm pack --dry-run` ships 65 files — `dist/index.js`, `src/`, `tsconfig.json`,
+  `LICENSE`, `README.md`, `CHANGELOG.md`, `SECURITY.md`, `social-preview.png` and `package.json` — and
+  excludes `tests/`, `.github/`, `node_modules/`, `.test-scratch/` and the local `kanban.json`.
+
+### Tests
+
+- 48 deterministic suites, zero mocks, executed against both the real bundle (`dist/index.js`) and the
+  `.ts` sources of `src/`. Verified in this release: `npm run build` → `npm run check` → `npm test`
+  (48/48 green) plus a real `node` resolution probe of the published entrypoint (`import` resolves to
+  `dist/index.js`).
+- The `package.json` contract test (`test_ticket_harness_38`) now flattens conditional export objects and
+  asserts the root entrypoint explicitly (`default` → `dist/index.js`, `types` → `src/index.ts`), so a
+  future regression of the packaging map fails the suite instead of only checking file existence.
+
 ## [0.18.1] - 2026-10-20
 
 Hardening release over the upstream base `@hueyexe/opencode-ensemble@0.18.0`. The theme is
@@ -104,6 +191,7 @@ sleeps, and the schema survives the upgrade.
 Initial baseline derived from `@hueyexe/opencode-ensemble@0.18.0` (MIT). Provides the multi-agent room,
 the SQLite-backed task board, `team_*` tools, worktree isolation and the base watchdog.
 
-[Unreleased]: https://github.com/maiteuxzanela/ensemble-room-lowcost/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/maiteuxzanela/ensemble-room-lowcost/compare/v0.18.2...HEAD
+[0.18.2]: https://github.com/maiteuxzanela/ensemble-room-lowcost/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/maiteuxzanela/ensemble-room-lowcost/releases/tag/v0.18.1
 [0.18.0]: https://github.com/hueyexe/opencode-ensemble/releases/tag/v0.18.0

@@ -1,13 +1,18 @@
 {
   "name": "ensemble-room-lowcost",
-  "version": "0.18.1",
+  "version": "0.18.2",
   "description": "OpenCode Ensemble Hardened - Low-cost multi-agent runtime with native standby, silent lead, and deterministic board wake",
-  "module": "src/index.ts",
+  "types": "./src/index.ts",
+  "module": "dist/index.js",
   "main": "dist/index.js",
   "exports": {
-    ".": "./src/index.ts",
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
     "./rpc": "./src/rpc.ts",
-    "./tui": "./src/tui.tsx"
+    "./tui": "./src/tui.tsx",
+    "./package.json": "./package.json"
   },
   "type": "module",
   "license": "MIT",
@@ -77,6 +82,9 @@
       "optional": true
     },
     "solid-js": {
+      "optional": true
+    },
+    "typescript": {
       "optional": true
     }
   },

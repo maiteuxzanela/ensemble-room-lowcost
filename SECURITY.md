@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| `0.18.x` | Yes — security fixes are released on this line |
+| `0.18.2` (current) | Yes — security fixes are released on this line |
+| `0.18.x` | Yes — previous patches remain installable, but fixes land on `0.18.2` |
 | `< 0.18.0` | No |
 
 Only the latest patch of the supported minor line receives security fixes. Upgrading is always the
@@ -65,6 +66,49 @@ Out of scope:
 - Social-engineering scenarios against operators.
 - Denial of service caused by deliberately oversized local configuration files.
 - Findings that only affect unsupported versions.
+
+## Package lineage and supply-chain provenance
+
+An external release audit flagged the coexistence of `@opencode/plugin` and `@opencode-ai/plugin` as a
+possible typosquatting / supply-chain risk. It is not. Both namespaces are legitimate and have different
+owners and purposes:
+
+| Package | Role | Lineage |
+|---|---|---|
+| `@opencode-ai/plugin` | v1 plugin/tool SDK (`tool`, `Plugin` types) | OpenCode official SDK namespace, used here for tool definitions and types |
+| `@opencode-ai/sdk` | v1 server/client SDK (`OpencodeClient`) | Same official namespace |
+| `@opencode/plugin` | v2 plugin SDK: `Plugin` from the root, `Rpc` from `@opencode/plugin/rpc`, TUI helpers from `@opencode/plugin/tui` | Maintained by **Dax Raad (`thdxr`)**, creator and architect of OpenCode |
+
+How the runtime uses them:
+
+- `src/index.ts` imports `Plugin` from `@opencode/plugin` and also re-exports the legacy `server()` shape
+  from `@opencode-ai/plugin` (dual V1/V2 compatibility, upstream issue #36).
+- `src/rpc.ts` imports `Rpc` from `@opencode/plugin/rpc`; `src/tui.tsx` imports `Plugin` from
+  `@opencode/plugin/tui`. Both are companion entrypoints and are optional at runtime.
+
+Verification properties that make the dependency auditable:
+
+- `@opencode/plugin` is pinned to an **exact version** (`2.0.16`) — no `^`, `~` or `latest` range — and
+  `package-lock.json` records the `registry.npmjs.org` tarball plus its `sha512` integrity hash.
+  `npm ci` therefore installs byte-identical code.
+- The package is published on the public npm registry under the `@opencode` scope with the same maintainer
+  as OpenCode itself; it is not an unowned, look-alike name.
+- `npm audit --omit=dev` reports **0 vulnerabilities** for the runtime dependency tree.
+- `@opencode/plugin`, `@opencode-ai/plugin` and `@opencode-ai/sdk` are declared as regular
+  `dependencies` (not post-install hooks, not git URLs, not tarball URLs); no package in the runtime tree
+  prompts for credentials or installs from a non-registry source.
+
+To audit the claim yourself:
+
+```bash
+npm ls @opencode/plugin @opencode-ai/plugin @opencode-ai/sdk
+npm view @opencode/plugin version maintainers   # → maintainer: thdxr <d@ironbay.co>
+npm audit --omit=dev
+```
+
+If a future release needs a different package from the `@opencode*` families, it must be added by an
+explicit, reviewed change to `package.json` with an exact version and a lockfile diff — never as a
+transitive surprise.
 
 ## Secure operating assumptions
 

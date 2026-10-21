@@ -1,7 +1,7 @@
 # AGENTS.md — OpenCode Ensemble Hardened (`ensemble-room-lowcost`)
 
 > **Repositório:** `/mnt/94CCB337CCB3130A/ensemble-room-lowcost`
-> **Pacote:** `@maiteuxzanela/ensemble-room-lowcost` v`0.18.1`
+> **Pacote:** `ensemble-room-lowcost` (sem escopo, como publicado no NPM) v`0.18.2`
 > **Base upstream:** `@hueyexe/opencode-ensemble@0.18.0` (derivado, endurecido — MIT)
 > **Runtime entrypoint:** `dist/index.js` (bundle autocontido)
 
@@ -116,7 +116,17 @@ Toda alteração neste repositório segue **obrigatoriamente** o ciclo abaixo, n
    ```
    Ambos devem sair com exit 0. Nenhum commit é permitido com teste falhando.
 
-4. **Git commit + push para `origin main`:**
+4. **Validação de empacotamento (pré-publicação):**
+   ```bash
+   npm pack --dry-run --json
+   ```
+   O tarball deve conter apenas `dist/index.js`, `src/`, `tsconfig.json`, `LICENSE`, `README.md`,
+   `CHANGELOG.md`, `SECURITY.md`, `social-preview.png` e `package.json` — nunca `tests/`, `.github/`,
+   `node_modules/`, `.test-scratch/` ou `kanban.json`. O contrato de resolução é
+   `exports["."] = { types: ./src/index.ts, default: ./dist/index.js }`: Node puro consome o bundle
+   compilado; `typescript` é peer **opcional** (instalação headless não puxa o compilador).
+
+5. **Git commit + push para `origin main`:**
    ```bash
    git add -A
    git commit -m "<mensagem descritiva>"

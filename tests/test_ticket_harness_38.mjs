@@ -173,9 +173,20 @@ check("1.pkg package.json.files não contém 'tests'",
 check("1.pkg package.json.files = conjunto exato esperado (nada a mais, nada a menos)",
   Array.isArray(pkg.files) && [...pkg.files].sort().join(",") === [...EXPECTED_FILES].sort().join(","),
   JSON.stringify(pkg.files));
+// Conditional exports: a subpath may be a nested condition object
+// (`{ types, default }`). Flatten every leaf so the disk-existence gate keeps
+// covering both the compiled runtime target and the type entrypoints.
+const exportTargets = (exp) =>
+  typeof exp === "string" ? [exp] : Object.values(exp ?? {}).flatMap(exportTargets);
 check("1.pkg exports apontam para arquivos existentes no disco",
-  Object.entries(pkg.exports ?? {}).every(([, rel]) => existsSync(path.join(PKG, rel))),
+  Object.entries(pkg.exports ?? {}).every(([, exp]) => {
+    const targets = exportTargets(exp);
+    return targets.length > 0 && targets.every((rel) => existsSync(path.join(PKG, rel)));
+  }),
   JSON.stringify(pkg.exports));
+check("1.pkg export raiz entrega o bundle compilado ao Node (default → dist/index.js) e tipos a src",
+  pkg.exports?.["."]?.default === "./dist/index.js" && pkg.exports?.["."]?.types === "./src/index.ts",
+  JSON.stringify(pkg.exports?.["."]));
 
 // ===========================================================================
 // 2. Harness do bundle dist + cópia do src (type-stripping rejeita node_modules).

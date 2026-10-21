@@ -10,8 +10,8 @@
 `ensemble-room-lowcost` gives you a shared team room — an orchestrator (lead), specialists, an SDET and a
 quality-gate reviewer — running on top of OpenCode, with a SQLite-backed task board, per-agent model
 fallback and a deterministic test suite. It is derived from `@hueyexe/opencode-ensemble@0.18.0` and
-hardened in `0.18.1` around one single objective: **do the same orchestration while burning far fewer
-tokens**.
+hardened in the `0.18.x` line around one single objective: **do the same orchestration while burning far
+fewer tokens**.
 
 The two structural wins:
 
@@ -24,9 +24,9 @@ The two structural wins:
 | | |
 |---|---|
 | Package | `ensemble-room-lowcost` |
-| Version | `0.18.1` (upstream base: `@hueyexe/opencode-ensemble@0.18.0`) |
-| Runtime entrypoint | `dist/index.js` — self-contained ESM bundle |
-| Source entrypoint | `src/index.ts` — `exports["."]` |
+| Version | `0.18.2` (upstream base: `@hueyexe/opencode-ensemble@0.18.0`) |
+| Runtime entrypoint | `dist/index.js` — self-contained ESM bundle (`exports["."]`, `main`) |
+| Types entrypoint | `src/index.ts` — TypeScript consumers only (`exports["."].types`) |
 | Repository | `github.com/maiteuxzanela/ensemble-room-lowcost` (branch `main`) |
 | License | MIT |
 | Test suite | 48 deterministic suites, zero mocks, offline-capable |
@@ -607,8 +607,26 @@ must stay green. Restart OpenCode to load the new bundle into memory.
 
 ## 9. Security
 
-See [SECURITY.md](./SECURITY.md) for the formal responsible-disclosure policy, supported versions and
-response targets.
+See [SECURITY.md](./SECURITY.md) for the formal responsible-disclosure policy, supported versions,
+response targets and the **package lineage** register.
+
+### Package lineage (`@opencode/plugin` vs `@opencode-ai/plugin`)
+
+Both packages are legitimate and are used for different SDK generations. `@opencode-ai/plugin` (and
+`@opencode-ai/sdk`) are the official v1 namespace; `@opencode/plugin` is the v2 plugin SDK maintained by
+**Dax Raad (`thdxr`)**, the creator and architect of OpenCode. The runtime imports `Plugin` from
+`@opencode/plugin` and keeps the v1 `server()` export for dual compatibility. `@opencode/plugin` is
+pinned to an exact version (`2.0.16`) and `package-lock.json` carries its registry URL and `sha512`
+integrity hash, so `npm ci` is byte-identical. Verify with:
+
+```bash
+npm ls @opencode/plugin @opencode-ai/plugin @opencode-ai/sdk
+npm view @opencode/plugin version maintainers   # → thdxr <d@ironbay.co>
+npm audit --omit=dev   # 0 vulnerabilities
+```
+
+The coexistence of the two scopes is therefore not typosquatting: it is the documented v1/v2 plugin
+surface, all installed from the public npm registry.
 
 Operational defaults that matter:
 
@@ -625,8 +643,13 @@ Operational defaults that matter:
 - Derived from `@hueyexe/opencode-ensemble@0.18.0` (MIT): `src/`, `dist/`, `LICENSE` and the social
   preview image originate there.
 - `package.json` was rewritten only in `name`, `version`, `description`, `repository`, `keywords`,
-  `files` and `scripts` (`test`, `check`, `typecheck`, `build`); dependencies and `exports` remain
-  equivalent to upstream.
+  `files`, `scripts` (`test`, `check`, `typecheck`, `build`) and the `exports`/`types` map. Since `0.18.2`
+  the package root resolves through `exports["."]` to the compiled `dist/index.js` (with
+  `exports["."].types` → `src/index.ts`), so plain Node consumers no longer hit TypeScript syntax. The
+  optional `./rpc` and `./tui` companion subpaths still point at their TypeScript sources and require
+  Bun/Node type-stripping.
+- `@opencode/plugin` (`2.0.16`) is pinned by exact version in `dependencies`, ahead of the upstream
+  `@opencode/plugin@2.0.3`; its runtime/tooling dependencies are pinned through `package-lock.json`.
 - The published upstream tarball omitted `tsconfig.json`; the file versioned here was recovered from the
   upstream repository with unchanged compiler settings.
 

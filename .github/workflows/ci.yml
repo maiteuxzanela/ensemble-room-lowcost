@@ -22,8 +22,9 @@ jobs:
       fail-fast: false
       matrix:
         # node:sqlite ships unflagged from 22.13; package.json "engines"
-        # declares >=22.22.2 (piso real: dependência aninhada ini@7 exige
-        # ^22.22.2). setup-node resolve a 22.x/24.x atual, sempre acima do piso.
+        # declares >=22.22.2 (hard floor: the nested dependency ini@7 requires
+        # ^22.22.2 || ^24.15.0). setup-node resolves the current 22.x/24.x
+        # release, always above both floors, so both matrix legs are valid.
         node: [22, 24]
 
     steps:
@@ -39,14 +40,34 @@ jobs:
       - name: Install dependencies (clean, lockfile-exact)
         run: npm ci
 
+      # Static gate, first and fastest: `biome check src` exits non-zero on any
+      # error-severity violation (biome.jsonc escalates noExplicitAny to error
+      # and keeps the rest of `recommended` at default severities, so style
+      # warnings are reported but never fail the build by design).
+      - name: Lint sources (biome)
+        run: npx biome check src
+
       - name: Build bundle (dist/index.js)
         run: npm run build
+
+      # Deterministic bundle-drift gate: the committed dist/index.js must be
+      # byte-identical to a fresh build from src/. Any drift (src changed
+      # without rebuilding, or a hand-edited bundle) fails the job here, before
+      # the test suite can mask it.
+      - name: Verify bundle is in sync with src (dist drift)
+        run: git diff --exit-code dist/
 
       - name: Syntax check bundle
         run: npm run check
 
       - name: Typecheck sources
         run: npm run typecheck
+
+      # Packaging smoke check: proves `files`/`exports` resolve into a real
+      # tarball without publishing anything. Catches a broken package layout
+      # before release, not at `npm publish` time.
+      - name: Validate npm package tarball (dry run)
+        run: npm pack --dry-run
 
       # Hermetic suites (TICKET-RELEASE-01): the real `session`/`project` DDL
       # comes from tests/fixtures/session_schema.sql and the standby upgrade
