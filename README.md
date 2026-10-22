@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/ensemble-room-lowcost.svg?color=cb3837&style=flat-square)](https://www.npmjs.com/package/ensemble-room-lowcost)
 [![npm downloads](https://img.shields.io/npm/dm/ensemble-room-lowcost.svg?style=flat-square)](https://www.npmjs.com/package/ensemble-room-lowcost)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](https://opensource.org/licenses/MIT)
-[![Node](https://img.shields.io/badge/node-%3E%3D22.22-339933.svg?style=flat-square)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-%3E%3D22.23-339933.svg?style=flat-square)](https://nodejs.org)
 
 **A hardened, token-efficient multi-agent orchestration runtime for [OpenCode](https://opencode.ai).**
 
@@ -332,7 +332,7 @@ Host/Origin gate on both `GET` and `POST` (DNS-rebinding protection). Set `dashb
 
 ### 5.1 Requirements
 
-- Node.js **>= 22.22.2** (native `node:sqlite`, type stripping)
+- Node.js **>= 22.23.4** (native `node:sqlite`, type stripping)
 - An OpenCode installation (`npm i -g opencode-ai`, or your preferred channel)
 - Bun **>= 1.0** only if you use the TUI helper (`exports["./tui"]`)
 
