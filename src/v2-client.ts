@@ -1,5 +1,19 @@
-import type { PluginClient } from "./types"
+import type { PluginClient, ModelCatalogEntry } from "./types"
 import { runCommand } from "./process"
+
+/**
+ * Structural subset of the REAL V2 catalog domain (see
+ * `@opencode/plugin/dist/promise/catalog.d.ts`): `model.list()` is a
+ * synchronous-catalog-backed Promise that returns the served models directly
+ * (`{ location, data: ModelInfo[] }`, NOT the HeyAPI `{ data: {...} }` shape).
+ */
+export interface V2CatalogDomain {
+  model: {
+    list(input?: { location?: { directory?: string; workspace?: string } }): Promise<{
+      data?: Array<{ id?: string; modelID?: string; providerID?: string; enabled?: boolean }>
+    }>
+  }
+}
 
 /** Structural subset of the REAL V2 plugin context that Ensemble consumes. */
 export interface V2Context {
@@ -23,6 +37,8 @@ export interface V2Context {
   permission: {
     rules(input: Record<string, unknown>): Promise<unknown>
   }
+  /** Live model catalog (present on the real V2 plugin context). */
+  catalog?: V2CatalogDomain
 }
 
 /** Prefix marking a workspace id that is really a local directory (see below). */
@@ -88,6 +104,33 @@ function joinParts(parts: Array<{ type: "text"; text: string }>): string {
  */
 export function createV2Client(ctx: V2Context, deps: V2ClientDeps = {}): PluginClient {
   const gitBranch = deps.gitBranch ?? gitBranchDefault
+  const catalog = ctx.catalog
+  // TICKET-RELEASE-10 (F1): the V2 catalog domain is an in-memory server
+  // catalog — cheap to read and always current. Absent (older host) → the
+  // capability stays undefined and spawn validation fails open.
+  const modelCatalog: PluginClient["modelCatalog"] = catalog
+    ? {
+        list: async (options) => {
+          const output = await catalog.model.list(
+            options?.directory ? { location: { directory: options.directory } } : undefined,
+          )
+          const entries: ModelCatalogEntry[] = []
+          for (const record of output?.data ?? []) {
+            if (!record || typeof record !== "object") continue
+            const modelID = typeof record.modelID === "string" && record.modelID.length > 0
+              ? record.modelID
+              : typeof record.id === "string" && record.id.length > 0 ? record.id : undefined
+            if (typeof record.providerID !== "string" || record.providerID.length === 0 || !modelID) continue
+            entries.push({
+              providerID: record.providerID,
+              modelID,
+              ...(typeof record.enabled === "boolean" ? { enabled: record.enabled } : {}),
+            })
+          }
+          return { data: entries }
+        },
+      }
+    : undefined
   return {
     session: {
       create: async (options) => {
@@ -232,5 +275,6 @@ export function createV2Client(ctx: V2Context, deps: V2ClientDeps = {}): PluginC
         }>,
       }),
     },
+    ...(modelCatalog ? { modelCatalog } : {}),
   } as PluginClient
 }

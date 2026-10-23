@@ -9,8 +9,14 @@ import {
   parseModelSelector,
   resolveFallbackChainForAgent,
   selectFallbackModel,
+  type ModelFallbackRef,
 } from "../config"
 import { log } from "../log"
+import {
+  fetchModelCatalog,
+  resolveSpawnModelFromCatalog,
+  type SpawnModelDecision,
+} from "../model-catalog"
 import { getTeamQAMember, getTeamSDETMember } from "../qa-role"
 import { ensureTeamLeadAgent } from "../lead-agent"
 import type { EnsembleConfig } from "../config"
@@ -99,6 +105,31 @@ function getSpawnTimeout(): number {
 /** Returns true if the directory is already inside an OpenCode worktree. */
 function isWorktreeDirectory(dir: string): boolean {
   return dir.includes("/opencode/worktree/")
+}
+
+/**
+ * Actionable pre-spawn failure: the configured model is absent from the live
+ * catalog AND every configured fallback entry is absent too.
+ *
+ * TICKET-RELEASE-10 (F1): this error is raised BEFORE worktree/workspace/
+ * session creation, so there is nothing to roll back and no orphan session to
+ * reap — the operator gets the diagnosis synchronously in the tool result.
+ * Suggestion list is catalog-derived ("Did you mean"), never hardcoded.
+ */
+export function unavailableSpawnModelError(
+  memberName: string,
+  decision: SpawnModelDecision,
+  chain: readonly ModelFallbackRef[],
+): string {
+  const configured = decision.configured ?? "(unset)"
+  const didYouMean = decision.suggestions.length > 0
+    ? ` Did you mean: ${decision.suggestions.join(", ")}?`
+    : ""
+  const chainLabels = chain.map((entry) => formatModelSelector(entry))
+  const chainInfo = chainLabels.length > 0
+    ? `Configured fallback chain: ${chainLabels.join(" → ")}.`
+    : "No fallback chain is configured."
+  return `Teammate "${memberName}" was NOT spawned: configured model "${configured}" does not exist in this OpenCode server's catalog.${didYouMean} ${chainInfo} None of those models resolve either. Fix ensemble.json (defaultModel / modelsByAgent / fallbackModels) to a model available on this server — list them with \`opencode models\`.`
 }
 
 /** Race a promise against a timeout. Throws if the timeout fires first. Cleans up timer on resolution. */
@@ -285,6 +316,73 @@ export async function executeTeamSpawn(
   // spawn_context and prepended by the first team_message/team_broadcast.
   const useStandby = (args.standby === true || autoStandby) && args.standby !== false
 
+  // -------------------------------------------------------------------------
+  // TICKET-RELEASE-10 (F1) — model resolution + server-truth validation
+  // BEFORE any side effect.
+  //
+  // Live bug (2026-10-22): a configured model absent from the server catalog
+  // (ensemble.json → defaultModel/modelsByAgent/fallbackModels[0]) let the
+  // worktree and session be created, then `promptAsync` died asynchronously
+  // with ProviderModelNotFoundError — and native failover never reacted (it
+  // only handles quota/rate-limit). Resolution now happens here, before
+  // worktree.create/workspace.create/session.create, and the effective model
+  // is validated against the LIVE catalog. When the configured selector is
+  // absent the configured fallback chain is walked to the first served entry;
+  // when nothing resolves the spawn fails fast with an actionable message.
+  // -------------------------------------------------------------------------
+  const memberCount = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId) as { c: number }).c
+  const configuredModel = resolveModel(args.model, agent, memberCount, deps.config, args.name)
+
+  // Resolve the rate-limit fallback chain for THIS agent (per-agent override
+  // `fallbackModelsByAgent[agent]` → global fallbackModels/modelFallback →
+  // DEFAULT_MODEL_FALLBACK). The agent key is already the canonical persona
+  // ("diana"), so a multi-instance member name ("diana-2") inherits its base
+  // persona's chain for free; a suffixed AGENT type ("diana-x") is tolerated
+  // by also trying resolveBasePersona(agent). Persisted nowhere: the chain is
+  // config-derived, so every delivery path recomputes the same result.
+  const agentBasePersona = resolveBasePersona(agent)
+  const agentFallbackChain = agentBasePersona !== agent && deps.config.fallbackModelsByAgent?.[agentBasePersona]?.length
+    ? resolveFallbackChainForAgent(deps.config, agentBasePersona)
+    : resolveFallbackChainForAgent(deps.config, agent)
+
+  const catalog = await fetchModelCatalog(deps.client, deps.directory)
+  const modelDecision = resolveSpawnModelFromCatalog(catalog, configuredModel, agentFallbackChain)
+  if (modelDecision.exhausted) {
+    const message = unavailableSpawnModelError(args.name, modelDecision, agentFallbackChain)
+    log(`spawn:model:unavailable name=${args.name} configured=${configuredModel} suggestions=${modelDecision.suggestions.join(",") || "none"}`)
+    throw new Error(message)
+  }
+  const resolvedModel = modelDecision.model
+  if (modelDecision.substituted) {
+    const didYouMean = modelDecision.suggestions.length > 0
+      ? ` Did you mean: ${modelDecision.suggestions.join(", ")}?`
+      : ""
+    log(`spawn:model:substituted name=${args.name} configured=${configuredModel} model=${resolvedModel} suggestions=${modelDecision.suggestions.join(",") || "none"}`)
+    // Actionable warning: name the absent configured model, the substitution
+    // actually used and the catalog-derived suggestions. Best effort (a host
+    // without a TUI must never block the spawn).
+    try {
+      void deps.client.tui.showToast({
+        title: "Team",
+        message: `Configured model "${configuredModel}" is not in the OpenCode catalog. Spawning "${args.name}" with fallback "${resolvedModel}".${didYouMean}`,
+        variant: "warning",
+        duration: 8000,
+      }).catch(() => { /* TUI may not be available */ })
+    } catch { /* TUI may not be available */ }
+  } else if (resolvedModel) {
+    log(`spawn:model name=${args.name} model=${resolvedModel}`)
+  }
+  if (!catalog) {
+    // Fail-open: a host that exposes no catalog API keeps the legacy behavior
+    // (the server resolves/validates), so spawning is never blocked on a
+    // best-effort enrichment.
+    log(`spawn:model:catalog-unavailable name=${args.name} — keeping configured model without pre-validation`)
+  }
+  // First chain entry differing from the primary — the rung silent failover
+  // (F2) starts from if the server rejects the chosen model at delivery time.
+  const fallbackModel = selectFallbackModel(agentFallbackChain, resolvedModel)
+  if (fallbackModel) log(`spawn:fallback name=${args.name} agent=${agent} fallback=${formatModelSelector(fallbackModel)}`)
+
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`)
 
   // Create worktree if enabled
@@ -451,26 +549,9 @@ export async function executeTeamSpawn(
   // Register in DB
   const planApproval = usePlanApproval ? "pending" : "none"
   const now = Date.now()
-  // Resolve model before DB insert so the stored value matches what promptAsync uses
-  const memberCount = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId) as { c: number }).c
-  const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config, args.name)
-  if (resolvedModel) log(`spawn:model name=${args.name} model=${resolvedModel}`)
-
-  // Resolve the rate-limit fallback chain for THIS agent (per-agent override
-  // `fallbackModelsByAgent[agent]` → global fallbackModels/modelFallback →
-  // DEFAULT_MODEL_FALLBACK). The agent key is already the canonical persona
-  // ("diana"), so a multi-instance member name ("diana-2") inherits its base
-  // persona's chain for free; a suffixed AGENT type ("diana-x") is tolerated
-  // by also trying resolveBasePersona(agent). Persisted nowhere: the chain is
-  // config-derived, so every delivery path recomputes the same result. The
-  // first entry differing from the primary is the one silent failover uses.
-  const agentBasePersona = resolveBasePersona(agent)
-  const agentFallbackChain = agentBasePersona !== agent && deps.config.fallbackModelsByAgent?.[agentBasePersona]?.length
-    ? resolveFallbackChainForAgent(deps.config, agentBasePersona)
-    : resolveFallbackChainForAgent(deps.config, agent)
-  const fallbackModel = selectFallbackModel(agentFallbackChain, resolvedModel)
-  if (fallbackModel) log(`spawn:fallback name=${args.name} agent=${agent} fallback=${formatModelSelector(fallbackModel)}`)
-
+  // `resolvedModel` was resolved AND validated against the live catalog before
+  // any side effect (TICKET-RELEASE-10 / F1) — the value stored here is exactly
+  // the value promptAsync will use, so the DB never lies about a member's model.
   deps.db.run(
     `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, is_qa, role, time_created, time_updated)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

@@ -1,4 +1,4 @@
-import type { PluginClient } from "./types"
+import type { PluginClient, ModelCatalogEntry } from "./types"
 
 /** Extract error message from a HeyAPI error response. */
 function extractError(err: unknown): string {
@@ -65,6 +65,121 @@ interface RawClient {
   tui: { showToast: SdkMethod; selectSession: SdkMethod }
   worktree: { create: SdkMethod; remove: SdkMethod; list: SdkMethod; reset: SdkMethod }
   experimental: { workspace: { create: SdkMethod; remove: SdkMethod; list: SdkMethod } }
+  /** Optional catalog domains (present on the real host client). */
+  model?: { list?: SdkMethod }
+  config?: { providers?: SdkMethod }
+}
+
+/** Extract `{ error }` from a HeyAPI result, if any. */
+function resultError(result: unknown): unknown {
+  if (!result || typeof result !== "object" || !("error" in result)) return undefined
+  const error = (result as { error?: unknown }).error
+  return error === undefined ? undefined : error
+}
+
+/** Map raw model records (v2 `model.list` entries) into catalog entries. */
+function toCatalogEntries(models: unknown): ModelCatalogEntry[] {
+  if (!Array.isArray(models)) return []
+  const entries: ModelCatalogEntry[] = []
+  for (const raw of models) {
+    if (!raw || typeof raw !== "object") continue
+    const record = raw as { id?: unknown; modelID?: unknown; providerID?: unknown; enabled?: unknown }
+    const modelID = typeof record.modelID === "string" && record.modelID.length > 0
+      ? record.modelID
+      : typeof record.id === "string" && record.id.length > 0 ? record.id : undefined
+    if (typeof record.providerID !== "string" || record.providerID.length === 0 || !modelID) continue
+    entries.push({
+      providerID: record.providerID,
+      modelID,
+      ...(typeof record.enabled === "boolean" ? { enabled: record.enabled } : {}),
+    })
+  }
+  return entries
+}
+
+/** v2 SDK `model.list()` → { data: { location, data: ModelInfo[] } }. */
+function catalogFromModelList(result: unknown): ModelCatalogEntry[] | undefined {
+  const payload = (result as { data?: unknown } | null | undefined)?.data
+  if (!payload || typeof payload !== "object") return undefined
+  const models = (payload as { data?: unknown }).data
+  return Array.isArray(models) ? toCatalogEntries(models) : undefined
+}
+
+/** v2 SDK `config.providers()` → { data: { providers, default } }. */
+function catalogFromConfigProviders(result: unknown): ModelCatalogEntry[] | undefined {
+  const payload = (result as { data?: unknown } | null | undefined)?.data
+  if (!payload || typeof payload !== "object") return undefined
+  const providers = (payload as { providers?: unknown }).providers
+  if (!Array.isArray(providers)) return undefined
+  const entries: ModelCatalogEntry[] = []
+  for (const raw of providers) {
+    if (!raw || typeof raw !== "object") continue
+    const provider = raw as { id?: unknown; models?: unknown }
+    if (typeof provider.id !== "string" || provider.id.length === 0) continue
+    const models = provider.models
+    if (Array.isArray(models)) {
+      for (const entry of toCatalogEntries(models)) {
+        entries.push({ ...entry, providerID: provider.id })
+      }
+      continue
+    }
+    if (!models || typeof models !== "object") continue
+    for (const [modelID, value] of Object.entries(models)) {
+      if (!modelID) continue
+      const enabled = value && typeof value === "object"
+        ? (value as { enabled?: unknown }).enabled
+        : undefined
+      entries.push({
+        providerID: provider.id,
+        modelID,
+        ...(typeof enabled === "boolean" ? { enabled } : {}),
+      })
+    }
+  }
+  return entries
+}
+
+/**
+ * Build the optional live-catalog capability from whatever the host client
+ * offers. Preference order:
+ *   1. `model.list()` — flat served-model list (v2 transport), includes
+ *      `enabled`, so disabled models do not resolve;
+ *   2. `config.providers()` — provider map fallback (classic transport).
+ * A host with neither leaves the capability undefined: spawns fail open.
+ */
+function buildModelCatalog(raw: RawClient): PluginClient["modelCatalog"] | undefined {
+  const modelList = raw.model?.list
+  const providers = raw.config?.providers
+  if (!modelList && !providers) return undefined
+  return {
+    list: async (options) => {
+      const directory = options?.directory
+      if (modelList) {
+        try {
+          const result = await modelList(directory ? { location: { directory } } : undefined)
+          const error = resultError(result)
+          if (error !== undefined) throw new Error(extractError(error))
+          const entries = catalogFromModelList(result)
+          if (entries && entries.length > 0) return { data: entries }
+        } catch (err) {
+          // Fall through to the provider map; when there is none, report empty
+          // (caller fails open) instead of breaking the spawn.
+          if (!providers) return {}
+          void err
+        }
+      }
+      if (!providers) return {}
+      try {
+        const result = await providers(directory ? { directory } : undefined)
+        const error = resultError(result)
+        if (error !== undefined) throw new Error(extractError(error))
+        const entries = catalogFromConfigProviders(result)
+        return entries && entries.length > 0 ? { data: entries } : {}
+      } catch {
+        return {}
+      }
+    },
+  }
 }
 
 /**
@@ -78,6 +193,7 @@ interface RawClient {
  */
 export function wrapThrowingClient(raw: unknown, agentResolver?: AgentResolver): PluginClient {
   const r = raw as RawClient
+  const modelCatalog = buildModelCatalog(r)
   return {
     session: {
       create: throwing(r.session.create.bind(r.session)),
@@ -102,5 +218,8 @@ export function wrapThrowingClient(raw: unknown, agentResolver?: AgentResolver):
       remove: throwing(r.experimental.workspace.remove.bind(r.experimental.workspace)),
       list: throwing(r.experimental.workspace.list.bind(r.experimental.workspace)),
     },
+    // TICKET-RELEASE-10 (F1): live catalog capability, only when the host
+    // transport exposes one. Never required — absence means fail-open.
+    ...(modelCatalog ? { modelCatalog } : {}),
   } as PluginClient
 }

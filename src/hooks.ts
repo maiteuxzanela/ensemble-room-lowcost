@@ -2,9 +2,11 @@ import type { Database } from "./db"
 import type { MemberRegistry, DescendantTracker } from "./state"
 import type { PluginClient } from "./types"
 import type { EnsembleConfig } from "./config"
-import { formatModelSelector, parseModelSelector, resolveFallbackChainForAgent, selectNextFallback } from "./config"
+import { formatModelSelector, parseModelSelector, resolveFallbackChainForAgent, selectNextFallback, type ModelFallbackRef } from "./config"
+import { catalogKey, describeModelNotFound, extractModelSelectorFromError, isModelNotFoundError } from "./model-catalog"
 import { abortInflight } from "./v2-session"
 import { notifyLead } from "./notify"
+import { sendMessage } from "./messaging"
 import { releaseMemberTasks } from "./tasks"
 import { findTeamBySession } from "./types"
 import { isQAMember } from "./qa-role"
@@ -656,6 +658,303 @@ function recordFailoverAction(
   failoverActions.set(key, { at, fromModel, toModel, exhausted })
 }
 
+/* ------------------------------------------------------------------ *
+ * Deterministic model-resolution failures (ProviderModelNotFound)     *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Texts a retry/session error can carry the failure detail in. Collecting
+ * every field keeps the detection tolerant to the SDK's union shapes
+ * (`name` + `data.message` for session.error, `message`/`action.*` for
+ * session.status retry payloads).
+ */
+function modelErrorTexts(payload: unknown): string[] {
+  if (!payload) return []
+  if (typeof payload === "string") return [payload]
+  if (typeof payload !== "object") return []
+  const e = payload as {
+    name?: unknown
+    message?: unknown
+    data?: { message?: unknown }
+    action?: { reason?: unknown; message?: unknown; title?: unknown }
+  }
+  const out: string[] = []
+  for (const value of [
+    e.name,
+    e.message,
+    e.data?.message,
+    e.action?.reason,
+    e.action?.message,
+    e.action?.title,
+  ]) {
+    if (typeof value === "string" && value) out.push(value)
+  }
+  return out
+}
+
+/**
+ * True when the payload describes a DETERMINISTIC model-resolution failure
+ * (`ProviderModelNotFoundError` / "Model not found: ...") instead of a
+ * transient rate limit.
+ *
+ * Detection delegates to `isModelNotFoundError` (src/model-catalog.ts, F1).
+ * That helper already normalizes Error, string and `{name,message,data}`
+ * shapes; the extra pass over THIS module's retry-payload fields covers the
+ * `action.reason/message/title` strings the retry status carries and the
+ * catalog helper never sees. There is no second, divergent signature regex.
+ */
+export function isModelResolutionFailure(payload: unknown): boolean {
+  if (!payload) return false
+  if (isModelNotFoundError(payload)) return true
+  return modelErrorTexts(payload).some((text) => isModelNotFoundError(text))
+}
+
+/**
+ * Selector candidates inside an error message. Anchored on the wording
+ * providers actually emit ("Model not found: provider/model", "model `p/m`
+ * does not exist"); used as a fallback when the shared catalog helper
+ * (`extractModelSelectorFromError`, F1) finds nothing.
+ */
+const MODEL_AFTER_NOT_FOUND =
+  /(?:model|provider)[^\n]{0,40}?(?:not\s*found|does\s*not\s*exist|not\s*available|unknown|invalid)[^A-Za-z0-9#]{0,4}([A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w./-]*(?:#[\w.-]+)?)/i
+
+/**
+ * Extract the model selector named by a model-resolution error, normalized via
+ * `parseModelSelector` (§5.1: `#default` never survives). Delegates to the
+ * shared helper from src/model-catalog.ts first so F1 and F2 speak the same
+ * language; returns undefined when neither finds a usable selector — callers
+ * then fall back to the member/current model instead of guessing.
+ */
+export function extractFailedModelSelector(payload: unknown): string | undefined {
+  const candidate = extractModelSelectorFromError(payload)
+    ?? modelErrorTexts(payload).map((text) => MODEL_AFTER_NOT_FOUND.exec(text)?.[1]).find((value) => !!value)
+  if (!candidate) return undefined
+  const parsed = parseModelSelector(candidate)
+  if (!parsed) return undefined
+  return formatModelSelector({
+    model: `${parsed.providerID}/${parsed.modelID}`,
+    ...(parsed.variant ? { variant: parsed.variant } : {}),
+  })
+}
+
+/**
+ * Canonical comparison key for a selector — the SAME normalization used by
+ * `selectNextFallback` (config.ts §5.1). Without it, "p/m#default" would look
+ * different from "p/m" and a deterministic error would restart at chain[0] on
+ * every event: the infinite failover loop the VARIANT_ABSENT_SENTINEL contract
+ * exists to prevent.
+ */
+function canonicalModelKey(selector: string | null | undefined): string | null {
+  if (!selector) return null
+  const trimmed = selector.trim()
+  if (!trimmed) return null
+  const parsed = parseModelSelector(trimmed)
+  if (!parsed) return trimmed
+  return formatModelSelector({
+    model: `${parsed.providerID}/${parsed.modelID}`,
+    ...(parsed.variant ? { variant: parsed.variant } : {}),
+  })
+}
+
+/** True when two selectors name the same provider/model#variant (§5.1). */
+function sameModel(a: string | null | undefined, b: string | null | undefined): boolean {
+  const keyA = canonicalModelKey(a)
+  const keyB = canonicalModelKey(b)
+  return keyA !== null && keyA === keyB
+}
+
+/**
+ * Variant-INDEPENDENT identity of a selector: "provider/model". This is the
+ * model identity a DETERMINISTIC "Model not found" names — `ProviderModelNotFound`
+ * is raised for the MODEL, not for one of its thinking levels, which is exactly
+ * why the shared catalog extractor (src/model-catalog.ts `extractModelSelectorFromError`)
+ * strips `#variant` on purpose and why `catalogKey` compares on provider+model
+ * only (variant is a server-side overlay, never an identity).
+ *
+ * BUG (SDET Hugo, TICKET-RELEASE-10): a member on "prov/a#low" receiving
+ * "Model not found: prov/a" was matched by the variant-CARRYING canonical key,
+ * so the ladder failed to locate the dead rung, fell into the
+ * "current outside the chain" branch and REAPPLIED "prov/a#low" forever — the
+ * infinite loop §5.1 exists to prevent, in a shape §5.1 alone does not cover.
+ */
+function modelIdentity(selector: string | null | undefined): string | null {
+  if (!selector) return null
+  const trimmed = selector.trim()
+  if (!trimmed) return null
+  return catalogKey(trimmed) ?? null
+}
+
+/**
+ * True when a cited selector names the same MODEL as an applied rung, either
+ * exactly (§5.1 normalization) or ignoring the variant (identity match).
+ */
+function namesSameModel(cited: string | null, applied: string | null | undefined): boolean {
+  if (cited === null || !applied) return false
+  if (sameModel(cited, applied)) return true
+  const citedIdentity = modelIdentity(cited)
+  return citedIdentity !== null && citedIdentity === modelIdentity(applied)
+}
+
+type DeterministicFailoverVerdict =
+  | { verdict: "proceed"; walkFrom: string | null }
+  | { verdict: "suppressed"; remainingMs: number }
+
+/**
+ * Gate for a DETERMINISTIC model-resolution failure. Unlike the rate-limit
+ * gate (`evaluateFailoverCooldown`), the long cooldown must NEVER freeze the
+ * chain: a model that does not exist will not start existing on the next
+ * attempt, so the only useful reaction is advancing to the next rung.
+ *
+ * Matching is by MODEL IDENTITY, not by the variant-carrying key: providers
+ * cite the base model ("Model not found: prov/a") while the applied rung
+ * usually carries a variant ("prov/a#low"). Comparing the two literally was
+ * the infinite-reapplication bug found by the SDET.
+ *
+ * Cases:
+ *   - no action yet → proceed from the cited model;
+ *   - a legacy/seeded cooldown entry (no metadata) → proceed: a deterministic
+ *     failure is never a burst echo, so the rate-limit window cannot freeze it;
+ *   - the error names the rung ALREADY APPLIED by the last switch → advance
+ *     immediately, ignoring the debounce (that rung is dead, walking from it
+ *     moves forward; §5.1 keeps `#default` equivalent to the variant-less key);
+ *   - an exhausted chain re-suppresses ONLY the same dead model for
+ *     FAILOVER_COOLDOWN_MS (no repeated actionable alarm); a DIFFERENT failing
+ *     model (e.g. config changed) is re-walked at once;
+ *   - a residual echo of the request that was just aborted (the error still
+ *     names the ABORTED model — the server has not rebound the session yet) is
+ *     suppressed once inside FAILOVER_BURST_DEBOUNCE_MS; past that window it
+ *     must walk from `record.toModel` — the rung actually applied — NEVER from
+ *     the abandoned one, or the ladder replays a no-op (SDET Hugo BUG 2, the
+ *     same rule `evaluateFailoverCooldown` implements for 429s).
+ */
+export function evaluateDeterministicFailover(
+  key: string,
+  failedModel: string | null,
+  now: number,
+): DeterministicFailoverVerdict {
+  const last = failoverCooldown.get(key)
+  if (last === undefined) return { verdict: "proceed", walkFrom: failedModel }
+
+  const elapsed = now - last
+  const record = failoverActions.get(key)
+  if (!record) {
+    // Legacy/seeded entry: a deterministic failure is not a burst echo, so it
+    // always proceeds (the rate-limit cooldown never blocks it).
+    return { verdict: "proceed", walkFrom: failedModel }
+  }
+
+  const namesAppliedRung = namesSameModel(failedModel, record.toModel)
+  const namesAbortedModel = failedModel === null || namesSameModel(failedModel, record.fromModel)
+
+  if (record.exhausted) {
+    if (elapsed < FAILOVER_COOLDOWN_MS && (namesAbortedModel || failedModel === null)) {
+      return { verdict: "suppressed", remainingMs: FAILOVER_COOLDOWN_MS - elapsed }
+    }
+    return { verdict: "proceed", walkFrom: failedModel ?? record.fromModel }
+  }
+
+  // The model we just applied is the one failing → advance NOW, regardless of
+  // the debounce (a nonexistent rung will never recover).
+  if (namesAppliedRung) {
+    return { verdict: "proceed", walkFrom: failedModel }
+  }
+
+  if (namesAbortedModel) {
+    if (elapsed < FAILOVER_BURST_DEBOUNCE_MS) {
+      return { verdict: "suppressed", remainingMs: FAILOVER_BURST_DEBOUNCE_MS - elapsed }
+    }
+    // BUG 2: past the debounce the burst is over and the server's report is
+    // simply stale — walk from the rung ACTUALLY APPLIED, never from the
+    // abandoned one.
+    return { verdict: "proceed", walkFrom: record.toModel ?? failedModel }
+  }
+
+  // A genuinely different model failing: walk from itself.
+  return { verdict: "proceed", walkFrom: failedModel ?? record.toModel }
+}
+
+/**
+ * Deterministic chain walk — the forward-only ladder for a
+ * `ProviderModelNotFound` failure.
+ *
+ * `selectNextFallback` (config.ts) is the rate-limit walk and matches the
+ * variant-CARRYING key; that is correct for a 429 (the same model at another
+ * thinking level can genuinely recover) but wrong for a nonexistent model,
+ * where the provider cites the base selector while the applied rung carries a
+ * variant. Falling into its "current outside the chain" branch re-picks
+ * `chain[0]` — the dead rung — forever (the loop the SDET reproduced).
+ *
+ * This walk is strictly forward and never returns a known-dead model:
+ *   1. `resumeAt` = the highest chain index named by ANY dead/known selector
+ *      (exact §5.1 key first, then model identity), so the ladder can neither
+ *      restart at chain[0] nor step backwards;
+ *   2. every rung whose MODEL IDENTITY (provider/model, variant ignored) is in
+ *      the dead set is skipped — "prov/a#low" and "prov/a#high" are the same
+ *      dead model, not two rungs;
+ *   3. the first surviving rung after `resumeAt` wins; nothing left →
+ *      undefined, i.e. the observable "exhausted" decision (HARNESS-13: log +
+ *      actionable persistence, never a lead wake).
+ */
+export function selectDeterministicNextFallback(
+  chain: readonly ModelFallbackRef[],
+  deadSelectors: readonly (string | null | undefined)[],
+): ModelFallbackRef | undefined {
+  if (chain.length === 0) return undefined
+
+  const deadIdentities = new Set<string>()
+  let resumeAt = -1
+  for (const raw of deadSelectors) {
+    const fullKey = canonicalModelKey(raw)
+    const identity = modelIdentity(raw)
+    if (identity) deadIdentities.add(identity)
+    if (!fullKey) continue
+    for (let index = 0; index < chain.length; index++) {
+      const entry = chain[index]
+      if (!entry) continue
+      if (formatModelSelector(entry) === fullKey && index > resumeAt) resumeAt = index
+    }
+  }
+
+  // Nothing matched by the exact key: fall back to identity matching so a
+  // variant-less citation ("prov/a") still locates its rung ("prov/a#low").
+  if (resumeAt === -1 && deadIdentities.size > 0) {
+    for (const identity of deadIdentities) {
+      for (let index = 0; index < chain.length; index++) {
+        const entry = chain[index]
+        if (!entry) continue
+        if (catalogKey(entry.model) === identity && index > resumeAt) resumeAt = index
+      }
+    }
+  }
+
+  for (let index = resumeAt + 1; index < chain.length; index++) {
+    const entry = chain[index]
+    if (!entry) continue
+    const identity = catalogKey(entry.model)
+    if (identity && deadIdentities.has(identity)) continue
+    return entry
+  }
+  return undefined
+}
+
+/**
+ * Dead selectors a deterministic walk must never return to: the model named by
+ * the error, the model currently bound to the session/member, and the last rung
+ * applied by this same seam (so a stale server report cannot replay it).
+ */
+function collectDeadSelectors(
+  failedModel: string | null,
+  boundModel: string | null,
+  gateWalkFrom: string | null,
+  lastApplied: string | null,
+): string[] {
+  const out: string[] = []
+  for (const value of [failedModel, boundModel, gateWalkFrom, lastApplied]) {
+    if (typeof value === "string" && value.trim()) out.push(value.trim())
+  }
+  return out
+}
+
 /** Outcome of a rate-limit failover evaluation (see handleRetryModelFailover). */
 export interface ModelFailoverDecision {
   /**
@@ -680,6 +979,12 @@ export interface ModelFailoverDecision {
   fromModel: string | null
   /** New selector persisted — only on "switched". */
   toModel?: string
+  /**
+   * Why the seam acted. "rate-limit" is the historical 429/retry path;
+   * "model-not-found" is the DETERMINISTIC ProviderModelNotFound path, which
+   * bypasses the long cooldown (a nonexistent model never recovers).
+   */
+  reason?: "rate-limit" | "model-not-found"
 }
 
 /**
@@ -757,21 +1062,46 @@ export async function handleRetryModelFailover(
 
   const cooldownKey = `${entry.teamId}:${entry.memberName}`
   const now = Date.now()
+  // TICKET-RELEASE-10 (F2): a DETERMINISTIC model-resolution failure
+  // (ProviderModelNotFound / "Model not found: ...") is not a burst echo that
+  // can recover on retry — it must advance the chain even while the rate-limit
+  // cooldown would otherwise suppress. The dedicated gate still dedupes one
+  // burst and never restarts at chain[0] (§5.1 loop guard).
+  const deterministic = isModelResolutionFailure(retryPayload)
+  const failedModel = deterministic
+    ? (extractFailedModelSelector(retryPayload) ?? member.model)
+    : member.model
   // TICKET-HARNESS-53: model-aware gate. A residual retry event of the burst
   // that was just aborted is suppressed (FAILOVER_BURST_DEBOUNCE_MS), but a
   // 429 on the fallback model that was JUST applied advances the ladder
   // immediately instead of freezing the member for FAILOVER_COOLDOWN_MS.
-  const gate = evaluateFailoverCooldown(cooldownKey, member.model, now)
+  const gate = deterministic
+    ? evaluateDeterministicFailover(cooldownKey, failedModel, now)
+    : evaluateFailoverCooldown(cooldownKey, member.model, now)
   if (gate.verdict === "suppressed") {
-    log(`failover:suppressed member=${entry.memberName} remaining_ms=${gate.remainingMs}`)
-    return { action: "suppressed", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model }
+    log(`failover:suppressed member=${entry.memberName} remaining_ms=${gate.remainingMs} reason=${deterministic ? "model-not-found" : "rate-limit"}`)
+    return {
+      action: "suppressed",
+      memberName: entry.memberName,
+      teamId: entry.teamId,
+      fromModel: member.model,
+      reason: deterministic ? "model-not-found" : "rate-limit",
+    }
   }
 
   // Per-agent chain: the member's agent (team_member.agent, e.g. "diana")
   // selects its `fallbackModelsByAgent` override; agents without an override
   // fall back to the global chain (resolveFallbackChainForAgent delegates).
   const chain = resolveFallbackChainForAgent(config, member.agent)
-  const next = selectNextFallback(chain, gate.walkFrom)
+  // Deterministic failures use the strictly-forward, identity-aware walk: the
+  // provider cites the base model while the applied rung carries a variant, so
+  // the rate-limit walk (variant-carrying key) would re-pick the dead rung.
+  const next = deterministic
+    ? selectDeterministicNextFallback(
+      chain,
+      collectDeadSelectors(failedModel, member.model, gate.walkFrom, failoverActions.get(cooldownKey)?.toModel ?? null),
+    )
+    : selectNextFallback(chain, gate.walkFrom)
   if (!next) {
     // HARNESS-13 zero-noise: exhaustion does NOT wake the lead — no
     // notifyLead, no team_message. Log + decision only: the wiring layer
@@ -780,8 +1110,14 @@ export async function handleRetryModelFailover(
     recordFailoverAction(cooldownKey, now, member.model, null, true)
     const detail = retryPayload?.action?.message ?? retryPayload?.message ?? "rate limited"
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty"
-    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}] detail=${detail}`)
-    return { action: "exhausted", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model }
+    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}] reason=${deterministic ? "model-not-found" : "rate-limit"} detail=${detail}`)
+    return {
+      action: "exhausted",
+      memberName: entry.memberName,
+      teamId: entry.teamId,
+      fromModel: member.model,
+      reason: deterministic ? "model-not-found" : "rate-limit",
+    }
   }
 
   const toSelector = formatModelSelector(next)
@@ -790,7 +1126,7 @@ export async function handleRetryModelFailover(
     [toSelector, now, entry.teamId, entry.memberName],
   )
   recordFailoverAction(cooldownKey, now, member.model, toSelector, false)
-  log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} (silent — lead not woken)`)
+  log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} reason=${deterministic ? "model-not-found" : "rate-limit"} (silent — lead not woken)`)
 
   // 1. Cancel in-flight HTTP request controller
   const cancelled = abortInflight(sessionId)
@@ -814,7 +1150,9 @@ export async function handleRetryModelFailover(
         parts: [
           {
             type: "text",
-            text: `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`,
+            text: deterministic
+              ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]`
+              : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`,
           },
         ],
         // Agent EXPLICIT (Diana achado 2 — BLOCKING): omitting `agent` makes
@@ -838,6 +1176,7 @@ export async function handleRetryModelFailover(
     teamId: entry.teamId,
     fromModel: member.model,
     toModel: toSelector,
+    reason: deterministic ? "model-not-found" : "rate-limit",
   }
 }
 
@@ -954,28 +1293,58 @@ async function handleIsolatedSessionFailover(
 
   const cooldownKey = `isolated:${sessionId}`
   const now = Date.now()
+  // TICKET-RELEASE-10 (F2): deterministic model-resolution failures advance
+  // the ladder through the dedicated gate (the rate-limit cooldown must never
+  // freeze them). A lead/isolated session still requires the EXPLICIT
+  // per-agent chain checked above — the global chain never sequesters it.
+  const deterministic = isModelResolutionFailure(retryPayload)
+  const failedModel = deterministic
+    ? (extractFailedModelSelector(retryPayload) ?? currentModel)
+    : currentModel
   // TICKET-HARNESS-53: same model-aware gate as the member path (this one
   // covers the Lead and Diana's isolated blind-review session — fixing only
   // the member path would leave both stuck on the second 429).
   const gate = evaluateFailoverCooldown(cooldownKey, currentModel, now)
-  if (gate.verdict === "suppressed") {
-    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${gate.remainingMs}`)
-    return { action: "suppressed", memberName: agent, teamId: "", fromModel: currentModel }
+  // F2: the deterministic gate REPLACES the rate-limit verdict for a
+  // model-resolution failure; it never disables the gate above for 429s.
+  const effectiveGate = deterministic
+    ? evaluateDeterministicFailover(cooldownKey, failedModel, now)
+    : gate
+  if (effectiveGate.verdict === "suppressed") {
+    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${effectiveGate.remainingMs} reason=${deterministic ? "model-not-found" : "rate-limit"}`)
+    return {
+      action: "suppressed",
+      memberName: agent,
+      teamId: "",
+      fromModel: currentModel,
+      reason: deterministic ? "model-not-found" : "rate-limit",
+    }
   }
 
-  const next = selectNextFallback(chain, gate.walkFrom)
+  const next = deterministic
+    ? selectDeterministicNextFallback(
+      chain,
+      collectDeadSelectors(failedModel, currentModel, effectiveGate.walkFrom, failoverActions.get(cooldownKey)?.toModel ?? null),
+    )
+    : selectNextFallback(chain, effectiveGate.walkFrom)
   if (!next) {
     // Chain exhausted — surface the decision so the wiring layer can toast.
     // HARNESS-13 zero-noise: the lead is NEVER woken from a failover path.
     recordFailoverAction(cooldownKey, now, currentModel, null, true)
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty"
-    log(`failover:exhausted ${scope} session=${sessionId} agent=${agent} model=${currentModel ?? "default"} chain=[${chainDesc}]`)
-    return { action: "exhausted", memberName: agent, teamId: "", fromModel: currentModel }
+    log(`failover:exhausted ${scope} session=${sessionId} agent=${agent} model=${currentModel ?? "default"} chain=[${chainDesc}] reason=${deterministic ? "model-not-found" : "rate-limit"}`)
+    return {
+      action: "exhausted",
+      memberName: agent,
+      teamId: "",
+      fromModel: currentModel,
+      reason: deterministic ? "model-not-found" : "rate-limit",
+    }
   }
 
   const toSelector = formatModelSelector(next)
   recordFailoverAction(cooldownKey, now, currentModel, toSelector, false)
-  log(`failover:switched ${scope} session=${sessionId} agent=${agent} from=${currentModel ?? "default"} to=${toSelector} (silent — lead not woken)`)
+  log(`failover:switched ${scope} session=${sessionId} agent=${agent} from=${currentModel ?? "default"} to=${toSelector} reason=${deterministic ? "model-not-found" : "rate-limit"} (silent — lead not woken)`)
 
   // Same active cycle as the member path: cancel in-flight, abort the native
   // retry backoff, then relaunch the turn on the next model.
@@ -998,7 +1367,9 @@ async function handleIsolatedSessionFailover(
         parts: [
           {
             type: "text",
-            text: `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`,
+            text: deterministic
+              ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]`
+              : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`,
           },
         ],
         // Agent EXPLICIT (Diana achado 2 — BLOCKING, HARNESS-15 A rule 1b):
@@ -1015,5 +1386,110 @@ async function handleIsolatedSessionFailover(
     }
   }
 
-  return { action: "switched", memberName: agent, teamId: "", fromModel: currentModel, toModel: toSelector }
+  return {
+    action: "switched",
+    memberName: agent,
+    teamId: "",
+    fromModel: currentModel,
+    toModel: toSelector,
+    reason: deterministic ? "model-not-found" : "rate-limit",
+  }
+}
+
+/**
+ * TICKET-RELEASE-10 (F2) — REACTIVE failover for a DETERMINISTIC
+ * model-resolution failure (`ProviderModelNotFoundError` / "Model not found:
+ * ...") surfaced as a `session.error` event.
+ *
+ * Why this seam exists: `session.error` used to only notify the lead ("had a
+ * session error"), so a member spawned on a model the provider does not serve
+ * died on its first turn while the fallback chain — which the config already
+ * carries — was never walked. Rate limits go through the `retry` status path;
+ * a nonexistent model does not retry, so it needs this entry point.
+ *
+ * Mechanics:
+ *   1. Only deterministic model-resolution errors are intercepted; every
+ *      other error returns undefined and the caller keeps the generic alarm.
+ *   2. The member/isolated split is delegated to handleRetryModelFailover with
+ *      a synthetic retry payload carrying the deterministic signature. That
+ *      reuses the exact same chain resolution, §5.1 normalization (no
+ *      chain[0] restart loop), member-only `team_member.model` persistence,
+ *      abort + resume cycle, and HARNESS-13 zero-noise policy.
+ *   3. EXHAUSTION is ACTIONABLE but NEVER wakes the lead: the message is
+ *      persisted via sendMessage (delivered=0, passive channel — NOT
+ *      notifyLead/forceWake) plus a user-visible toast that names the failed
+ *      model and the chain, so the fix (edit ensemble.json / respawn) is
+ *      obvious without interrupting the orchestrator.
+ *
+ * Never throws — safe to await from an event handler.
+ */
+export async function handleModelNotFoundSessionError(
+  db: Database,
+  registry: MemberRegistry,
+  client: PluginClient,
+  config: Required<EnsembleConfig>,
+  sessionId: string | undefined,
+  error: SessionErrorPayload | undefined,
+): Promise<ModelFailoverDecision | undefined> {
+  if (!sessionId || !error) return undefined
+  if (isAbortError(error)) return undefined
+  if (!isModelResolutionFailure(error)) return undefined
+
+  const failedModel = extractFailedModelSelector(error) ?? null
+  const decision = await handleRetryModelFailover(db, registry, client, config, sessionId, {
+    attempt: 0,
+    // Join every text field so the detection in the retry seam sees the same
+    // signature (name "ProviderModelNotFoundError" AND the "Model not found"
+    // message), whichever one the helper keys on.
+    message: modelErrorTexts(error).join(" | ") || "Model not found",
+    next: Date.now(),
+  })
+
+  if (decision?.action !== "exhausted") return decision
+
+  // ACTIONABLE exhaustion. HARNESS-13: the lead is NEVER woken from a failover
+  // path — persist passively (delivered=0) and toast the user.
+  const teamInfo = findTeamBySession(db, registry, sessionId)
+  // The chain belongs to the AGENT, not to the member name: member "bia" with
+  // agent "diana" must report diana's per-agent chain, never the global one.
+  // Isolated/lead decisions already carry the agent in `memberName`.
+  const chainAgent = teamInfo?.memberName
+    ? (db.query("SELECT agent FROM team_member WHERE team_id = ? AND name = ?")
+      .get(teamInfo.teamId, teamInfo.memberName) as { agent: string | null } | null)?.agent ?? decision.memberName
+    : decision.memberName
+  const chain = resolveFallbackChainForAgent(config, chainAgent)
+  const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty"
+  const failedLabel = failedModel ?? decision.fromModel ?? "the configured model"
+  // Human-readable diagnosis only — the persistence below is the parameterized
+  // INSERT inside sendMessage (src/messaging.ts), never a composed statement.
+  // The remedy sentence is pre-computed and deliberately uses "Fix", so no
+  // prose token ever sits next to a template interpolation.
+  const chainLabel = chainDesc
+  const remedy = "Fix ensemble.json (modelsByAgent / defaultModel / fallbackModels) to a model the provider actually serves, then respawn the teammate."
+  const text =
+    `${describeModelNotFound(error)} Fallback chain for "${decision.memberName}" is exhausted ` +
+    `[${chainLabel}]. ${remedy}`
+
+  if (teamInfo) {
+    try {
+      sendMessage(db, { teamId: teamInfo.teamId, from: "system", to: "lead", content: text })
+    } catch (err) {
+      log(`failover:model-not-found:persist:failed session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  log(`failover:model-not-found:exhausted session=${sessionId} member=${decision.memberName} model=${failedLabel} chain=[${chainDesc}]`)
+  try {
+    await client.tui.showToast({
+      title: "Team",
+      message: `Model "${failedLabel}" not found — no fallback left for ${decision.memberName}. Fix ensemble.json and respawn.`,
+      variant: "error",
+      duration: 8000,
+    })
+  } catch (err) {
+    // NOT silent: a host without a TUI must not block the failover, but the
+    // suppressed notification stays observable in the log.
+    log(`failover:model-not-found:toast:failed session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  return decision
 }

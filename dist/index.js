@@ -1033,6 +1033,132 @@ function lastRoomActivity(db, teamId) {
   return 0;
 }
 
+// src/model-catalog.ts
+function errorText(err) {
+  if (typeof err === "string") return err;
+  if (!err || typeof err !== "object") return String(err ?? "");
+  const e = err;
+  const parts = [];
+  for (const key of ["name", "message"]) {
+    const value = e[key];
+    if (typeof value === "string" && value.length > 0) parts.push(value);
+  }
+  const data = e["data"];
+  if (data && typeof data === "object") {
+    for (const key of ["name", "message"]) {
+      const value = data[key];
+      if (typeof value === "string" && value.length > 0) parts.push(value);
+    }
+  }
+  const nested = e["error"];
+  if (typeof nested === "string") parts.push(nested);
+  else if (nested instanceof Error) parts.push(nested.message);
+  return parts.join(" | ");
+}
+function isModelNotFoundError(err) {
+  const text = errorText(err);
+  if (!text) return false;
+  if (/ProviderModelNotFound(Error)?/i.test(text)) return true;
+  if (/provider\s+model\s+not\s+found/i.test(text)) return true;
+  if (/\bmodel\s+not\s+found\b/i.test(text)) return true;
+  if (/\bmodelnotfound(error)?\b/i.test(text)) return true;
+  return false;
+}
+function catalogKey(selector) {
+  if (typeof selector !== "string") return void 0;
+  const parsed = parseModelSelector(selector.trim());
+  return parsed ? `${parsed.providerID}/${parsed.modelID}` : void 0;
+}
+function isSelectorAvailable(catalog, selector) {
+  const parsed = parseModelSelector(typeof selector === "string" ? selector.trim() : "");
+  if (!parsed) return false;
+  return catalog.some(
+    (entry) => entry.providerID === parsed.providerID && entry.modelID === parsed.modelID && entry.enabled !== false
+  );
+}
+function editDistance(a, b) {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a.charCodeAt(i - 1) === b.charCodeAt(j - 1) ? 0 : 1;
+      current[j] = Math.min(
+        (previous[j] ?? 0) + 1,
+        (current[j - 1] ?? 0) + 1,
+        (previous[j - 1] ?? 0) + cost
+      );
+    }
+    previous = current;
+  }
+  return previous[b.length] ?? Math.max(a.length, b.length);
+}
+function suggestModelSelectors(catalog, selector, limit = 3) {
+  const parsed = parseModelSelector(typeof selector === "string" ? selector.trim() : "");
+  if (!parsed || catalog.length === 0 || limit <= 0) return [];
+  const available = catalog.filter((entry) => entry.enabled !== false && entry.providerID && entry.modelID);
+  if (available.length === 0) return [];
+  const sameProvider = available.filter((entry) => entry.providerID === parsed.providerID);
+  const key = `${parsed.providerID}/${parsed.modelID}`;
+  const scored = (sameProvider.length > 0 ? sameProvider : available).map((entry) => {
+    const full = `${entry.providerID}/${entry.modelID}`;
+    return {
+      full,
+      distance: sameProvider.length > 0 ? editDistance(entry.modelID, parsed.modelID) : editDistance(full, key)
+    };
+  }).sort((a, b) => a.distance - b.distance || a.full.localeCompare(b.full));
+  const filtered = sameProvider.length > 0 ? scored : scored.filter((entry) => entry.distance <= Math.max(4, Math.floor(key.length / 3)));
+  const suggestions = [];
+  for (const entry of filtered) {
+    if (entry.full === key || suggestions.includes(entry.full)) continue;
+    suggestions.push(entry.full);
+    if (suggestions.length >= limit) break;
+  }
+  return suggestions;
+}
+function extractModelSelectorFromError(err) {
+  const text = errorText(err);
+  const match = text.match(/([A-Za-z0-9][A-Za-z0-9._-]*)\/([A-Za-z0-9][A-Za-z0-9._/-]*)/);
+  if (!match) return void 0;
+  return `${match[1]}/${match[2]}`.replace(/#.*$/, "");
+}
+function describeModelNotFound(err, catalog = []) {
+  const selector = extractModelSelectorFromError(err);
+  const suggestions = selector ? suggestModelSelectors(catalog, selector) : [];
+  const label = selector ? `Model not found: ${selector}.` : `Model not found: ${errorText(err) || "unknown model"}.`;
+  return suggestions.length > 0 ? `${label} Did you mean: ${suggestions.join(", ")}?` : `${label} No catalog suggestion available.`;
+}
+function resolveSpawnModelFromCatalog(catalog, requested, chain = []) {
+  const configured = requested;
+  const base = { configured, substituted: false, exhausted: false, suggestions: [] };
+  if (!requested) return { model: void 0, ...base };
+  if (!catalog || catalog.length === 0) return { model: requested, ...base };
+  if (isSelectorAvailable(catalog, requested)) return { model: requested, ...base };
+  const suggestions = suggestModelSelectors(catalog, requested);
+  const requestedKey = catalogKey(requested);
+  for (const entry of chain) {
+    const selector = formatModelSelector(entry);
+    if (catalogKey(selector) === requestedKey) continue;
+    if (isSelectorAvailable(catalog, selector)) {
+      return { model: selector, configured, substituted: true, exhausted: false, suggestions };
+    }
+  }
+  return { model: void 0, configured, substituted: false, exhausted: true, suggestions };
+}
+async function fetchModelCatalog(client, directory) {
+  const list = client.modelCatalog?.list;
+  if (!list) return void 0;
+  try {
+    const result = await list(directory ? { directory } : void 0);
+    const entries = result?.data;
+    return Array.isArray(entries) && entries.length > 0 ? entries : void 0;
+  } catch {
+    return void 0;
+  }
+}
+
 // src/v2-session.ts
 async function deliverPrompt(port, sessionID, text, agent) {
   if (agent) await port.switchAgent?.({ sessionID, agent });
@@ -1214,6 +1340,13 @@ function resolveLeadWakeContext(db, teamId) {
   if (!team?.lead_session_id) return void 0;
   return { leadSessionId: team.lead_session_id, leadAgent: team.lead_agent || void 0 };
 }
+var MODEL_NOT_FOUND_WAKE_TTL_MS = 10 * 60 * 1e3;
+var modelNotFoundWakeSessions = /* @__PURE__ */ new Map();
+function isModelNotFoundWakeError(err) {
+  if (isModelNotFoundError(err)) return true;
+  const message = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  return message.length > 0 && isModelNotFoundError(message);
+}
 function promptModelAwareWake(client, params) {
   const { sessionID, text, logTag, agent, config, primaryModel, synthetic = true } = params;
   const ladder = [primaryModel || void 0];
@@ -1225,6 +1358,16 @@ function promptModelAwareWake(client, params) {
         seen.add(selector);
         ladder.push(selector);
       }
+    }
+  }
+  let startIndex = 0;
+  const remembered = modelNotFoundWakeSessions.get(sessionID);
+  if (remembered) {
+    if (Date.now() - remembered.at >= MODEL_NOT_FOUND_WAKE_TTL_MS) {
+      modelNotFoundWakeSessions.delete(sessionID);
+    } else if (remembered.nextIndex > 0 && ladder.length > 0) {
+      startIndex = Math.min(remembered.nextIndex, ladder.length - 1);
+      log(`${logTag}:skip-dead-rungs session=${sessionID} failed=${remembered.failedRung} start=${startIndex}`);
     }
   }
   const attempt = (index) => {
@@ -1241,16 +1384,24 @@ function promptModelAwareWake(client, params) {
       log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${rung}`);
     }).catch((err) => {
       const errMsg = err instanceof Error ? err.message : String(err);
+      const deterministic = isModelNotFoundWakeError(err);
+      if (deterministic) {
+        modelNotFoundWakeSessions.set(sessionID, {
+          at: Date.now(),
+          failedRung: rung,
+          nextIndex: index + 1 < ladder.length ? index + 1 : ladder.length
+        });
+      }
       const next = index + 1 < ladder.length ? ladder[index + 1] : void 0;
       if (next) {
-        log(`${logTag}:retry session=${sessionID} from=${rung} to=${next} err=${errMsg}`);
+        log(`${logTag}:retry session=${sessionID} from=${rung} to=${next} reason=${deterministic ? "model-not-found" : "transport"} err=${errMsg}`);
         attempt(index + 1);
       } else {
-        log(`${logTag}:failed session=${sessionID} model=${rung} err=${errMsg}`);
+        log(`${logTag}:${deterministic ? "model-not-found:exhausted" : "failed"} session=${sessionID} model=${rung} err=${errMsg}`);
       }
     });
   };
-  attempt(0);
+  attempt(startIndex);
 }
 function notifyLead(client, db, teamId, content, options) {
   const id = sendMessage(db, { teamId, from: "system", to: "lead", content });
@@ -1643,6 +1794,135 @@ function recordFailoverAction(key, at, fromModel, toModel, exhausted) {
   failoverCooldown.set(key, at);
   failoverActions.set(key, { at, fromModel, toModel, exhausted });
 }
+function modelErrorTexts(payload) {
+  if (!payload) return [];
+  if (typeof payload === "string") return [payload];
+  if (typeof payload !== "object") return [];
+  const e = payload;
+  const out = [];
+  for (const value of [
+    e.name,
+    e.message,
+    e.data?.message,
+    e.action?.reason,
+    e.action?.message,
+    e.action?.title
+  ]) {
+    if (typeof value === "string" && value) out.push(value);
+  }
+  return out;
+}
+function isModelResolutionFailure(payload) {
+  if (!payload) return false;
+  if (isModelNotFoundError(payload)) return true;
+  return modelErrorTexts(payload).some((text) => isModelNotFoundError(text));
+}
+var MODEL_AFTER_NOT_FOUND = /(?:model|provider)[^\n]{0,40}?(?:not\s*found|does\s*not\s*exist|not\s*available|unknown|invalid)[^A-Za-z0-9#]{0,4}([A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w./-]*(?:#[\w.-]+)?)/i;
+function extractFailedModelSelector(payload) {
+  const candidate = extractModelSelectorFromError(payload) ?? modelErrorTexts(payload).map((text) => MODEL_AFTER_NOT_FOUND.exec(text)?.[1]).find((value) => !!value);
+  if (!candidate) return void 0;
+  const parsed = parseModelSelector(candidate);
+  if (!parsed) return void 0;
+  return formatModelSelector({
+    model: `${parsed.providerID}/${parsed.modelID}`,
+    ...parsed.variant ? { variant: parsed.variant } : {}
+  });
+}
+function canonicalModelKey(selector) {
+  if (!selector) return null;
+  const trimmed = selector.trim();
+  if (!trimmed) return null;
+  const parsed = parseModelSelector(trimmed);
+  if (!parsed) return trimmed;
+  return formatModelSelector({
+    model: `${parsed.providerID}/${parsed.modelID}`,
+    ...parsed.variant ? { variant: parsed.variant } : {}
+  });
+}
+function sameModel(a, b) {
+  const keyA = canonicalModelKey(a);
+  const keyB = canonicalModelKey(b);
+  return keyA !== null && keyA === keyB;
+}
+function modelIdentity(selector) {
+  if (!selector) return null;
+  const trimmed = selector.trim();
+  if (!trimmed) return null;
+  return catalogKey(trimmed) ?? null;
+}
+function namesSameModel(cited, applied) {
+  if (cited === null || !applied) return false;
+  if (sameModel(cited, applied)) return true;
+  const citedIdentity = modelIdentity(cited);
+  return citedIdentity !== null && citedIdentity === modelIdentity(applied);
+}
+function evaluateDeterministicFailover(key, failedModel, now) {
+  const last = failoverCooldown.get(key);
+  if (last === void 0) return { verdict: "proceed", walkFrom: failedModel };
+  const elapsed = now - last;
+  const record = failoverActions.get(key);
+  if (!record) {
+    return { verdict: "proceed", walkFrom: failedModel };
+  }
+  const namesAppliedRung = namesSameModel(failedModel, record.toModel);
+  const namesAbortedModel = failedModel === null || namesSameModel(failedModel, record.fromModel);
+  if (record.exhausted) {
+    if (elapsed < FAILOVER_COOLDOWN_MS && (namesAbortedModel || failedModel === null)) {
+      return { verdict: "suppressed", remainingMs: FAILOVER_COOLDOWN_MS - elapsed };
+    }
+    return { verdict: "proceed", walkFrom: failedModel ?? record.fromModel };
+  }
+  if (namesAppliedRung) {
+    return { verdict: "proceed", walkFrom: failedModel };
+  }
+  if (namesAbortedModel) {
+    if (elapsed < FAILOVER_BURST_DEBOUNCE_MS) {
+      return { verdict: "suppressed", remainingMs: FAILOVER_BURST_DEBOUNCE_MS - elapsed };
+    }
+    return { verdict: "proceed", walkFrom: record.toModel ?? failedModel };
+  }
+  return { verdict: "proceed", walkFrom: failedModel ?? record.toModel };
+}
+function selectDeterministicNextFallback(chain, deadSelectors) {
+  if (chain.length === 0) return void 0;
+  const deadIdentities = /* @__PURE__ */ new Set();
+  let resumeAt = -1;
+  for (const raw of deadSelectors) {
+    const fullKey = canonicalModelKey(raw);
+    const identity = modelIdentity(raw);
+    if (identity) deadIdentities.add(identity);
+    if (!fullKey) continue;
+    for (let index = 0; index < chain.length; index++) {
+      const entry = chain[index];
+      if (!entry) continue;
+      if (formatModelSelector(entry) === fullKey && index > resumeAt) resumeAt = index;
+    }
+  }
+  if (resumeAt === -1 && deadIdentities.size > 0) {
+    for (const identity of deadIdentities) {
+      for (let index = 0; index < chain.length; index++) {
+        const entry = chain[index];
+        if (!entry) continue;
+        if (catalogKey(entry.model) === identity && index > resumeAt) resumeAt = index;
+      }
+    }
+  }
+  for (let index = resumeAt + 1; index < chain.length; index++) {
+    const entry = chain[index];
+    if (!entry) continue;
+    const identity = catalogKey(entry.model);
+    if (identity && deadIdentities.has(identity)) continue;
+    return entry;
+  }
+  return void 0;
+}
+function collectDeadSelectors(failedModel, boundModel, gateWalkFrom, lastApplied) {
+  const out = [];
+  for (const value of [failedModel, boundModel, gateWalkFrom, lastApplied]) {
+    if (typeof value === "string" && value.trim()) out.push(value.trim());
+  }
+  return out;
+}
 async function handleRetryModelFailover(db, registry, client, config, sessionId, retryPayload) {
   const entry = registry.getBySession(sessionId);
   if (!entry) {
@@ -1657,19 +1937,36 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
   }
   const cooldownKey = `${entry.teamId}:${entry.memberName}`;
   const now = Date.now();
-  const gate = evaluateFailoverCooldown(cooldownKey, member.model, now);
+  const deterministic = isModelResolutionFailure(retryPayload);
+  const failedModel = deterministic ? extractFailedModelSelector(retryPayload) ?? member.model : member.model;
+  const gate = deterministic ? evaluateDeterministicFailover(cooldownKey, failedModel, now) : evaluateFailoverCooldown(cooldownKey, member.model, now);
   if (gate.verdict === "suppressed") {
-    log(`failover:suppressed member=${entry.memberName} remaining_ms=${gate.remainingMs}`);
-    return { action: "suppressed", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model };
+    log(`failover:suppressed member=${entry.memberName} remaining_ms=${gate.remainingMs} reason=${deterministic ? "model-not-found" : "rate-limit"}`);
+    return {
+      action: "suppressed",
+      memberName: entry.memberName,
+      teamId: entry.teamId,
+      fromModel: member.model,
+      reason: deterministic ? "model-not-found" : "rate-limit"
+    };
   }
   const chain = resolveFallbackChainForAgent(config, member.agent);
-  const next = selectNextFallback(chain, gate.walkFrom);
+  const next = deterministic ? selectDeterministicNextFallback(
+    chain,
+    collectDeadSelectors(failedModel, member.model, gate.walkFrom, failoverActions.get(cooldownKey)?.toModel ?? null)
+  ) : selectNextFallback(chain, gate.walkFrom);
   if (!next) {
     recordFailoverAction(cooldownKey, now, member.model, null, true);
     const detail = retryPayload?.action?.message ?? retryPayload?.message ?? "rate limited";
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty";
-    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}] detail=${detail}`);
-    return { action: "exhausted", memberName: entry.memberName, teamId: entry.teamId, fromModel: member.model };
+    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}] reason=${deterministic ? "model-not-found" : "rate-limit"} detail=${detail}`);
+    return {
+      action: "exhausted",
+      memberName: entry.memberName,
+      teamId: entry.teamId,
+      fromModel: member.model,
+      reason: deterministic ? "model-not-found" : "rate-limit"
+    };
   }
   const toSelector = formatModelSelector(next);
   db.run(
@@ -1677,7 +1974,7 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
     [toSelector, now, entry.teamId, entry.memberName]
   );
   recordFailoverAction(cooldownKey, now, member.model, toSelector, false);
-  log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} (silent \u2014 lead not woken)`);
+  log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} reason=${deterministic ? "model-not-found" : "rate-limit"} (silent \u2014 lead not woken)`);
   const cancelled = abortInflight(sessionId);
   log(`failover:abort-inflight member=${entry.memberName} session=${sessionId} cancelled=${cancelled}`);
   if (typeof client.session?.abort === "function") {
@@ -1695,7 +1992,7 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
         parts: [
           {
             type: "text",
-            text: `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`
+            text: deterministic ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]` : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`
           }
         ],
         // Agent EXPLICIT (Diana achado 2 — BLOCKING): omitting `agent` makes
@@ -1717,7 +2014,8 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
     memberName: entry.memberName,
     teamId: entry.teamId,
     fromModel: member.model,
-    toModel: toSelector
+    toModel: toSelector,
+    reason: deterministic ? "model-not-found" : "rate-limit"
   };
 }
 async function handleIsolatedSessionFailover(db, client, config, sessionId, retryPayload) {
@@ -1750,21 +2048,39 @@ async function handleIsolatedSessionFailover(db, client, config, sessionId, retr
   if (chain.length === 0) return void 0;
   const cooldownKey = `isolated:${sessionId}`;
   const now = Date.now();
+  const deterministic = isModelResolutionFailure(retryPayload);
+  const failedModel = deterministic ? extractFailedModelSelector(retryPayload) ?? currentModel : currentModel;
   const gate = evaluateFailoverCooldown(cooldownKey, currentModel, now);
-  if (gate.verdict === "suppressed") {
-    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${gate.remainingMs}`);
-    return { action: "suppressed", memberName: agent, teamId: "", fromModel: currentModel };
+  const effectiveGate = deterministic ? evaluateDeterministicFailover(cooldownKey, failedModel, now) : gate;
+  if (effectiveGate.verdict === "suppressed") {
+    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${effectiveGate.remainingMs} reason=${deterministic ? "model-not-found" : "rate-limit"}`);
+    return {
+      action: "suppressed",
+      memberName: agent,
+      teamId: "",
+      fromModel: currentModel,
+      reason: deterministic ? "model-not-found" : "rate-limit"
+    };
   }
-  const next = selectNextFallback(chain, gate.walkFrom);
+  const next = deterministic ? selectDeterministicNextFallback(
+    chain,
+    collectDeadSelectors(failedModel, currentModel, effectiveGate.walkFrom, failoverActions.get(cooldownKey)?.toModel ?? null)
+  ) : selectNextFallback(chain, effectiveGate.walkFrom);
   if (!next) {
     recordFailoverAction(cooldownKey, now, currentModel, null, true);
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty";
-    log(`failover:exhausted ${scope} session=${sessionId} agent=${agent} model=${currentModel ?? "default"} chain=[${chainDesc}]`);
-    return { action: "exhausted", memberName: agent, teamId: "", fromModel: currentModel };
+    log(`failover:exhausted ${scope} session=${sessionId} agent=${agent} model=${currentModel ?? "default"} chain=[${chainDesc}] reason=${deterministic ? "model-not-found" : "rate-limit"}`);
+    return {
+      action: "exhausted",
+      memberName: agent,
+      teamId: "",
+      fromModel: currentModel,
+      reason: deterministic ? "model-not-found" : "rate-limit"
+    };
   }
   const toSelector = formatModelSelector(next);
   recordFailoverAction(cooldownKey, now, currentModel, toSelector, false);
-  log(`failover:switched ${scope} session=${sessionId} agent=${agent} from=${currentModel ?? "default"} to=${toSelector} (silent \u2014 lead not woken)`);
+  log(`failover:switched ${scope} session=${sessionId} agent=${agent} from=${currentModel ?? "default"} to=${toSelector} reason=${deterministic ? "model-not-found" : "rate-limit"} (silent \u2014 lead not woken)`);
   const cancelled = abortInflight(sessionId);
   log(`failover:abort-inflight ${scope} session=${sessionId} cancelled=${cancelled}`);
   if (typeof client.session?.abort === "function") {
@@ -1782,7 +2098,7 @@ async function handleIsolatedSessionFailover(db, client, config, sessionId, retr
         parts: [
           {
             type: "text",
-            text: `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`
+            text: deterministic ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]` : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`
           }
         ],
         // Agent EXPLICIT (Diana achado 2 — BLOCKING, HARNESS-15 A rule 1b):
@@ -1798,7 +2114,56 @@ async function handleIsolatedSessionFailover(db, client, config, sessionId, retr
       log(`failover:promptAsync:failed ${scope} session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  return { action: "switched", memberName: agent, teamId: "", fromModel: currentModel, toModel: toSelector };
+  return {
+    action: "switched",
+    memberName: agent,
+    teamId: "",
+    fromModel: currentModel,
+    toModel: toSelector,
+    reason: deterministic ? "model-not-found" : "rate-limit"
+  };
+}
+async function handleModelNotFoundSessionError(db, registry, client, config, sessionId, error) {
+  if (!sessionId || !error) return void 0;
+  if (isAbortError(error)) return void 0;
+  if (!isModelResolutionFailure(error)) return void 0;
+  const failedModel = extractFailedModelSelector(error) ?? null;
+  const decision = await handleRetryModelFailover(db, registry, client, config, sessionId, {
+    attempt: 0,
+    // Join every text field so the detection in the retry seam sees the same
+    // signature (name "ProviderModelNotFoundError" AND the "Model not found"
+    // message), whichever one the helper keys on.
+    message: modelErrorTexts(error).join(" | ") || "Model not found",
+    next: Date.now()
+  });
+  if (decision?.action !== "exhausted") return decision;
+  const teamInfo = findTeamBySession(db, registry, sessionId);
+  const chainAgent = teamInfo?.memberName ? db.query("SELECT agent FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, teamInfo.memberName)?.agent ?? decision.memberName : decision.memberName;
+  const chain = resolveFallbackChainForAgent(config, chainAgent);
+  const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty";
+  const failedLabel = failedModel ?? decision.fromModel ?? "the configured model";
+  const chainLabel = chainDesc;
+  const remedy = "Fix ensemble.json (modelsByAgent / defaultModel / fallbackModels) to a model the provider actually serves, then respawn the teammate.";
+  const text = `${describeModelNotFound(error)} Fallback chain for "${decision.memberName}" is exhausted [${chainLabel}]. ${remedy}`;
+  if (teamInfo) {
+    try {
+      sendMessage(db, { teamId: teamInfo.teamId, from: "system", to: "lead", content: text });
+    } catch (err) {
+      log(`failover:model-not-found:persist:failed session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  log(`failover:model-not-found:exhausted session=${sessionId} member=${decision.memberName} model=${failedLabel} chain=[${chainDesc}]`);
+  try {
+    await client.tui.showToast({
+      title: "Team",
+      message: `Model "${failedLabel}" not found \u2014 no fallback left for ${decision.memberName}. Fix ensemble.json and respawn.`,
+      variant: "error",
+      duration: 8e3
+    });
+  } catch (err) {
+    log(`failover:model-not-found:toast:failed session=${sessionId} err=${err instanceof Error ? err.message : String(err)}`);
+  }
+  return decision;
 }
 
 // src/v2-events.ts
@@ -1921,6 +2286,26 @@ function joinParts(parts) {
 }
 function createV2Client(ctx, deps = {}) {
   const gitBranch = deps.gitBranch ?? gitBranchDefault;
+  const catalog = ctx.catalog;
+  const modelCatalog = catalog ? {
+    list: async (options) => {
+      const output = await catalog.model.list(
+        options?.directory ? { location: { directory: options.directory } } : void 0
+      );
+      const entries = [];
+      for (const record of output?.data ?? []) {
+        if (!record || typeof record !== "object") continue;
+        const modelID = typeof record.modelID === "string" && record.modelID.length > 0 ? record.modelID : typeof record.id === "string" && record.id.length > 0 ? record.id : void 0;
+        if (typeof record.providerID !== "string" || record.providerID.length === 0 || !modelID) continue;
+        entries.push({
+          providerID: record.providerID,
+          modelID,
+          ...typeof record.enabled === "boolean" ? { enabled: record.enabled } : {}
+        });
+      }
+      return { data: entries };
+    }
+  } : void 0;
   return {
     session: {
       create: async (options) => {
@@ -2039,7 +2424,8 @@ function createV2Client(ctx, deps = {}) {
       list: async () => ({
         data: []
       })
-    }
+    },
+    ...modelCatalog ? { modelCatalog } : {}
   };
 }
 
@@ -2845,6 +3231,13 @@ function getSpawnTimeout() {
 function isWorktreeDirectory(dir) {
   return dir.includes("/opencode/worktree/");
 }
+function unavailableSpawnModelError(memberName, decision, chain) {
+  const configured = decision.configured ?? "(unset)";
+  const didYouMean = decision.suggestions.length > 0 ? ` Did you mean: ${decision.suggestions.join(", ")}?` : "";
+  const chainLabels = chain.map((entry) => formatModelSelector(entry));
+  const chainInfo = chainLabels.length > 0 ? `Configured fallback chain: ${chainLabels.join(" \u2192 ")}.` : "No fallback chain is configured.";
+  return `Teammate "${memberName}" was NOT spawned: configured model "${configured}" does not exist in this OpenCode server's catalog.${didYouMean} ${chainInfo} None of those models resolve either. Fix ensemble.json (defaultModel / modelsByAgent / fallbackModels) to a model available on this server \u2014 list them with \`opencode models\`.`;
+}
 function withTimeout(promise, ms, label) {
   let timer;
   return Promise.race([
@@ -2912,6 +3305,39 @@ async function executeTeamSpawn(deps, args, sessionId) {
     log(`spawn:auto-standby member=${args.name} agent=${agent} reason=hugo_sdet_default`);
   }
   const useStandby = (args.standby === true || autoStandby) && args.standby !== false;
+  const memberCount = deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId).c;
+  const configuredModel = resolveModel(args.model, agent, memberCount, deps.config, args.name);
+  const agentBasePersona = resolveBasePersona3(agent);
+  const agentFallbackChain = agentBasePersona !== agent && deps.config.fallbackModelsByAgent?.[agentBasePersona]?.length ? resolveFallbackChainForAgent(deps.config, agentBasePersona) : resolveFallbackChainForAgent(deps.config, agent);
+  const catalog = await fetchModelCatalog(deps.client, deps.directory);
+  const modelDecision = resolveSpawnModelFromCatalog(catalog, configuredModel, agentFallbackChain);
+  if (modelDecision.exhausted) {
+    const message = unavailableSpawnModelError(args.name, modelDecision, agentFallbackChain);
+    log(`spawn:model:unavailable name=${args.name} configured=${configuredModel} suggestions=${modelDecision.suggestions.join(",") || "none"}`);
+    throw new Error(message);
+  }
+  const resolvedModel = modelDecision.model;
+  if (modelDecision.substituted) {
+    const didYouMean = modelDecision.suggestions.length > 0 ? ` Did you mean: ${modelDecision.suggestions.join(", ")}?` : "";
+    log(`spawn:model:substituted name=${args.name} configured=${configuredModel} model=${resolvedModel} suggestions=${modelDecision.suggestions.join(",") || "none"}`);
+    try {
+      void deps.client.tui.showToast({
+        title: "Team",
+        message: `Configured model "${configuredModel}" is not in the OpenCode catalog. Spawning "${args.name}" with fallback "${resolvedModel}".${didYouMean}`,
+        variant: "warning",
+        duration: 8e3
+      }).catch(() => {
+      });
+    } catch {
+    }
+  } else if (resolvedModel) {
+    log(`spawn:model name=${args.name} model=${resolvedModel}`);
+  }
+  if (!catalog) {
+    log(`spawn:model:catalog-unavailable name=${args.name} \u2014 keeping configured model without pre-validation`);
+  }
+  const fallbackModel = selectFallbackModel(agentFallbackChain, resolvedModel);
+  if (fallbackModel) log(`spawn:fallback name=${args.name} agent=${agent} fallback=${formatModelSelector(fallbackModel)}`);
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`);
   let worktreeDir = null;
   let worktreeBranch = null;
@@ -3056,13 +3482,6 @@ async function executeTeamSpawn(deps, args, sessionId) {
   }
   const planApproval = usePlanApproval ? "pending" : "none";
   const now = Date.now();
-  const memberCount = deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId).c;
-  const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config, args.name);
-  if (resolvedModel) log(`spawn:model name=${args.name} model=${resolvedModel}`);
-  const agentBasePersona = resolveBasePersona3(agent);
-  const agentFallbackChain = agentBasePersona !== agent && deps.config.fallbackModelsByAgent?.[agentBasePersona]?.length ? resolveFallbackChainForAgent(deps.config, agentBasePersona) : resolveFallbackChainForAgent(deps.config, agent);
-  const fallbackModel = selectFallbackModel(agentFallbackChain, resolvedModel);
-  if (fallbackModel) log(`spawn:fallback name=${args.name} agent=${agent} fallback=${formatModelSelector(fallbackModel)}`);
   deps.db.run(
     `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, is_qa, role, time_created, time_updated)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -8541,8 +8960,98 @@ function throwingPromptAsync(fn, agentResolver) {
     return result;
   };
 }
+function resultError(result) {
+  if (!result || typeof result !== "object" || !("error" in result)) return void 0;
+  const error = result.error;
+  return error === void 0 ? void 0 : error;
+}
+function toCatalogEntries(models) {
+  if (!Array.isArray(models)) return [];
+  const entries = [];
+  for (const raw of models) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw;
+    const modelID = typeof record.modelID === "string" && record.modelID.length > 0 ? record.modelID : typeof record.id === "string" && record.id.length > 0 ? record.id : void 0;
+    if (typeof record.providerID !== "string" || record.providerID.length === 0 || !modelID) continue;
+    entries.push({
+      providerID: record.providerID,
+      modelID,
+      ...typeof record.enabled === "boolean" ? { enabled: record.enabled } : {}
+    });
+  }
+  return entries;
+}
+function catalogFromModelList(result) {
+  const payload = result?.data;
+  if (!payload || typeof payload !== "object") return void 0;
+  const models = payload.data;
+  return Array.isArray(models) ? toCatalogEntries(models) : void 0;
+}
+function catalogFromConfigProviders(result) {
+  const payload = result?.data;
+  if (!payload || typeof payload !== "object") return void 0;
+  const providers = payload.providers;
+  if (!Array.isArray(providers)) return void 0;
+  const entries = [];
+  for (const raw of providers) {
+    if (!raw || typeof raw !== "object") continue;
+    const provider = raw;
+    if (typeof provider.id !== "string" || provider.id.length === 0) continue;
+    const models = provider.models;
+    if (Array.isArray(models)) {
+      for (const entry of toCatalogEntries(models)) {
+        entries.push({ ...entry, providerID: provider.id });
+      }
+      continue;
+    }
+    if (!models || typeof models !== "object") continue;
+    for (const [modelID, value] of Object.entries(models)) {
+      if (!modelID) continue;
+      const enabled = value && typeof value === "object" ? value.enabled : void 0;
+      entries.push({
+        providerID: provider.id,
+        modelID,
+        ...typeof enabled === "boolean" ? { enabled } : {}
+      });
+    }
+  }
+  return entries;
+}
+function buildModelCatalog(raw) {
+  const modelList = raw.model?.list;
+  const providers = raw.config?.providers;
+  if (!modelList && !providers) return void 0;
+  return {
+    list: async (options) => {
+      const directory = options?.directory;
+      if (modelList) {
+        try {
+          const result = await modelList(directory ? { location: { directory } } : void 0);
+          const error = resultError(result);
+          if (error !== void 0) throw new Error(extractError(error));
+          const entries = catalogFromModelList(result);
+          if (entries && entries.length > 0) return { data: entries };
+        } catch (err) {
+          if (!providers) return {};
+          void err;
+        }
+      }
+      if (!providers) return {};
+      try {
+        const result = await providers(directory ? { directory } : void 0);
+        const error = resultError(result);
+        if (error !== void 0) throw new Error(extractError(error));
+        const entries = catalogFromConfigProviders(result);
+        return entries && entries.length > 0 ? { data: entries } : {};
+      } catch {
+        return {};
+      }
+    }
+  };
+}
 function wrapThrowingClient(raw, agentResolver) {
   const r = raw;
+  const modelCatalog = buildModelCatalog(r);
   return {
     session: {
       create: throwing(r.session.create.bind(r.session)),
@@ -8566,7 +9075,10 @@ function wrapThrowingClient(raw, agentResolver) {
       create: throwing(r.experimental.workspace.create.bind(r.experimental.workspace)),
       remove: throwing(r.experimental.workspace.remove.bind(r.experimental.workspace)),
       list: throwing(r.experimental.workspace.list.bind(r.experimental.workspace))
-    }
+    },
+    // TICKET-RELEASE-10 (F1): live catalog capability, only when the host
+    // transport exposes one. Never required — absence means fail-open.
+    ...modelCatalog ? { modelCatalog } : {}
   };
 }
 
@@ -8871,7 +9383,20 @@ var plugin = async (input) => {
       }
       if (event.type === "session.error") {
         const props = event.properties;
-        handleSessionErrorEvent(db, registry, client, props.sessionID, props.error, config);
+        const modelFailover = await handleModelNotFoundSessionError(
+          db,
+          registry,
+          client,
+          config,
+          props.sessionID,
+          props.error
+        ).catch((err) => {
+          log(`failover:model-not-found:seam:failed session=${props.sessionID} err=${err instanceof Error ? err.message : String(err)}`);
+          return void 0;
+        });
+        if (!modelFailover) {
+          handleSessionErrorEvent(db, registry, client, props.sessionID, props.error, config);
+        }
       }
       if (event.type === "message.part.updated") {
         const part = event.properties.part;
@@ -9241,9 +9766,11 @@ export {
   abortInflight,
   buildLeadSystemPrompt,
   buildTeammateSystemPrompt,
+  catalogKey,
   claimTask,
   clearAwaitingLeadDecision,
   index_default as default,
+  describeModelNotFound,
   endTracked,
   executeDecisionLead,
   executeTeamClaim,
@@ -9253,7 +9780,9 @@ export {
   executeTeamTaskHandover,
   executeTeamTasksReject,
   executeTeamTasksReview,
+  extractModelSelectorFromError,
   failoverCooldown,
+  fetchModelCatalog,
   getTeamQAMember,
   getTeamSDETMember,
   handleRetryModelFailover,
@@ -9263,13 +9792,18 @@ export {
   hasOtherActiveMembers,
   hasPendingBoardTasks,
   inReviewNudges,
+  isModelNotFoundError,
   isQAMember,
   isSDETMEmber,
+  isSelectorAvailable,
   lastRoomActivity,
   markAwaitingLeadDecision,
+  resolveSpawnModelFromCatalog,
   setMemberStandby,
   shouldAlarmFastIdle,
   shouldNudgeIdleMember,
   shouldNudgeInReviewTasks,
-  trackPrompt
+  suggestModelSelectors,
+  trackPrompt,
+  unavailableSpawnModelError
 };

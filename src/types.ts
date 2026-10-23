@@ -78,6 +78,20 @@ export interface PermissionRule {
 }
 
 /**
+ * A model served by the LIVE OpenCode catalog.
+ *
+ * TICKET-RELEASE-10 (F1): the catalog is server truth, not configuration. It is
+ * consumed before spawn side effects so a nonexistent `defaultModel` /
+ * `modelsByAgent` entry can never silently kill a whole room again.
+ */
+export interface ModelCatalogEntry {
+  providerID: string
+  modelID: string
+  /** Server-declared availability. Absent means "assume available". */
+  enabled?: boolean
+}
+
+/**
  * Minimal interface for the OpenCode v2 SDK client methods we actually use.
  * Uses flat params matching the v2 SDK (imported from @opencode-ai/sdk/v2).
  * This is a real SDK boundary: tests capture what was called at the transport
@@ -138,6 +152,17 @@ export interface PluginClient {
     create(options: { id?: string; type?: string; branch?: string | null; extra?: unknown | null }): Promise<{ data?: { id: string; type: string; branch: string | null; directory: string | null; projectID: string } }>
     remove(options: { id: string }): Promise<unknown>
     list(): Promise<{ data?: Array<{ id: string; type: string; branch: string | null; directory: string | null; projectID: string }> }>
+  }
+  /**
+   * Live server model catalog (TICKET-RELEASE-10 / F1).
+   *
+   * OPTIONAL by design: hosts/adapter layers that expose no catalog API leave
+   * it undefined, and spawn validation fails open (the configured model is
+   * kept). When present, it is the authoritative list of served models — the
+   * pre-spawn validation never trusts configuration alone.
+   */
+  modelCatalog?: {
+    list(options?: { directory?: string }): Promise<{ data?: ModelCatalogEntry[] }>
   }
 }
 

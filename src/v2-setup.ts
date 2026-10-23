@@ -5,7 +5,7 @@ import { MemberRegistry as MemberRegistryImpl, DescendantTracker as DescendantTr
 import { dispatchV2Event, type V2EventLike } from "./v2-events"
 import { deliverPrompt, type V2SessionPort } from "./v2-session"
 import { resolveAgentForSession } from "./member-model"
-import type { V2Context } from "./v2-client"
+import type { V2Context, V2CatalogDomain } from "./v2-client"
 import { createV2Client } from "./v2-client"
 import { registerV2Tools } from "./v2-tools"
 import type { PluginClient, ToolDeps } from "./types"
@@ -34,6 +34,8 @@ export interface V2SetupContext {
   }
   worktree: V2Context["worktree"]
   permission: V2Context["permission"]
+  /** Live model catalog (TICKET-RELEASE-10 F1) — optional on older hosts. */
+  catalog?: V2CatalogDomain
   event: {
     subscribe(opts?: { signal?: AbortSignal }): AsyncIterable<V2EventLike>
   }

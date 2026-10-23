@@ -10,7 +10,7 @@ import { wrapThrowingClient } from "./client"
 import { recoverStaleMembers, recoverUndeliveredMessages, recoverOrphanedWorktrees, recoverOrphanedBranches, recoverOrphanedTeams, rehydrateRegistry } from "./recovery"
 import { MemberRegistry, DescendantTracker, PendingPurgeApprovals } from "./state"
 import { isWorktreeInstance } from "./util"
-import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, shouldAlarmFastIdle, shouldNudgeInReviewTasks, inReviewNudges, IN_REVIEW_NUDGE_MESSAGE, handleSessionErrorEvent, handleRetryModelFailover, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
+import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, shouldAlarmFastIdle, shouldNudgeInReviewTasks, inReviewNudges, IN_REVIEW_NUDGE_MESSAGE, handleSessionErrorEvent, handleRetryModelFailover, handleModelNotFoundSessionError, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
 // Re-exported so test harnesses (and the dist bundle) can exercise the nudge /
 // fast-idle decisions against a real SQLite database without reimplementing them.
 export { shouldNudgeIdleMember, shouldAlarmFastIdle, shouldNudgeInReviewTasks, inReviewNudges, IN_REVIEW_NUDGE_MESSAGE, hasInReviewAssignedTasks, hasActivePeerDialogue, hasPendingBoardTasks, hasOtherActiveMembers } from "./hooks"
@@ -36,6 +36,22 @@ export { executeDecisionLead, markAwaitingLeadDecision, clearAwaitingLeadDecisio
 // hardcoding the string "clara". See src/qa-role.ts for the lookup contract.
 export { isQAMember, getTeamQAMember, isSDETMEmber, getTeamSDETMember, type QAMemberInfo, type SDETMemberInfo } from "./qa-role"
 export { buildTeammateSystemPrompt, buildLeadSystemPrompt } from "./system-prompt"
+// TICKET-RELEASE-10 — server-truth model validation (F1) shared with the
+// reactive failover seams (F2): the predicate, the catalog decisions and the
+// "Did you mean" formatter are exported so both fronts speak the same language.
+export {
+  isModelNotFoundError,
+  describeModelNotFound,
+  catalogKey,
+  isSelectorAvailable,
+  suggestModelSelectors,
+  extractModelSelectorFromError,
+  resolveSpawnModelFromCatalog,
+  fetchModelCatalog,
+  type SpawnModelDecision,
+  type ModelCatalogEntry,
+} from "./model-catalog"
+export { unavailableSpawnModelError } from "./tools/team-spawn"
 export { lastRoomActivity } from "./config"
 export { Watchdog } from "./watchdog"
 import { notifyTeamEvent, notifyWorkingProgress, notifyLead } from "./notify"
@@ -513,9 +529,27 @@ const plugin: Plugin = async (input) => {
       // teammate just appears stuck.
       if (event.type === "session.error") {
         const props = event.properties as { sessionID?: string; error?: { name?: string; data?: { message?: string } } }
-        // HARNESS-15 B: thread the config so the notifyLead wake inside is
-        // model-aware (agent + fallback-chain ladder).
-        handleSessionErrorEvent(db, registry, client, props.sessionID, props.error, config)
+        // TICKET-RELEASE-10 (F2): a DETERMINISTIC model-resolution failure
+        // (ProviderModelNotFound / "Model not found") is intercepted FIRST and
+        // walked through the fallback chain — silently on success, actionable
+        // (passive message + toast) on exhaustion, NEVER waking the lead
+        // (HARNESS-13). Any other error falls through to the generic alarm.
+        const modelFailover = await handleModelNotFoundSessionError(
+          db,
+          registry,
+          client,
+          config,
+          props.sessionID,
+          props.error,
+        ).catch((err) => {
+          log(`failover:model-not-found:seam:failed session=${props.sessionID} err=${err instanceof Error ? err.message : String(err)}`)
+          return undefined
+        })
+        if (!modelFailover) {
+          // HARNESS-15 B: thread the config so the notifyLead wake inside is
+          // model-aware (agent + fallback-chain ladder).
+          handleSessionErrorEvent(db, registry, client, props.sessionID, props.error, config)
+        }
       }
 
       // Track per-step output tokens for stall detection

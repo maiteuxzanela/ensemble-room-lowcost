@@ -3,6 +3,7 @@ import type { PluginClient } from "./types"
 import type { EnsembleConfig } from "./config"
 import { formatModelSelector, parseModelSelector, resolveFallbackChainForAgent } from "./config"
 import { sendMessage } from "./messaging"
+import { isModelNotFoundError } from "./model-catalog"
 import { log } from "./log"
 
 type TeamEventType = "spawn" | "message" | "completed" | "error" | "shutdown"
@@ -159,6 +160,48 @@ export function resolveLeadWakeContext(db: Database, teamId: string): LeadWakeCo
 }
 
 /**
+ * TICKET-RELEASE-10 (F2) — memory of wake ladders that hit a DETERMINISTIC
+ * model-resolution failure (`ProviderModelNotFound` / "Model not found").
+ *
+ * A rejected `promptAsync` already steps the ladder inside ONE call, but the
+ * server can accept the wake and fail the turn afterwards; the next system
+ * wake would then start again at the dead native model. Remembering the rung
+ * that failed lets every SUBSEQUENT wake start on the next usable rung instead
+ * of replaying the same broken model — the same forward-walk principle the
+ * retry failover applies to members.
+ *
+ * Expiration uses the rate-limit cooldown window (10 min) imported as a plain
+ * number to avoid a notify ⇄ hooks import cycle; entries are process-wide like
+ * the failover cooldown maps. Exported so deterministic suites can inspect /
+ * clear it without sleeping.
+ */
+export const MODEL_NOT_FOUND_WAKE_TTL_MS = 10 * 60 * 1000
+
+export interface ModelNotFoundWakeRecord {
+  /** Timestamp of the failed attempt (clock for the TTL). */
+  at: number
+  /** Rung that failed ("session-native" when the model key was omitted). */
+  failedRung: string
+  /** Absolute index of the first rung worth trying on the next wake. */
+  nextIndex: number
+}
+
+/** Keyed by sessionID. @see ModelNotFoundWakeRecord */
+export const modelNotFoundWakeSessions = new Map<string, ModelNotFoundWakeRecord>()
+
+/**
+ * True when a rejected wake attempt is a deterministic model-resolution
+ * failure. Delegates to `isModelNotFoundError` (src/model-catalog.ts) probing
+ * both the error object and its message, so the contract holds whichever
+ * shape the helper prefers. Never throws.
+ */
+export function isModelNotFoundWakeError(err: unknown): boolean {
+  if (isModelNotFoundError(err)) return true
+  const message = err instanceof Error ? err.message : typeof err === "string" ? err : ""
+  return message.length > 0 && isModelNotFoundError(message)
+}
+
+/**
  * Fire a MODEL-AWARE wake (HARNESS-15 B / F1 / TICKET-32B) — the shared
  * step-down ladder behind every lead wake that carries a config:
  *
@@ -225,6 +268,20 @@ export function promptModelAwareWake(
     }
   }
 
+  // TICKET-RELEASE-10 (F2): skip rungs already proven dead by a deterministic
+  // model-not-found within the TTL. The ladder still starts at rung 0 on a
+  // fresh session / after expiry (see modelNotFoundWakeSessions).
+  let startIndex = 0
+  const remembered = modelNotFoundWakeSessions.get(sessionID)
+  if (remembered) {
+    if (Date.now() - remembered.at >= MODEL_NOT_FOUND_WAKE_TTL_MS) {
+      modelNotFoundWakeSessions.delete(sessionID)
+    } else if (remembered.nextIndex > 0 && ladder.length > 0) {
+      startIndex = Math.min(remembered.nextIndex, ladder.length - 1)
+      log(`${logTag}:skip-dead-rungs session=${sessionID} failed=${remembered.failedRung} start=${startIndex}`)
+    }
+  }
+
   const attempt = (index: number): void => {
     const selector = ladder[index]
     // Log label only — the native rung is never parsed as a selector.
@@ -240,16 +297,27 @@ export function promptModelAwareWake(
       log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${rung}`)
     }).catch((err) => {
       const errMsg = err instanceof Error ? err.message : String(err)
+      // TICKET-RELEASE-10 (F2): a deterministic model-resolution failure is
+      // NOT a transient transport error — remember the dead rung so the next
+      // wake does not replay it, and step forward immediately.
+      const deterministic = isModelNotFoundWakeError(err)
+      if (deterministic) {
+        modelNotFoundWakeSessions.set(sessionID, {
+          at: Date.now(),
+          failedRung: rung,
+          nextIndex: index + 1 < ladder.length ? index + 1 : ladder.length,
+        })
+      }
       const next = index + 1 < ladder.length ? ladder[index + 1] : undefined
       if (next) {
-        log(`${logTag}:retry session=${sessionID} from=${rung} to=${next} err=${errMsg}`)
+        log(`${logTag}:retry session=${sessionID} from=${rung} to=${next} reason=${deterministic ? "model-not-found" : "transport"} err=${errMsg}`)
         attempt(index + 1)
       } else {
-        log(`${logTag}:failed session=${sessionID} model=${rung} err=${errMsg}`)
+        log(`${logTag}:${deterministic ? "model-not-found:exhausted" : "failed"} session=${sessionID} model=${rung} err=${errMsg}`)
       }
     })
   }
-  attempt(0)
+  attempt(startIndex)
 }
 
 /**

@@ -2,7 +2,7 @@
 /**
  * Runner determinístico das suítes do ensemble-room-lowcost.
  *
- * Executa as 48 suítes determinísticas do repositório em sequência estrita
+ * Executa as 50 suítes determinísticas do repositório em sequência estrita
  * (fail-report, sem aborte antecipado): cada arquivo listado em SUITES roda
  * até o fim mesmo que um anterior falhe, e o relatório consolidado final
  * agrega PASS/FAIL de todas elas. Total atual: 48 arquivos de teste
@@ -17,7 +17,7 @@
  *   3. test_silent_lead_board_wake.mjs — Silent lead + despertar sistemático por board (151 checks,
  *                                        re-executa as suítes 1 e 2 como regressão)
  *
- * As demais 45 suítes cobrem standby/auto-wake, failover model-aware e cooldown,
+ * As demais 47 suítes cobrem standby/auto-wake, failover model-aware e cooldown,
  * Quality Gate/SDET/handover, dashboard HTTP, auto-commit multi-repo, pausa de
  * emergência e saneamento de schema (HARNESS-16 … HARNESS-57). A lista canônica
  * é o array SUITES abaixo — ele é a fonte da verdade da cobertura.
@@ -89,6 +89,8 @@ const SUITES = [
   { file: "test_release_03_dashboard_csrf.mjs", label: "TICKET-RELEASE-03 (Dashboard CSRF/cross-origin: Host loopback+porta, Origin allow-list, null+JSON, fallback de Referer, cabeçalhos nosniff/no-referrer/no-store em JSON/HTML/403, emergência sem efeito colateral; HTTP cru real, paridade src↔dist e prova de mutação M1-M7)" },
   { file: "test_release05_shell_ledger.mjs", label: "RELEASE-05 (Ledger captura artefatos de shell: snapshot before/after, package-lock já-sujo, deleção, filtros node_modules/.test-scratch, fail-safe sem baseline, teto, Portão 1 cirúrgico + prova de mutação M1)" },
   { file: "test_release_09_persona_sequester.mjs", label: "RELEASE-09 (Persona Sequester Fix: lead_agent persistido no team_create, sem fallback 'dante' no resolver, auto-cura de salas legadas NULL via session.get e wake de lead que preserva a persona — dist+src, SQLite real)" },
+  { file: "test_release_10_pre_spawn_model_validation.mjs", label: "RELEASE-10/F1 (Validação pré-spawn contra o catálogo vivo: modelo configurado ausente avança fallbackModels até o primeiro servido, exaustão falha ANTES de worktree/session com mensagem acionável + Did you mean, fail-open sem catálogo, enabled:false, variant §5.1 e paridade src↔dist)" },
+  { file: "test_release_10_deterministic_failover.mjs", label: "RELEASE-10/F2 (Failover reativo determinístico: erro de resolução avança a cadeia com cooldown ativo, anti-loop §5.1/#default e rung com variante, exaustão acionável delivered=0 sem wake de lead, cadeia resolvida pelo AGENTE, memória de rung morta no promptModelAwareWake; SQLite real e paridade src↔dist)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 
