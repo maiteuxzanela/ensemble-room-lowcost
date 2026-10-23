@@ -259,20 +259,18 @@ export async function executeDecisionLead(
 
   const ctx = resolveLeadWakeContext(deps.db, teamInfo.teamId)
   if (ctx) {
-    // TICKET-HARNESS-73 / TICKET-RELEASE-09 — NO `primaryModel` here.
+    // TICKET-HARNESS-73 / TICKET-RELEASE-09 / TICKET-RELEASE-15 — NO model is
+    // computed here, and none needs to be.
     //
-    // The canonical TICKET-32B contract (src/notify.ts) says rung 0 of the
-    // model-aware wake PRESERVES THE SESSION'S NATIVE MODEL: with no
-    // `primaryModel` the `model` key is OMITTED from promptAsync, so the
-    // OpenCode server keeps whatever model the lead session is bound to.
-    //
-    // The pre-TICKET-32B shape (this code) computed `primaryModel` from
-    // chain[0] and handed it over, which turned rung 0 into an EXPLICIT
-    // selector = a PREMATURE DOWNGRADE of the Lead to the cheapest fallback
-    // on EVERY emergency decision wake — even when the lead's own model was
-    // perfectly healthy. The reactive ladder (rungs 1..n) still walks the
-    // chain on rejection/rate-limit, which is the ONLY legitimate use of
-    // the fallback chain.
+    // TICKET-RELEASE-15 corrected the old premise: omitting the `model` key
+    // does NOT preserve the session's bound model — the server resolves the
+    // model from the agent definition (`agent/<persona>.md`). omitting it here
+    // is therefore NOT a sovereignty guarantee; the shared model-aware wake now
+    // resolves the model the lead session is CURRENTLY BOUND to
+    // (`resolveSessionBoundModel` via `client.session.get`) and sends it
+    // EXPLICITLY as rung 0. decision_lead inherits that automatically — no
+    // local model selection, no chain[0] downgrade (HARNESS-73), and the
+    // reactive ladder (rungs 1..n) still walks the chain only on rejection.
     promptModelAwareWake(deps.client, {
       sessionID: ctx.leadSessionId,
       text: payload,

@@ -237,6 +237,15 @@ function createTestClient(calls) {
         calls.abort.push(o);
         return {};
       },
+      // TICKET-RELEASE-15: seam de LEITURA da sessão. O server reporta
+      // variant "default" para modelo sem variante — o wake deve normalizar
+      // para AUSÊNCIA e enviar o modelo bound explicitamente.
+      get: async ({ sessionID }) => ({
+        data: {
+          id: sessionID,
+          model: { providerID: "opencode-go", id: "deepseek-v4.1-flash", variant: "default" },
+        },
+      }),
     },
     tui: {
       showToast: async (o) => {
@@ -340,6 +349,9 @@ async function runBehavior(label, mods) {
       typeof res === "string" && res.includes("Emergency decision requested from the lead") && res.includes("standby"),
       res,
     );
+    // TICKET-RELEASE-15: o wake resolve o modelo bound via session.get (async)
+    // antes de disparar — drena as microtasks para a captura de transporte.
+    await new Promise((r) => setImmediate(r));
 
     const teamRow = db
       .query("SELECT awaiting_lead_decision, awaiting_decision_member, awaiting_decision_at FROM team WHERE id = ?")
@@ -384,13 +396,16 @@ async function runBehavior(label, mods) {
         payload.includes("2. Caminho B"),
     );
     check(`[${label}] 1.11 wake usa o agent do lead (team.lead_agent='dante')`, p?.agent === LEAD_AGENT, String(p?.agent));
-    // TICKET-32B / TICKET-HARNESS-73: rung 0 do wake model-aware PRESERVA o
-    // modelo NATIVO da sessão do lead — `model` é OMITIDO. O downgrade
-    // prematuro para o head da cadeia em toda decisão de emergência foi
-    // removido; a cadeia só é caminhada reativamente, após rejeição/429.
+    // TICKET-RELEASE-15 (substitui a premissa falsa "modelless = nativo"):
+    // rung 0 é o MODELO BOUND da sessão do lead, enviado EXPLICITAMENTE via
+    // session.get; o sentinel `variant: "default"` é normalizado para AUSÊNCIA
+    // (nunca #default). A cadeia só é caminhada reativamente, após rejeição.
     check(
-      `[${label}] 1.12 rung 0 preserva o modelo nativo (sem chave 'model' no payload)`,
-      p !== undefined && !("model" in p),
+      `[${label}] 1.12 rung 0 = modelo BOUND da sessão, explícito e sem #default`,
+      p !== undefined &&
+        p.model?.providerID === "opencode-go" &&
+        p.model?.modelID === "deepseek-v4.1-flash" &&
+        !("variant" in (p.model ?? {})),
       JSON.stringify(p?.model),
     );
     const chainHead = formatModelSelector(resolveFallbackChainForAgent(deps.config, LEAD_AGENT)[0]);

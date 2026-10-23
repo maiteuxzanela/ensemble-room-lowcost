@@ -5,21 +5,24 @@
  *
  * Sob teste (código REAL, sem mocks de decisão):
  *   - [F1] src/tools/team-tasks-complete.ts — o wake 'board-complete' (sob
- *     silentLead:true é o ÚNICO caminho que acorda o lead) permanece
- *     SOBERANO: promptAsync neutro, sem `model` e sem `agent`.
- *   - [TICKET-32B] src/notify.ts — `promptModelAwareWake` preserva o MODELO
- *     NATIVO da sessão no degrau 0 (payload SEM a chave `model`) quando
- *     nenhum `primaryModel` explícito é passado; a escada
+ *     silentLead:true é o ÚNICO caminho que acorda o lead) persiste a
+ *     mensagem durável e envia `agent` (team.lead_agent) e `model` (o modelo
+ *     BOUND da sessão, resolvido via session.get) EXPLÍCITOS
+ *     (TICKET-RELEASE-15: omitir `model` faz o server usar agent/<persona>.md).
+ *   - [TICKET-32B / TICKET-RELEASE-15] src/notify.ts — `promptModelAwareWake`
+ *     resolve o modelo bound da sessão para o degrau 0 (ou usa `boundModel`
+ *     pré-resolvido); sem session.get a resolução degrada para omissão +
+ *     log `wake:model-resolution-failed`. A escada
  *     `resolveFallbackChainForAgent(config, leadAgent)` só é percorrida após
  *     REJEIÇÃO do degrau anterior (STEP-DOWN). Prova de causalidade: com
- *     config + transporte rejeitado → 2 tentativas (nativo → cadeia dante);
- *     sem config + mesma rejeição → 1 tentativa nativa (fallback reativo
- *     desativado, assinatura retrocompatível nunca quebrada). Um
+ *     config + transporte rejeitado → 2 tentativas (resolvido/omitido →
+ *     cadeia dante); sem config + mesma rejeição → 1 tentativa (fallback
+ *     reativo desativado, assinatura retrocompatível nunca quebrada). Um
  *     `primaryModel` explícito segue respeitado como degrau 0
  *     (tests/test_fallback_hardening.mjs g2).
  *   - [F2] src/watchdog.ts — o wrapper `notifyLead` repassa `{ config }`
  *     (stall / chatty / timeout acordam o lead na escada model-aware);
- *     Watchdog construído SEM config degrada para o wake legado modelless.
+ *     Watchdog construído SEM config degrada para o wake legado (1 tentativa).
  *   - [F2] src/tools/team-spawn.ts — o rollback de spawn falho chama
  *     `notifyLead(..., { config: deps.config })`.
  *   - [TICKET-32B item 2] call sites de notifyLead repassam `options.config`
@@ -39,10 +42,11 @@
  * DEFAULT_CONFIG espelhado em disco em memória (nenhum arquivo lido).
  *
  * Cobertura do ticket T8 + TICKET-32B:
- *   (a) wake 'board-complete' segue SOBERANO (sem `model`/`agent`);
- *   (b) degrau 0 de todo wake com config preserva o MODELO NATIVO da sessão
- *       (payload SEM `model`) e a rejeição do transporte dispara STEP-DOWN
- *       para a cadeia (fallbackModelsByAgent.dante) — prova com fail-once;
+ *   (a) wake 'board-complete' envia agent+model EXPLÍCITOS (bound) e persiste
+ *       a mensagem durável antes do wake;
+ *   (b) degrau 0 de todo wake com config resolve o MODELO BOUND da sessão e a
+ *       rejeição do transporte dispara STEP-DOWN para a cadeia
+ *       (fallbackModelsByAgent.dante) — prova com fail-once;
  *   (c) call sites notifyLead (watchdog.ts, hooks.ts, index.ts, team-spawn.ts)
  *       passam `config` (escada reativa ativa) — paridade estática src↔dist
  *       + provas comportamentais com e sem config.
@@ -194,13 +198,28 @@ function marker(label, needle, { src = true, dist = true } = {}) {
 // aparecer em qualquer um deles (evita falsos negativos por arquivo).
 const srcAll = () => [srcComplete, srcWatchdog, srcSpawn, srcNotify].join("\n");
 
-/* --- F1: wake 'board-complete' soberano (modelless e agentless) --- */
+/* --- F1: wake 'board-complete' com agent + model explícitos --------------- */
 {
-  // O wake do board dispara promptAsync neutro direto para a sessão do lead,
-  // sem forçar model ou agent (preserva o modelo soberano da sessão do Dante).
-  const f1Wake = /deps\.client\.session\.promptAsync\(\{[\s\S]{0,150}sessionID: leadSessionId,[\s\S]{0,150}synthetic: true/;
-  check("paridade F1 (src): wake do board dispara promptAsync neutro para leadSessionId", f1Wake.test(srcComplete), srcComplete.match(f1Wake)?.[0]?.slice(0, 120) ?? "ausente");
-  check("paridade F1 (dist): wake do board dispara promptAsync neutro para leadSessionId", f1Wake.test(distRaw), distRaw.match(f1Wake)?.[0]?.slice(0, 120) ?? "ausente");
+  // TICKET-RELEASE-15: o wake do board deixou de ser cru/modelless. Ele
+  // (1) persiste a mensagem durável, (2) resolve o agent do lead e (3) entrega
+  // ao promptModelAwareWake o modelo BOUND da sessão (session.get) como
+  // `boundModel` — o server usaria o modelo do agent/<persona>.md se `model`
+  // fosse omitido.
+  check(
+    "paridade F1 (src): board wake persiste team_message durável antes do wake",
+    /from: "system",\s*to: "lead",\s*content: wakeText/.test(srcComplete),
+    srcComplete.match(/from: "system",\s*to: "lead",\s*content: wakeText/)?.[0] ?? "ausente",
+  );
+  check(
+    "paridade F1 (dist): board wake persiste team_message durável antes do wake",
+    /from: "system",\s*to: "lead",\s*content: wakeText/.test(distRaw),
+    distRaw.match(/from: "system",\s*to: "lead",\s*content: wakeText/)?.[0] ?? "ausente",
+  );
+  const f1Wake = /promptModelAwareWake\(deps\.client,\s*\{\s*sessionID: leadSessionId,[\s\S]{0,220}?agent: leadAgent,[\s\S]{0,120}?boundModel: boundModel \?\? null/;
+  check("paridade F1 (src): board wake envia agent explícito + boundModel resolvido", f1Wake.test(srcComplete), srcComplete.match(f1Wake)?.[0]?.slice(0, 160) ?? "ausente");
+  check("paridade F1 (dist): board wake envia agent explícito + boundModel resolvido", f1Wake.test(distRaw), distRaw.match(f1Wake)?.[0]?.slice(0, 160) ?? "ausente");
+  marker("F1: resolveSessionBoundModel resolve o modelo bound (session.get)", "resolveSessionBoundModel(deps.client, leadSessionId)");
+  marker("F1: fallback do agent via session.get (nunca persona hardcoded)", "resolveSessionAgent(deps.client, leadSessionId)");
   marker("F1: guard do fechamento de board (total > 0 && completed === total)", /total\d* > 0 && completed === total\d*/);
   marker("F1: texto sintético do wake do board", "[System: All team tasks completed on board by ${who}]");
 
@@ -212,12 +231,12 @@ const srcAll = () => [srcComplete, srcWatchdog, srcSpawn, srcNotify].join("\n");
 
 /* --- TICKET-32B: degrau 0 nativo + threading de options.config ---------- */
 {
-  // (1) rung 0 = primaryModel explícito OU nativo da sessão — NUNCA a cabeça
-  // da cadeia. Sem isso o wake do notifyLead começava em chain[0] e baixava o
-  // Lead para um modelo de fallback barato logo no primeiro promptAsync.
+  // (1) rung 0 = primaryModel explícito OU boundModel resolvido (nunca a
+  // cabeça da cadeia). Sem session.get/pre-resolução o rung 0 degrada para
+  // omissão — caminho comprovado pelos cenários B/C abaixo.
   marker(
-    "32B: ladder do promptModelAwareWake tem rung 0 = [primaryModel || undefined] (nativo)",
-    /const ladder(:\s*Array<string\s*\|\s*undefined>)?\s*=\s*\[primaryModel \|\| (undefined|void 0)\]/,
+    "32B/RELEASE-15: ladder do promptModelAwareWake tem rung 0 = [primary || undefined]",
+    /const ladder(:\s*Array<string\s*\|\s*undefined>)?\s*=\s*\[primary \|\| (undefined|void 0)\]/,
   );
   // (2) notifyLead repassa options.config/options.primaryModel VERBATIM
   // (o esbuild remove a vírgula final — o marcador é tolerante a isso).
@@ -425,7 +444,7 @@ async function runBehavior(label, mods) {
   const expectWake = (who) => `[System: All team tasks completed on board by ${who}]`;
 
   /* ================================================================ *
-   * A) [F1] Wake 'board-complete' soberano (modelless e agentless)     *
+   * A) [F1] Wake 'board-complete' com agent + model bound explícitos  *
    * ================================================================ */
   const A = scenario("f1_board");
   {
@@ -435,6 +454,13 @@ async function runBehavior(label, mods) {
     seedTeam(A.db, "team_f1a", LEAD, "dante");
     seedMember(A.db, "team_f1a", M1, MS);
     A.registry.register("team_f1a", M1, MS);
+    // TICKET-RELEASE-15: o seam passa a expor session.get — o cenário prova que
+    // o wake do board envia o MODELO BOUND da sessão EXPLICITAMENTE (o variante
+    // "default" do server é a ausência e NÃO pode vazar como #default) e o
+    // agent REAL do lead. Omitir `model` faria o server usar agent/<persona>.md.
+    const BOUND = { providerID: "prov", modelID: "lead-bound", variant: "default" };
+    A.client.session.get = async ({ sessionID }) =>
+      sessionID === LEAD ? { data: { agent: "dante", model: BOUND } } : { data: {} };
     seedTask(A.db, "t_f1a_1", "team_f1a", "pending", M1);
     seedTask(A.db, "t_f1a_2", "team_f1a", "pending", M1);
 
@@ -454,8 +480,8 @@ async function runBehavior(label, mods) {
     const wakes = A.leadWakes(LEAD, base);
     check(`[${label}] A2 board fechado (2/2): wake do lead EXATAMENTE 1x`, wakes.length === 1, `delta=${wakes.length}`);
     const w = wakes[0];
-    check(`[${label}] A3 wake soberano: sem chave 'model' (modelless)`, w !== undefined && !("model" in w), w ? Object.keys(w).join(",") : "sem wake");
-    check(`[${label}] A4 wake soberano: sem chave 'agent' (agentless)`, w !== undefined && !("agent" in w), w ? Object.keys(w).join(",") : "sem wake");
+    check(`[${label}] A3 wake envia o MODELO BOUND da sessão explicitamente (variant "default" omitida)`, eq(w?.model, { providerID: "prov", modelID: "lead-bound" }), JSON.stringify(w?.model));
+    check(`[${label}] A4 wake envia o agent do lead EXPLICITAMENTE (team.lead_agent)`, w?.agent === "dante", String(w?.agent));
     check(
       `[${label}] A5 wake é synthetic:true com texto exato do board`,
       w?.synthetic === true && w?.parts?.[0]?.text === expectWake(M1),

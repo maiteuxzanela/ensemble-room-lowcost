@@ -47,7 +47,7 @@ export interface ParsedModelSelector {
  * "current outside the chain" branch, restarting at `chain[0]` on every
  * retry — an infinite switch loop with zero progress.
  */
-const VARIANT_ABSENT_SENTINEL = "default"
+export const VARIANT_ABSENT_SENTINEL = "default"
 
 /**
  * Parse an OpenCode model selector into its parts.

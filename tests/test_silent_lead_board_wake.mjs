@@ -202,7 +202,7 @@ marker("tasks-complete: texto sintético do wake", srcComplete, "[System: All te
 marker("tasks-complete: texto sintético do wake (bundle)", distRaw, "[System: All team tasks completed on board by ${who}]");
 marker("tasks-complete: fail-safe .catch no wake", srcComplete, "tasks-complete:wake-lead:failed");
 marker("tasks-complete: fail-safe .catch no wake (bundle)", distRaw, "tasks-complete:wake-lead:failed");
-marker("tasks-complete: wake endereça team.lead_session_id (não team_member)", srcComplete, "SELECT lead_session_id FROM team WHERE id = ?");
+marker("tasks-complete: wake endereça team.lead_session_id (não team_member)", srcComplete, "SELECT lead_session_id, lead_agent FROM team WHERE id = ?");
 
 // Coerção: exatamente UMA ocorrência no código inteiro (o ramo legado),
 // em nenhuma outra call site.

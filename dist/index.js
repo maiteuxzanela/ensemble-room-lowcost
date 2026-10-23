@@ -1274,6 +1274,68 @@ function hasReportedCompletion(db, teamId, memberName) {
   return row?.reported_to_lead === 1;
 }
 
+// src/member-model.ts
+init_log();
+function parseModelId(model) {
+  return parseModelSelector(model);
+}
+function getMemberModel(db, teamId, memberName) {
+  const row = db.query("SELECT model FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
+  if (!row?.model) return void 0;
+  return parseModelId(row.model);
+}
+function formatParsedModelSelector(model) {
+  return model.variant ? `${model.providerID}/${model.modelID}#${model.variant}` : `${model.providerID}/${model.modelID}`;
+}
+function extractSessionBoundModel(payload) {
+  if (!payload || typeof payload !== "object") return void 0;
+  const root = payload;
+  const candidates = [root.model, root.data?.model, root.data?.data?.model];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const record = candidate;
+    const providerID = typeof record.providerID === "string" ? record.providerID.trim() : "";
+    const rawModelID = typeof record.id === "string" && record.id.trim().length > 0 ? record.id.trim() : typeof record.modelID === "string" ? record.modelID.trim() : "";
+    if (!providerID || !rawModelID) continue;
+    const rawVariant = typeof record.variant === "string" ? record.variant.trim() : "";
+    const variant = rawVariant && rawVariant !== VARIANT_ABSENT_SENTINEL ? rawVariant : void 0;
+    return variant ? { providerID, modelID: rawModelID, variant } : { providerID, modelID: rawModelID };
+  }
+  return void 0;
+}
+async function resolveSessionBoundModel(client, sessionID) {
+  if (!sessionID) return void 0;
+  try {
+    if (typeof client?.session?.get !== "function") {
+      log(`wake:model-resolution-failed session=${sessionID} reason=no-session-get`);
+      return void 0;
+    }
+    const res = await client.session.get({ sessionID });
+    const model = extractSessionBoundModel(res);
+    if (!model) {
+      log(`wake:model-resolution-failed session=${sessionID} reason=no-bound-model`);
+      return void 0;
+    }
+    return model;
+  } catch (err) {
+    log(`wake:model-resolution-failed session=${sessionID} reason=session-get-error err=${err instanceof Error ? err.message : String(err)}`);
+    return void 0;
+  }
+}
+function resolveAgentForSession(db, sessionID) {
+  if (!sessionID) return void 0;
+  const member = db.query(
+    `SELECT tm.agent AS agent
+     FROM team_member tm
+     JOIN team t ON tm.team_id = t.id
+     WHERE tm.session_id = ? AND t.status = 'active'`
+  ).get(sessionID);
+  if (member?.agent) return member.agent;
+  const lead = db.query("SELECT lead_agent FROM team WHERE lead_session_id = ? AND status = 'active'").get(sessionID);
+  if (lead) return lead.lead_agent || void 0;
+  return void 0;
+}
+
 // src/notify.ts
 init_log();
 var TOAST_CONFIG = {
@@ -1348,60 +1410,75 @@ function isModelNotFoundWakeError(err) {
   return message.length > 0 && isModelNotFoundError(message);
 }
 function promptModelAwareWake(client, params) {
-  const { sessionID, text, logTag, agent, config, primaryModel, synthetic = true } = params;
-  const ladder = [primaryModel || void 0];
-  const seen = new Set(primaryModel ? [primaryModel] : []);
-  if (config) {
-    for (const entry of resolveFallbackChainForAgent(config, agent)) {
-      const selector = formatModelSelector(entry);
-      if (selector && !seen.has(selector)) {
-        seen.add(selector);
-        ladder.push(selector);
+  const { sessionID, text, logTag, agent, config, primaryModel, boundModel, synthetic = true } = params;
+  const dispatch = (primary) => {
+    const ladder = [primary || void 0];
+    const seen = new Set(primary ? [primary] : []);
+    if (config) {
+      for (const entry of resolveFallbackChainForAgent(config, agent)) {
+        const selector = formatModelSelector(entry);
+        if (selector && !seen.has(selector)) {
+          seen.add(selector);
+          ladder.push(selector);
+        }
       }
     }
-  }
-  let startIndex = 0;
-  const remembered = modelNotFoundWakeSessions.get(sessionID);
-  if (remembered) {
-    if (Date.now() - remembered.at >= MODEL_NOT_FOUND_WAKE_TTL_MS) {
-      modelNotFoundWakeSessions.delete(sessionID);
-    } else if (remembered.nextIndex > 0 && ladder.length > 0) {
-      startIndex = Math.min(remembered.nextIndex, ladder.length - 1);
-      log(`${logTag}:skip-dead-rungs session=${sessionID} failed=${remembered.failedRung} start=${startIndex}`);
+    let startIndex = 0;
+    const remembered = modelNotFoundWakeSessions.get(sessionID);
+    if (remembered) {
+      if (Date.now() - remembered.at >= MODEL_NOT_FOUND_WAKE_TTL_MS) {
+        modelNotFoundWakeSessions.delete(sessionID);
+      } else if (remembered.failedRung !== "session-native" && primary && remembered.failedRung !== primary) {
+        modelNotFoundWakeSessions.delete(sessionID);
+      } else if (remembered.nextIndex > 0 && ladder.length > 0) {
+        startIndex = Math.min(remembered.nextIndex, ladder.length - 1);
+        log(`${logTag}:skip-dead-rungs session=${sessionID} failed=${remembered.failedRung} start=${startIndex}`);
+      }
     }
-  }
-  const attempt = (index) => {
-    const selector = ladder[index];
-    const rung = selector ?? "session-native";
-    const parsed = selector ? parseModelSelector(selector) : void 0;
-    client.session.promptAsync({
-      sessionID,
-      parts: [{ type: "text", text }],
-      ...agent ? { agent } : {},
-      ...parsed ? { model: parsed } : {},
-      ...synthetic ? { synthetic: true } : {}
-    }).then(() => {
-      log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${rung}`);
-    }).catch((err) => {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      const deterministic = isModelNotFoundWakeError(err);
-      if (deterministic) {
-        modelNotFoundWakeSessions.set(sessionID, {
-          at: Date.now(),
-          failedRung: rung,
-          nextIndex: index + 1 < ladder.length ? index + 1 : ladder.length
-        });
-      }
-      const next = index + 1 < ladder.length ? ladder[index + 1] : void 0;
-      if (next) {
-        log(`${logTag}:retry session=${sessionID} from=${rung} to=${next} reason=${deterministic ? "model-not-found" : "transport"} err=${errMsg}`);
-        attempt(index + 1);
-      } else {
-        log(`${logTag}:${deterministic ? "model-not-found:exhausted" : "failed"} session=${sessionID} model=${rung} err=${errMsg}`);
-      }
-    });
+    const attempt = (index) => {
+      const selector = ladder[index];
+      const rung = selector ?? "session-native";
+      const parsed = selector ? parseModelSelector(selector) : void 0;
+      client.session.promptAsync({
+        sessionID,
+        parts: [{ type: "text", text }],
+        ...agent ? { agent } : {},
+        ...parsed ? { model: parsed } : {},
+        ...synthetic ? { synthetic: true } : {}
+      }).then(() => {
+        log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${rung}`);
+      }).catch((err) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const deterministic = isModelNotFoundWakeError(err);
+        if (deterministic) {
+          modelNotFoundWakeSessions.set(sessionID, {
+            at: Date.now(),
+            failedRung: rung,
+            nextIndex: index + 1 < ladder.length ? index + 1 : ladder.length
+          });
+        }
+        const next = index + 1 < ladder.length ? ladder[index + 1] : void 0;
+        if (next) {
+          log(`${logTag}:retry session=${sessionID} from=${rung} to=${next} reason=${deterministic ? "model-not-found" : "transport"} err=${errMsg}`);
+          attempt(index + 1);
+        } else {
+          log(`${logTag}:${deterministic ? "model-not-found:exhausted" : "failed"} session=${sessionID} model=${rung} err=${errMsg}`);
+        }
+      });
+    };
+    attempt(startIndex);
   };
-  attempt(startIndex);
+  if (primaryModel || boundModel !== void 0) {
+    const primary = primaryModel || (boundModel ? formatParsedModelSelector(boundModel) : void 0);
+    dispatch(primary);
+    return;
+  }
+  void resolveSessionBoundModel(client, sessionID).then((model) => {
+    dispatch(model ? formatParsedModelSelector(model) : void 0);
+  }).catch((err) => {
+    log(`${logTag}:wake:model-resolution-failed session=${sessionID} err=${err instanceof Error ? err.message : String(err)}`);
+    dispatch(void 0);
+  });
 }
 function notifyLead(client, db, teamId, content, options) {
   const id = sendMessage(db, { teamId, from: "system", to: "lead", content });
@@ -2244,29 +2321,6 @@ function dispatchV2Event(db, registry, tracker, event, failoverCtx) {
     default:
       return void 0;
   }
-}
-
-// src/member-model.ts
-function parseModelId(model) {
-  return parseModelSelector(model);
-}
-function getMemberModel(db, teamId, memberName) {
-  const row = db.query("SELECT model FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName);
-  if (!row?.model) return void 0;
-  return parseModelId(row.model);
-}
-function resolveAgentForSession(db, sessionID) {
-  if (!sessionID) return void 0;
-  const member = db.query(
-    `SELECT tm.agent AS agent
-     FROM team_member tm
-     JOIN team t ON tm.team_id = t.id
-     WHERE tm.session_id = ? AND t.status = 'active'`
-  ).get(sessionID);
-  if (member?.agent) return member.agent;
-  const lead = db.query("SELECT lead_agent FROM team WHERE lead_session_id = ? AND status = 'active'").get(sessionID);
-  if (lead) return lead.lead_agent || void 0;
-  return void 0;
 }
 
 // src/v2-client.ts
@@ -4964,21 +5018,31 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
     commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content);
   }
   if (total > 0 && completed === total && activeRemaining === 0) {
-    const leadRow = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?").get(teamInfo.teamId);
+    const leadRow = deps.db.query("SELECT lead_session_id, lead_agent FROM team WHERE id = ?").get(teamInfo.teamId);
     const leadSessionId = leadRow?.lead_session_id;
     if (leadSessionId) {
+      const wakeText = `[System: All team tasks completed on board by ${who}]`;
       try {
-        deps.client.session.promptAsync({
-          sessionID: leadSessionId,
-          parts: [{ type: "text", text: `[System: All team tasks completed on board by ${who}]` }],
-          synthetic: true
-        }).catch((err) => {
-          log(`tasks-complete:wake-lead:failed team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`);
+        sendMessage(deps.db, {
+          teamId: teamInfo.teamId,
+          from: "system",
+          to: "lead",
+          content: wakeText
         });
-        log(`tasks-complete:wake-lead:sent leadSession=${leadSessionId} by=${who}`);
       } catch (err) {
-        log(`tasks-complete:wake-lead:failed team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`);
+        log(`tasks-complete:wake-lead:failed phase=persist team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`);
       }
+      let leadAgent = leadRow?.lead_agent?.trim() || void 0;
+      if (!leadAgent) leadAgent = await resolveSessionAgent(deps.client, leadSessionId);
+      const boundModel = await resolveSessionBoundModel(deps.client, leadSessionId);
+      promptModelAwareWake(deps.client, {
+        sessionID: leadSessionId,
+        text: wakeText,
+        logTag: "tasks-complete:wake-lead",
+        agent: leadAgent,
+        boundModel: boundModel ?? null
+      });
+      log(`tasks-complete:wake-lead:sent leadSession=${leadSessionId} by=${who} agent=${leadAgent ?? "(unknown)"} model=${boundModel ? formatParsedModelSelector(boundModel) : "(unresolved)"}`);
     }
   }
   return `Completed task: ${task.content}${commitSuffix}`;

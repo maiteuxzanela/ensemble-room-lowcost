@@ -4,6 +4,7 @@ import type { EnsembleConfig } from "./config"
 import { formatModelSelector, parseModelSelector, resolveFallbackChainForAgent } from "./config"
 import { sendMessage } from "./messaging"
 import { isModelNotFoundError } from "./model-catalog"
+import { formatParsedModelSelector, resolveSessionBoundModel, type ParsedModel } from "./member-model"
 import { log } from "./log"
 
 type TeamEventType = "spawn" | "message" | "completed" | "error" | "shutdown"
@@ -109,17 +110,17 @@ export interface NotifyLeadWakeOptions {
    * rate-limited primary never strands the message at delivered=0 (the
    * 2026-10 incident: a modelless wake landed on the rate-limited gemini
    * primary and the system message was never delivered). The chain is the
-   * REACTIVE fallback — it never displaces the session's native model as the
-   * first attempt (TICKET-32B).
+   * REACTIVE fallback — rung 0 is always the model the session is BOUND to
+   * (resolved via session.get, TICKET-RELEASE-15), never a chain entry.
    */
   config?: Required<EnsembleConfig>
   /**
-   * Optional EXPLICIT model selector for the FIRST wake attempt (e.g. the
-   * lead's currently bound model). When omitted, attempt 0 is the session's
-   * NATIVE model — the `model` key is omitted from promptAsync, so the
-   * OpenCode server keeps whatever the lead session is bound to (no premature
-   * downgrade to a cheap fallback chain entry). Never carries the "#default"
-   * sentinel — parseModelSelector normalizes it away.
+   * Optional EXPLICIT model selector for the FIRST wake attempt. TICKET-
+   * RELEASE-15: when omitted, the wake resolves the model the lead session is
+   * CURRENTLY BOUND to (`client.session.get`) and sends it explicitly — the
+   * OpenCode server would otherwise fall back to the agent `.md` model, not
+   * to the session's bound model. Never carries the "#default" sentinel —
+   * parseModelSelector normalizes it away.
    */
   primaryModel?: string
   /**
@@ -202,29 +203,40 @@ export function isModelNotFoundWakeError(err: unknown): boolean {
 }
 
 /**
- * Fire a MODEL-AWARE wake (HARNESS-15 B / F1 / TICKET-32B) — the shared
- * step-down ladder behind every lead wake that carries a config:
+ * Fire a MODEL-AWARE wake (HARNESS-15 B / F1 / TICKET-32B / TICKET-RELEASE-15)
+ * — the shared step-down ladder behind every lead wake that carries a config:
  *
  *   - `agent` (when known) goes EXPLICITLY on every attempt — omitting it
  *     lets the server rebind the session to its default agent (persona
  *     sequester);
- *   - rung 0 PRESERVES THE SESSION'S NATIVE MODEL: with no `primaryModel`
- *     the `model` key is omitted from promptAsync, so the OpenCode server
- *     keeps whatever model the lead session is bound to. Passing chain[0] as
- *     attempt 0 (the pre-TICKET-32B shape) forced a premature downgrade of
- *     the Lead to a cheap fallback the moment any system message woke it. An
- *     EXPLICIT `primaryModel`, when handed in, is respected as rung 0;
+ *   - rung 0 is the MODEL THE SESSION IS CURRENTLY BOUND TO. TICKET-RELEASE-15
+ *     corrected the old premise: omitting the `model` key does NOT preserve
+ *     the bound model — the server falls back to the AGENT DEFINITION
+ *     (`agent/<persona>.md`). The incident of 23/10 woke lead `nora`
+ *     (session bound to `opencode-go/deepseek-v4.1-flash`) on
+ *     `google/antigravity-gemini-3.8-flash#medium` (what `agent/nora.md`
+ *     declares) and the exhausted Antigravity pool swallowed the turn. So the
+ *     bound model is RESOLVED via `client.session.get` and sent EXPLICITLY
+ *     (variant "default" normalized away, §5.1). An explicit `primaryModel`
+ *     from the caller still wins; a caller that already resolved the model
+ *     hands it over as `boundModel` (`null` = resolution attempted, nothing
+ *     usable) and the wake is dispatched SYNCHRONOUSLY. Only a cold caller
+ *     (no primaryModel, no boundModel) pays the session.get round-trip, and
+ *     the wake is then dispatched right after it (fire-and-forget preserved);
+ *   - resolution failure degrades to a model-less attempt with an explicit
+ *     `wake:model-resolution-failed` log — never silently;
  *   - rungs 1..n are each distinct entry of
  *     `resolveFallbackChainForAgent(config, agent)` (agent optional: without
  *     one the resolver returns the global chain), walked ONLY after a
  *     rejected attempt (e.g. rate-limit 429) — the reactive fallback that
- *     still beats a stranded `delivered=0` message;
+ *     still beats a stranded `delivered=0` message. `chain[0]` is NEVER used
+ *     as rung 0 (the premature-downgrade regression of HARNESS-73);
  *   - each rejected attempt steps to the next rung; the ladder exhausted →
  *     log only. The caller must persist any message BEFORE calling: the wake
  *     is fire-and-forget (never awaited, per the promptAsync invariant).
  *
  * Shared by notifyLead (system messages), the watchdog/spawn wake wrappers
- * (indirect, via notifyLead) and the unconditional member wake in
+ * (indirect, via notifyLead), decision_lead and the board-close wake in
  * team-tasks-complete.
  */
 export function promptModelAwareWake(
@@ -239,85 +251,124 @@ export function promptModelAwareWake(
     /** Enables the model ladder via resolveFallbackChainForAgent(config, agent). */
     config?: Required<EnsembleConfig>
     /**
-     * Explicit first-attempt selector (TICKET-32B). PRESENT → respected as
-     * rung 0; ABSENT → rung 0 is the session's NATIVE model (`model` omitted,
-     * never the fallback-chain head).
+     * Explicit first-attempt selector. PRESENT → respected as rung 0 and
+     * dispatched synchronously; ABSENT → the session's bound model is resolved
+     * (see `boundModel`).
      */
     primaryModel?: string
+    /**
+     * TICKET-RELEASE-15 — a bound model the CALLER already resolved through
+     * `resolveSessionBoundModel` (e.g. the board-close wake, which is async).
+     * `null` means "resolution was attempted and the session exposes no usable
+     * model": rung 0 then goes out WITHOUT a model key, still synchronously.
+     * When omitted, this function resolves it itself before dispatching.
+     */
+    boundModel?: ParsedModel | null
     /** Synthetic system entry (default: true). */
     synthetic?: boolean
   },
 ): void {
-  const { sessionID, text, logTag, agent, config, primaryModel, synthetic = true } = params
+  const { sessionID, text, logTag, agent, config, primaryModel, boundModel, synthetic = true } = params
 
-  // TICKET-32B — ladder rungs. Rung 0 being `undefined` IS the session's
-  // NATIVE model: `model` is omitted from the payload and the server keeps
-  // the lead session's bound model. An explicit primaryModel replaces that
-  // native rung. Rungs 1..n = each DISTINCT chain entry, deduped by
-  // formatted selector, pushed ONLY for the reactive fallback walk.
-  // "#default" never survives parse/format (config.ts).
-  const ladder: Array<string | undefined> = [primaryModel || undefined]
-  const seen = new Set<string>(primaryModel ? [primaryModel] : [])
-  if (config) {
-    for (const entry of resolveFallbackChainForAgent(config, agent)) {
-      const selector = formatModelSelector(entry)
-      if (selector && !seen.has(selector)) {
-        seen.add(selector)
-        ladder.push(selector)
+  /**
+   * Build the ladder from an already-known rung 0 and fire attempt(startIndex).
+   * Kept as a closure (not a separate async step) so a caller-provided model
+   * wakes the lead in the SAME tick — the deterministic suites assert the
+   * transport payload right after the calling tool returns.
+   */
+  const dispatch = (primary: string | undefined): void => {
+    // Rung 0 = the effective primary (explicit caller selector or the resolved
+    // bound model). Rungs 1..n = each DISTINCT chain entry, deduped by
+    // formatted selector, pushed ONLY for the reactive fallback walk.
+    // "#default" never survives parse/format (config.ts §5.1).
+    const ladder: Array<string | undefined> = [primary || undefined]
+    const seen = new Set<string>(primary ? [primary] : [])
+    if (config) {
+      for (const entry of resolveFallbackChainForAgent(config, agent)) {
+        const selector = formatModelSelector(entry)
+        if (selector && !seen.has(selector)) {
+          seen.add(selector)
+          ladder.push(selector)
+        }
       }
     }
-  }
 
-  // TICKET-RELEASE-10 (F2): skip rungs already proven dead by a deterministic
-  // model-not-found within the TTL. The ladder still starts at rung 0 on a
-  // fresh session / after expiry (see modelNotFoundWakeSessions).
-  let startIndex = 0
-  const remembered = modelNotFoundWakeSessions.get(sessionID)
-  if (remembered) {
-    if (Date.now() - remembered.at >= MODEL_NOT_FOUND_WAKE_TTL_MS) {
-      modelNotFoundWakeSessions.delete(sessionID)
-    } else if (remembered.nextIndex > 0 && ladder.length > 0) {
-      startIndex = Math.min(remembered.nextIndex, ladder.length - 1)
-      log(`${logTag}:skip-dead-rungs session=${sessionID} failed=${remembered.failedRung} start=${startIndex}`)
+    // TICKET-RELEASE-10 (F2): skip rungs already proven dead by a deterministic
+    // model-not-found within the TTL. The ladder still starts at rung 0 on a
+    // fresh session / after expiry (see modelNotFoundWakeSessions).
+    let startIndex = 0
+    const remembered = modelNotFoundWakeSessions.get(sessionID)
+    if (remembered) {
+      if (Date.now() - remembered.at >= MODEL_NOT_FOUND_WAKE_TTL_MS) {
+        modelNotFoundWakeSessions.delete(sessionID)
+      } else if (remembered.failedRung !== "session-native" && primary && remembered.failedRung !== primary) {
+        // TICKET-RELEASE-15: the recorded rung was a CONCRETE bound model and
+        // the session now reports a DIFFERENT one (it was rebound after a
+        // failover). nextIndex indexes the OLD ladder — drop it instead of
+        // skipping the freshly bound model.
+        modelNotFoundWakeSessions.delete(sessionID)
+      } else if (remembered.nextIndex > 0 && ladder.length > 0) {
+        startIndex = Math.min(remembered.nextIndex, ladder.length - 1)
+        log(`${logTag}:skip-dead-rungs session=${sessionID} failed=${remembered.failedRung} start=${startIndex}`)
+      }
     }
+
+    const attempt = (index: number): void => {
+      const selector = ladder[index]
+      // Log label only — a model-less rung is never parsed as a selector.
+      const rung = selector ?? "session-native"
+      const parsed = selector ? parseModelSelector(selector) : undefined
+      client.session.promptAsync({
+        sessionID,
+        parts: [{ type: "text", text }],
+        ...(agent ? { agent } : {}),
+        ...(parsed ? { model: parsed } : {}),
+        ...(synthetic ? { synthetic: true } : {}),
+      }).then(() => {
+        log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${rung}`)
+      }).catch((err) => {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        // TICKET-RELEASE-10 (F2): a deterministic model-resolution failure is
+        // NOT a transient transport error — remember the dead rung so the next
+        // wake does not replay it, and step forward immediately.
+        const deterministic = isModelNotFoundWakeError(err)
+        if (deterministic) {
+          modelNotFoundWakeSessions.set(sessionID, {
+            at: Date.now(),
+            failedRung: rung,
+            nextIndex: index + 1 < ladder.length ? index + 1 : ladder.length,
+          })
+        }
+        const next = index + 1 < ladder.length ? ladder[index + 1] : undefined
+        if (next) {
+          log(`${logTag}:retry session=${sessionID} from=${rung} to=${next} reason=${deterministic ? "model-not-found" : "transport"} err=${errMsg}`)
+          attempt(index + 1)
+        } else {
+          log(`${logTag}:${deterministic ? "model-not-found:exhausted" : "failed"} session=${sessionID} model=${rung} err=${errMsg}`)
+        }
+      })
+    }
+    attempt(startIndex)
   }
 
-  const attempt = (index: number): void => {
-    const selector = ladder[index]
-    // Log label only — the native rung is never parsed as a selector.
-    const rung = selector ?? "session-native"
-    const parsed = selector ? parseModelSelector(selector) : undefined
-    client.session.promptAsync({
-      sessionID,
-      parts: [{ type: "text", text }],
-      ...(agent ? { agent } : {}),
-      ...(parsed ? { model: parsed } : {}),
-      ...(synthetic ? { synthetic: true } : {}),
-    }).then(() => {
-      log(`${logTag}:delivered session=${sessionID} agent=${agent} model=${rung}`)
-    }).catch((err) => {
-      const errMsg = err instanceof Error ? err.message : String(err)
-      // TICKET-RELEASE-10 (F2): a deterministic model-resolution failure is
-      // NOT a transient transport error — remember the dead rung so the next
-      // wake does not replay it, and step forward immediately.
-      const deterministic = isModelNotFoundWakeError(err)
-      if (deterministic) {
-        modelNotFoundWakeSessions.set(sessionID, {
-          at: Date.now(),
-          failedRung: rung,
-          nextIndex: index + 1 < ladder.length ? index + 1 : ladder.length,
-        })
-      }
-      const next = index + 1 < ladder.length ? ladder[index + 1] : undefined
-      if (next) {
-        log(`${logTag}:retry session=${sessionID} from=${rung} to=${next} reason=${deterministic ? "model-not-found" : "transport"} err=${errMsg}`)
-        attempt(index + 1)
-      } else {
-        log(`${logTag}:${deterministic ? "model-not-found:exhausted" : "failed"} session=${sessionID} model=${rung} err=${errMsg}`)
-      }
-    })
+  // An explicit caller selector wins, and a pre-resolved boundModel (including
+  // the `null` sentinel) dispatches in the SAME tick. Only a cold caller needs
+  // the async round-trip below.
+  if (primaryModel || boundModel !== undefined) {
+    const primary = primaryModel || (boundModel ? formatParsedModelSelector(boundModel) : undefined)
+    dispatch(primary)
+    return
   }
-  attempt(startIndex)
+
+  // Cold path (TICKET-RELEASE-15): resolve the session's BOUND model before the
+  // first attempt — omitting `model` makes the server use the agent `.md`.
+  // Fire-and-forget is preserved: the outer signature stays `void`.
+  void resolveSessionBoundModel(client, sessionID).then((model) => {
+    dispatch(model ? formatParsedModelSelector(model) : undefined)
+  }).catch((err) => {
+    log(`${logTag}:wake:model-resolution-failed session=${sessionID} err=${err instanceof Error ? err.message : String(err)}`)
+    dispatch(undefined)
+  })
 }
 
 /**
@@ -337,14 +388,16 @@ export function promptModelAwareWake(
  * reach promptModelAwareWake; every other system event is delivered passively
  * through the lead's system prompt.
  *
- * HARNESS-15 B / TICKET-32B — MODEL-AWARE WAKE: when wake options carry the
- * config (and an agent resolves — options.agent, else team.lead_agent), the
- * wake becomes a RETRY LADDER delegated to promptModelAwareWake: the SESSION'S
- * NATIVE model first (or the explicit options.primaryModel, when given), then
- * each distinct entry of the agent's fallback chain, in order. Each failed
- * attempt (rejected promptAsync) steps to the next rung; the message row is
- * persisted up front so a fully failed ladder still leaves the passive
- * backstop / recovery paths available.
+ * HARNESS-15 B / TICKET-32B / TICKET-RELEASE-15 — MODEL-AWARE WAKE: when wake
+ * options carry the config (and an agent resolves — options.agent, else
+ * team.lead_agent), the wake becomes a RETRY LADDER delegated to
+ * promptModelAwareWake: the model the lead session is CURRENTLY BOUND to is
+ * resolved via `client.session.get` and sent EXPLICITLY first (or the explicit
+ * options.primaryModel, when given) — omitting `model` would make the server
+ * use the agent `.md` model — then each distinct entry of the agent's fallback
+ * chain, in order. Each failed attempt (rejected promptAsync) steps to the
+ * next rung; the message row is persisted up front so a fully failed ladder
+ * still leaves the passive backstop / recovery paths available.
  *
  * The message is persisted first; the promptAsync wake is fire-and-forget
  * (never awaited, per the plugin's promptAsync invariant). Returns the

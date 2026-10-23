@@ -1,6 +1,8 @@
 import type { ToolDeps } from "../types"
 import { requireTeamMember, resolveStandbyWake } from "./shared"
-import { getMemberModel } from "../member-model"
+import { formatParsedModelSelector, getMemberModel, resolveSessionBoundModel } from "../member-model"
+import { resolveSessionAgent } from "../lead-agent"
+import { sendMessage } from "../messaging"
 import { inReviewNudges } from "../hooks"
 import { isQAMember, getTeamQAMember, isSDETMEmber, getTeamSDETMember, type QAMemberInfo } from "../qa-role"
 import { promptModelAwareWake } from "../notify"
@@ -1019,25 +1021,59 @@ export async function executeTeamTasksComplete(
     // NOTE: team_member has no `role` column (see schema.ts) — the lead's
     // session id lives on team.lead_session_id, the same canonical source
     // team_broadcast uses to address the lead (never a team_member session).
-    const leadRow = deps.db.query("SELECT lead_session_id FROM team WHERE id = ?")
-      .get(teamInfo.teamId) as { lead_session_id?: string | null } | null
+    // TICKET-RELEASE-15: `lead_agent` is read alongside so the wake carries the
+    // REAL persona explicitly instead of leaving the server to rebind it.
+    const leadRow = deps.db.query("SELECT lead_session_id, lead_agent FROM team WHERE id = ?")
+      .get(teamInfo.teamId) as { lead_session_id?: string | null; lead_agent?: string | null } | null
     const leadSessionId = leadRow?.lead_session_id
     if (leadSessionId) {
-      // Board closure wake: neutral notification to lead session.
-      // Deliberately modelless and agentless: preserving lead sovereignty.
-      // Subagents must never dictate which model or agent the lead session runs.
+      const wakeText = `[System: All team tasks completed on board by ${who}]`
+
+      // TICKET-RELEASE-15 (F1c) — persist the board closure as a DURABLE
+      // message BEFORE waking the lead. Under silentLead the system-prompt
+      // transform is the passive delivery channel, so a failed/killed wake
+      // (transport error, rate-limit, dead model) never loses the notification:
+      // the lead reads it on its next turn.
       try {
-        deps.client.session.promptAsync({
-          sessionID: leadSessionId,
-          parts: [{ type: "text", text: `[System: All team tasks completed on board by ${who}]` }],
-          synthetic: true,
-        }).catch((err) => {
-          log(`tasks-complete:wake-lead:failed team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`)
+        sendMessage(deps.db, {
+          teamId: teamInfo.teamId,
+          from: "system",
+          to: "lead",
+          content: wakeText,
         })
-        log(`tasks-complete:wake-lead:sent leadSession=${leadSessionId} by=${who}`)
       } catch (err) {
-        log(`tasks-complete:wake-lead:failed team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`)
+        log(`tasks-complete:wake-lead:failed phase=persist team=${teamInfo.teamId} err=${err instanceof Error ? err.message : String(err)}`)
       }
+
+      // TICKET-RELEASE-15 (F1a) — the agent goes EXPLICITLY on the wake:
+      // team.lead_agent is the plugin's known persona; the SDK session is the
+      // fallback. NEVER a hard-coded persona. Unknown → omitted (the server
+      // keeps the session's own binding, which is the lesser evil).
+      let leadAgent = leadRow?.lead_agent?.trim() || undefined
+      if (!leadAgent) leadAgent = await resolveSessionAgent(deps.client, leadSessionId)
+
+      // TICKET-RELEASE-15 (F1b) — the MODEL goes EXPLICITLY too. Omitting it
+      // does NOT preserve session.model: the server resolves the model from
+      // the agent definition (`agent/<persona>.md`), which is exactly how the
+      // 23/10 incident ran lead `nora` on the exhausted Antigravity pool.
+      // `resolveSessionBoundModel` normalizes variant "default" to absence
+      // (§5.1) and logs `wake:model-resolution-failed` when it cannot resolve
+      // — the wake then degrades to a model-less attempt, never silently.
+      //
+      // The resolved model is handed over as `boundModel` so the wake is
+      // dispatched in THIS tick (both resolutions already happened above).
+      // No `config` is threaded: board closure keeps its single-attempt
+      // semantics — the durable message is the backstop, not a chain walk.
+      const boundModel = await resolveSessionBoundModel(deps.client, leadSessionId)
+
+      promptModelAwareWake(deps.client, {
+        sessionID: leadSessionId,
+        text: wakeText,
+        logTag: "tasks-complete:wake-lead",
+        agent: leadAgent,
+        boundModel: boundModel ?? null,
+      })
+      log(`tasks-complete:wake-lead:sent leadSession=${leadSessionId} by=${who} agent=${leadAgent ?? "(unknown)"} model=${boundModel ? formatParsedModelSelector(boundModel) : "(unresolved)"}`)
     }
   }
 

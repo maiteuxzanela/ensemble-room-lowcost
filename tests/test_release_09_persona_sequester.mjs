@@ -413,6 +413,9 @@ async function runBehavior(label, mods) {
     config: { ...DEFAULT_CONFIG, silentLead: true },
     forceWake: true,
   });
+  // TICKET-RELEASE-15: o wake resolve o modelo bound (session.get) antes de
+  // disparar — drena as microtasks antes de inspecionar o transporte.
+  await new Promise((r) => setImmediate(r));
   const nlWake = calls.promptAsync.find((p) => p.sessionID === "ses_lead_d2");
   check(
     `[${label}] D: notifyLead(forceWake) envia agent='iris' e preserva o vínculo`,
@@ -457,6 +460,7 @@ async function runBehavior(label, mods) {
     config: { ...DEFAULT_CONFIG, silentLead: false },
     forceWake: true,
   });
+  await new Promise((r) => setImmediate(r));
   const e2Wake = calls.promptAsync.find((p) => p.sessionID === "ses_lead_e2");
   check(
     `[${label}] E: notifyLead com lead desconhecido omite 'agent' (nada hardcoded)`,

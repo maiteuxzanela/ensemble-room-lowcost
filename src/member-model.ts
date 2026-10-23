@@ -1,5 +1,7 @@
 import type { Database } from "./db"
-import { parseModelSelector, type ParsedModelSelector } from "./config"
+import type { PluginClient } from "./types"
+import { parseModelSelector, VARIANT_ABSENT_SENTINEL, type ParsedModelSelector } from "./config"
+import { log } from "./log"
 
 /** A parsed provider/model pair, as accepted by session.promptAsync. */
 export type ParsedModel = ParsedModelSelector
@@ -29,6 +31,99 @@ export function getMemberModel(db: Database, teamId: string, memberName: string)
     .get(teamId, memberName) as { model: string | null } | null
   if (!row?.model) return undefined
   return parseModelId(row.model)
+}
+
+/**
+ * TICKET-RELEASE-15 — format a parsed bound model back into OpenCode selector
+ * form (`provider/model[#variant]`). The `#default` absence sentinel is NEVER
+ * emitted (config.ts §5.1 / VARIANT_ABSENT_SENTINEL): a bound model with no
+ * real variant formats exactly like `provider/model`.
+ */
+export function formatParsedModelSelector(model: ParsedModel): string {
+  return model.variant ? `${model.providerID}/${model.modelID}#${model.variant}` : `${model.providerID}/${model.modelID}`
+}
+
+/** Structural shape of the `model` field carried by a `session.get()` payload. */
+interface SessionModelRecord {
+  providerID?: unknown
+  id?: unknown
+  modelID?: unknown
+  variant?: unknown
+}
+
+/** Structural shape of the session fields read here (V2 nests under `data`). */
+interface SessionModelPayload {
+  model?: unknown
+  data?: { model?: unknown; data?: { model?: unknown } }
+}
+
+/**
+ * Parse the `model` record of a `session.get()` payload into a ParsedModel.
+ * Accepts both the V2 field name (`id`) and the older `modelID`, and requires
+ * a non-empty provider + model. Returns undefined for anything malformed.
+ *
+ * `variant: "default"` is the server's ABSENCE marker (config.ts §5.1): it is
+ * normalized to `undefined` so the selector never round-trips as `#default`
+ * and the promptAsync payload carries no bogus thinking level.
+ */
+export function extractSessionBoundModel(payload: unknown): ParsedModel | undefined {
+  if (!payload || typeof payload !== "object") return undefined
+  const root = payload as SessionModelPayload
+  const candidates: unknown[] = [root.model, root.data?.model, root.data?.data?.model]
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue
+    const record = candidate as SessionModelRecord
+    const providerID = typeof record.providerID === "string" ? record.providerID.trim() : ""
+    const rawModelID = typeof record.id === "string" && record.id.trim().length > 0
+      ? record.id.trim()
+      : typeof record.modelID === "string" ? record.modelID.trim() : ""
+    if (!providerID || !rawModelID) continue
+    const rawVariant = typeof record.variant === "string" ? record.variant.trim() : ""
+    const variant = rawVariant && rawVariant !== VARIANT_ABSENT_SENTINEL ? rawVariant : undefined
+    return variant ? { providerID, modelID: rawModelID, variant } : { providerID, modelID: rawModelID }
+  }
+  return undefined
+}
+
+/**
+ * TICKET-RELEASE-15 — resolve the model a session is CURRENTLY BOUND to via
+ * `client.session.get({sessionID})` → `data.model`.
+ *
+ * WHY THIS EXISTS (incident 23/10, session ses_e95bdc982ffe4Kl5ZgFPrkWxFe):
+ * omitting the `model` key from `session.promptAsync` does NOT preserve the
+ * session's bound model. The OpenCode server resolves it from the AGENT
+ * DEFINITION (`agent/<persona>.md`) — the lead `nora` had
+ * `session.model = opencode-go/deepseek-v4.1-flash` but a modelless wake ran
+ * `google/antigravity-gemini-3.8-flash#medium` (exactly what `agent/nora.md`
+ * declares) and died on an exhausted Antigravity pool, leaving the lead mute.
+ * The pre-TICKET-RELEASE-15 premise "modelless = native model" was FALSE.
+ *
+ * Never throws. A missing session.get, a failed round-trip or a payload with
+ * no usable model all yield `undefined` AFTER logging
+ * `wake:model-resolution-failed` — the caller then degrades to a model-less
+ * wake explicitly, never silently.
+ */
+export async function resolveSessionBoundModel(
+  client: PluginClient,
+  sessionID: string,
+): Promise<ParsedModel | undefined> {
+  if (!sessionID) return undefined
+  try {
+    if (typeof client?.session?.get !== "function") {
+      log(`wake:model-resolution-failed session=${sessionID} reason=no-session-get`)
+      return undefined
+    }
+    const res = await client.session.get({ sessionID })
+    const model = extractSessionBoundModel(res)
+    if (!model) {
+      log(`wake:model-resolution-failed session=${sessionID} reason=no-bound-model`)
+      return undefined
+    }
+    return model
+  } catch (err) {
+    log(`wake:model-resolution-failed session=${sessionID} reason=session-get-error err=${err instanceof Error ? err.message : String(err)}`)
+    return undefined
+  }
 }
 
 /**
