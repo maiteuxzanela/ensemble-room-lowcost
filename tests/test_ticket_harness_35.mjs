@@ -26,7 +26,8 @@
  *              localhost:port / 127.0.0.1:port legítimos → 200.
  *   (a) lead   to='lead' e '@lead ...' resolvem de team, gravam to_name='lead',
  *              despacham promptAsync(lead_session_id, agent=lead_agent) e 200
- *              recipients=["lead"] (antes 404). lead_agent NULL → fallback "dante".
+ *              recipients=["lead"] (antes 404). lead_agent NULL → SEM persona
+ *              inventada (TICKET-RELEASE-09: chave `agent` omitida).
  *   (b/c)      preservação de model (variant separado do modelID) e agent.
  *   (d) standby execution_status='standby' + spawn_context → o texto entregue
  *              prepende o contexto e a execução vira 'starting'.
@@ -365,11 +366,16 @@ async function runFlow(mod) {
     lc = callFor("ses_lead_t1");
     R("lead.mention-prompt", !!lc && lc.agent === "dante" && textOf(lc).includes("item-mention"), `agent=${lc?.agent}`);
 
-    // lead_agent NULL → fallback "dante".
+    // TICKET-RELEASE-09 — lead_agent NULL → persona DESCONHECIDA: o payload
+    // NÃO carrega `agent` (nunca "dante"), preservando o vínculo da sessão.
     calls.length = 0;
     r = await post({ teamId: "t2", to: "lead", text: "sem-agente" });
     lc = callFor("ses_lead_t2");
-    R("lead.fallback-agent-dante", r.status === 200 && !!lc && lc.agent === "dante", `status=${r.status} agent=${lc?.agent}`);
+    R(
+      "lead.unknown-agent-omitted",
+      r.status === 200 && !!lc && !("agent" in lc) && lc.agent !== "dante",
+      `status=${r.status} agent=${lc?.agent} keys=${lc ? Object.keys(lc).join(",") : "-"}`,
+    );
 
     // ===================== (b/c) MODELO + PERSONA ==========================
     calls.length = 0;
@@ -555,7 +561,7 @@ const MUTATIONS = [
     to: "} else if (false) {",
     detect: [
       "lead.200", "lead.row-to-name", "lead.prompt-session-agent", "lead.prompt-text", "lead.delivered",
-      "lead.mention-200", "lead.mention-row", "lead.mention-prompt", "lead.fallback-agent-dante",
+      "lead.mention-200", "lead.mention-row", "lead.mention-prompt", "lead.unknown-agent-omitted",
     ],
     unaffected: ["model.preserved", "standby.prepend-context", "broadcast.delivered", "gate.health-forged-403"],
   },

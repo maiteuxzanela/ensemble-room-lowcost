@@ -236,7 +236,10 @@ function scnMemberModel(mod) {
     R("resolve.unknown-undefined", mod.resolveAgentForSession(db, "nope") === undefined, String(mod.resolveAgentForSession(db, "nope")));
 
     db.run("UPDATE team SET lead_agent = NULL WHERE id = 'TA'");
-    R("resolve.lead-null-agent-fallback-dante", mod.resolveAgentForSession(db, "sesL_A") === "dante", String(mod.resolveAgentForSession(db, "sesL_A")));
+    // TICKET-RELEASE-09: NULL = persona desconhecida -> undefined (o vínculo
+    // nativo da sessão é preservado). O antigo fallback "dante" era o
+    // sequestrador de persona.
+    R("resolve.lead-null-agent-undefined", mod.resolveAgentForSession(db, "sesL_A") === undefined, String(mod.resolveAgentForSession(db, "sesL_A")));
   } finally {
     cleanup(base, db);
   }
@@ -736,7 +739,7 @@ const MUTATIONS = [
     to: "\"SELECT lead_agent FROM team WHERE lead_session_id = ?\"",
     scenarios: ["memberModel"],
     detect: ["resolve.lead-archived-undefined"],
-    unaffected: ["resolve.member-active", "resolve.member-archived-undefined", "resolve.lead-active", "resolve.lead-null-agent-fallback-dante"],
+    unaffected: ["resolve.member-active", "resolve.member-archived-undefined", "resolve.lead-active", "resolve.lead-null-agent-undefined"],
   },
   {
     id: "M5",

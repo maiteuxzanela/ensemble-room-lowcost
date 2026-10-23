@@ -88,6 +88,7 @@ const SUITES = [
   { file: "test_ticket_harness_57_failover_refinement.mjs", label: "HARNESS-57 (Failover model-aware: supressão do eco residual vs bypass imediato do modelo novo + AbortController no spawn sem rollback destrutivo; SQLite/transporte reais, paridade src↔dist e prova de mutação M1-M3)" },
   { file: "test_release_03_dashboard_csrf.mjs", label: "TICKET-RELEASE-03 (Dashboard CSRF/cross-origin: Host loopback+porta, Origin allow-list, null+JSON, fallback de Referer, cabeçalhos nosniff/no-referrer/no-store em JSON/HTML/403, emergência sem efeito colateral; HTTP cru real, paridade src↔dist e prova de mutação M1-M7)" },
   { file: "test_release05_shell_ledger.mjs", label: "RELEASE-05 (Ledger captura artefatos de shell: snapshot before/after, package-lock já-sujo, deleção, filtros node_modules/.test-scratch, fail-safe sem baseline, teto, Portão 1 cirúrgico + prova de mutação M1)" },
+  { file: "test_release_09_persona_sequester.mjs", label: "RELEASE-09 (Persona Sequester Fix: lead_agent persistido no team_create, sem fallback 'dante' no resolver, auto-cura de salas legadas NULL via session.get e wake de lead que preserva a persona — dist+src, SQLite real)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

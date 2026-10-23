@@ -39,13 +39,24 @@ export function getMemberModel(db: Database, teamId: string, memberName: string)
  *
  * Resolution order (deterministic, fail-safe):
  *   1. `team_member.session_id = ?` → the member's own `agent` (when non-empty).
- *   2. `team.lead_session_id = ?` → the team's `lead_agent`, or the safe
- *      fallback `"dante"` when a legacy team has `lead_agent = NULL`
- *      (Migration 5 adds the column nullable).
+ *   2. `team.lead_session_id = ?` → the team's `lead_agent` (when non-empty).
  *   3. No row matches in either table → `undefined`. Callers MUST NOT invent
  *      a fallback: an unknown session (e.g. a sub-agent or an isolated
  *      reviewer session) must be delivered verbatim, not resequenced into an
  *      arbitrary persona.
+ *
+ * TICKET-HARNESS-73 / TICKET-RELEASE-09 — step 2 NO LONGER falls back to
+ * the hard-coded `"dante"`. `team.lead_agent` is nullable (Migration 5) and
+ * was NEVER written by `team_create`, so the old `lead_agent ?? "dante"`
+ * answered "dante" for EVERY lead — and because the transport choke point
+ * (`src/client.ts` → `throwingPromptAsync`) re-injects `agent` whenever the
+ * caller omitted it, that invented value SILENTLY REBOUND the lead session
+ * onto Dante's persona (Iris, Nora, Selene… all became Dante).
+ *
+ * A NULL/empty `lead_agent` now yields `undefined`: the session keeps its
+ * OWN binding and no persona is sequestered. The truthful value is
+ * persisted at creation time (`executeTeamCreate`) and legacy rows are
+ * self-healed on demand (`ensureTeamLeadAgent`, src/lead-agent.ts).
  *
  * Never throws — a missing/invalid `sessionID` yields `undefined`.
  */
@@ -62,7 +73,9 @@ export function resolveAgentForSession(db: Database, sessionID: string): string 
 
   const lead = db.query("SELECT lead_agent FROM team WHERE lead_session_id = ? AND status = 'active'")
     .get(sessionID) as { lead_agent: string | null } | null
-  if (lead) return lead.lead_agent ?? "dante"
+  // Unknown lead agent → undefined (preserve the session's native binding).
+  // NEVER invent a persona here.
+  if (lead) return lead.lead_agent || undefined
 
   return undefined
 }

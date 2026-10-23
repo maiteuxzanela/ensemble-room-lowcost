@@ -1900,7 +1900,7 @@ function resolveAgentForSession(db, sessionID) {
   ).get(sessionID);
   if (member?.agent) return member.agent;
   const lead = db.query("SELECT lead_agent FROM team WHERE lead_session_id = ? AND status = 'active'").get(sessionID);
-  if (lead) return lead.lead_agent ?? "dante";
+  if (lead) return lead.lead_agent || void 0;
   return void 0;
 }
 
@@ -2658,6 +2658,59 @@ function buildTeamCompactionContext(db, teamId, role, memberName, config) {
   return lines.join("\n");
 }
 
+// src/lead-agent.ts
+init_log();
+function extractSessionAgent(payload) {
+  if (!payload || typeof payload !== "object") return void 0;
+  const root = payload;
+  const candidates = [
+    root.agent,
+    root.data?.agent,
+    root.data?.data?.agent
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) return candidate.trim();
+  }
+  return void 0;
+}
+async function resolveSessionAgent(client, sessionID) {
+  if (!sessionID) return void 0;
+  try {
+    if (typeof client?.session?.get !== "function") return void 0;
+    const res = await client.session.get({ sessionID });
+    return extractSessionAgent(res);
+  } catch (err) {
+    log(`lead-agent:session-get:failed session=${sessionID} err=${err instanceof Error ? err.message : String(err)}`);
+    return void 0;
+  }
+}
+async function ensureTeamLeadAgent(db, client, teamId) {
+  if (!teamId) return void 0;
+  let row = null;
+  try {
+    row = db.query("SELECT lead_agent, lead_session_id FROM team WHERE id = ?").get(teamId);
+  } catch (err) {
+    log(`lead-agent:read:failed team=${teamId} err=${err instanceof Error ? err.message : String(err)}`);
+    return void 0;
+  }
+  if (!row) return void 0;
+  if (row.lead_agent && row.lead_agent.trim().length > 0) return row.lead_agent;
+  if (!row.lead_session_id) return void 0;
+  const agent = await resolveSessionAgent(client, row.lead_session_id);
+  if (!agent) return void 0;
+  try {
+    db.run(
+      "UPDATE team SET lead_agent = ?, time_updated = ? WHERE id = ? AND (lead_agent IS NULL OR lead_agent = '')",
+      [agent, Date.now(), teamId]
+    );
+  } catch (err) {
+    log(`lead-agent:update:failed team=${teamId} agent=${agent} err=${err instanceof Error ? err.message : String(err)}`);
+    return void 0;
+  }
+  log(`lead-agent:healed team=${teamId} agent=${agent} session=${row.lead_session_id}`);
+  return agent;
+}
+
 // src/tools/team-create.ts
 async function executeTeamCreate(deps, args, sessionId) {
   const nameError = validateTeamName(args.name);
@@ -2680,6 +2733,7 @@ async function executeTeamCreate(deps, args, sessionId) {
   const id = generateId("team");
   const now = Date.now();
   const projectName = args.project_name ?? generateProjectName();
+  const leadAgent = await resolveSessionAgent(deps.client, sessionId);
   deps.db.run(
     `INSERT INTO project (id, name, path, status, time_created, time_updated)
      VALUES (?, ?, ?, 'active', ?, ?)
@@ -2687,8 +2741,8 @@ async function executeTeamCreate(deps, args, sessionId) {
     [projectId, projectName, projectId, now, now]
   );
   deps.db.run(
-    "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)",
-    [id, args.name, projectId, sessionId, now, now]
+    "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated, lead_agent) VALUES (?, ?, ?, ?, 'active', 0, ?, ?, ?)",
+    [id, args.name, projectId, sessionId, now, now, leadAgent ?? null]
   );
   return `Team "${args.name}" created. You are the lead. Para demandas de engenharia, convoque o squad can\xF4nico via team_spawn: implementadores especializados, engenheiro de testes determin\xEDsticos (SDET) e revisor de Quality Gate. Use team_tasks_add para planejar as frentes.
 
@@ -2805,6 +2859,7 @@ async function executeTeamSpawn(deps, args, sessionId) {
   const nameError = validateMemberName(args.name);
   if (nameError) throw new Error(nameError);
   const teamInfo = requireLead(deps, sessionId);
+  await ensureTeamLeadAgent(deps.db, deps.client, teamInfo.teamId);
   const failures = spawnFailures.get(teamInfo.teamId);
   if (failures && failures.count >= 3) {
     throw new Error(`Spawn circuit breaker tripped for team "${teamInfo.teamName}": 3 consecutive failures. Last error: ${failures.lastError}. Investigate before retrying \u2014 the circuit breaker resets on the next successful spawn.`);
@@ -3445,18 +3500,15 @@ ${context}${optionsBlock}`;
     to: "lead",
     content: payload
   });
+  await ensureTeamLeadAgent(deps.db, deps.client, teamInfo.teamId);
   const ctx = resolveLeadWakeContext(deps.db, teamInfo.teamId);
   if (ctx) {
-    const chain = resolveFallbackChainForAgent(deps.config, ctx.leadAgent);
-    const firstModel = chain[0];
-    const primaryModel = firstModel !== void 0 ? formatModelSelector(firstModel) : void 0;
     promptModelAwareWake(deps.client, {
       sessionID: ctx.leadSessionId,
       text: payload,
       logTag: `decision-lead:wake team=${teamInfo.teamId} member=${memberName}`,
       agent: ctx.leadAgent,
-      config: deps.config,
-      primaryModel
+      config: deps.config
     });
   } else {
     log(`decision-lead:no-lead team=${teamInfo.teamId} member=${memberName} \u2014 decision recorded but lead could not be resolved`);
@@ -7539,14 +7591,17 @@ function handleDashboardRequest(db, port, req, res, sessionToken, options) {
           messageId = sendMessage(db, { teamId, from: "human", to: "lead", content: text });
           recipients.push("lead");
           if (options?.client) {
-            const wake = resolveStandbyWake(db, teamId, "lead", `[Direct message from human]: ${text}`);
-            const model = getMemberModel(db, teamId, "lead");
-            options.client.session.promptAsync({
-              sessionID: team.lead_session_id,
-              parts: [{ type: "text", text: wake.text }],
-              synthetic: true,
-              agent: team.lead_agent ?? "dante",
-              ...model ? { model } : {}
+            const client = options.client;
+            ensureTeamLeadAgent(db, client, teamId).then((leadAgent) => {
+              const wake = resolveStandbyWake(db, teamId, "lead", `[Direct message from human]: ${text}`);
+              const model = getMemberModel(db, teamId, "lead");
+              return client.session.promptAsync({
+                sessionID: team.lead_session_id,
+                parts: [{ type: "text", text: wake.text }],
+                synthetic: true,
+                ...leadAgent ? { agent: leadAgent } : {},
+                ...model ? { model } : {}
+              });
             }).then(() => {
               markDelivered(db, messageId);
             }).catch((err) => log(`dashboard:chat lead msg failed err=${err}`));

@@ -3,6 +3,7 @@ import { generateId, generateProjectName, validateProjectName, validateTeamName 
 import { findTeamBySession } from "../types"
 import { isSessionAlive } from "../recovery"
 import { leadTopologySizingReminder } from "../system-prompt"
+import { resolveSessionAgent } from "../lead-agent"
 
 /**
  * Execute the team_create tool. Creates a new team with the caller as lead.
@@ -43,6 +44,24 @@ export async function executeTeamCreate(
   const id = generateId("team")
   const now = Date.now()
   const projectName = args.project_name ?? generateProjectName()
+
+  // TICKET-HARNESS-73 / TICKET-RELEASE-09 — persist the lead's AGENT
+  // (persona) at creation time.
+  //
+  // `team.lead_agent` (Migration 5) was NEVER written by team_create, so
+  // every team the plugin created carried `lead_agent = NULL`. Downstream
+  // that NULL was papered over with a hard-coded "dante" by
+  // `resolveAgentForSession` — which SILENTLY REBOUND the lead session onto
+  // Dante's persona (Iris, Nora, Selene… all became Dante) on the next
+  // prompt, because the transport choke point re-injects `agent` whenever
+  // the caller omitted it.
+  //
+  // The agent is read from the SDK (the session's own binding) and stored
+  // verbatim. When the lookup fails the column stays NULL — which the
+  // resolver now treats as "unknown" (preserve native binding) instead of
+  // "invent a persona".
+  const leadAgent = await resolveSessionAgent(deps.client, sessionId)
+
   deps.db.run(
     `INSERT INTO project (id, name, path, status, time_created, time_updated)
      VALUES (?, ?, ?, 'active', ?, ?)
@@ -50,8 +69,8 @@ export async function executeTeamCreate(
     [projectId, projectName, projectId, now, now]
   )
   deps.db.run(
-    "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)",
-    [id, args.name, projectId, sessionId, now, now]
+    "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated, lead_agent) VALUES (?, ?, ?, ?, 'active', 0, ?, ?, ?)",
+    [id, args.name, projectId, sessionId, now, now, leadAgent ?? null]
   )
 
   // TICKET-HARNESS-55 (Camada C): the tool result is the lead's first post-create

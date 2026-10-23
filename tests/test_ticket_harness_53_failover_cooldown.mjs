@@ -509,11 +509,11 @@ for (const [scn, map] of Object.entries(DIST_MAPS)) {
     const diana = cfg.fallbackModelsByAgent?.diana ?? [];
     const hugo = cfg.fallbackModelsByAgent?.hugo ?? [];
     const clara = cfg.fallbackModelsByAgent?.clara ?? [];
-    // Cadeia canônica de Hugo e Clara (1º salto pago deepseek#low). A entrada
-    // "opencode/glm-5.3-flash-free" foi REMOVIDA por diretriz da Fundadora
-    // (glm removido das cadeias de Diana, Hugo e Clara) — o config vivo desta
-    // máquina já reflete a cadeia sem glm (5 entradas).
+    // Cadeia canônica de Hugo e Clara (LongCat primário, MiniMax 1º fallback,
+    // seguido pela cadeia deepseek/mimo/gemini).
     const HUGO_CLARA_CHAIN = [
+      "opencode-go/longcat-2.5-preview-free",
+      "opencode-go/minimax-m3.1-flash-free",
       "opencode/deepseek-v4.1-flash-free",
       "opencode-go/deepseek-v4.1-flash#low",
       "opencode/mimo-v2.6-flash-free",
@@ -526,9 +526,9 @@ for (const [scn, map] of Object.entries(DIST_MAPS)) {
       "opencode-go/deepseek-v4.1-flash#high",
     ];
     check(
-      "4.1: modelsByAgent.hugo e .clara primam em opencode/deepseek-v4.1-flash-free",
-      cfg.modelsByAgent?.hugo === "opencode/deepseek-v4.1-flash-free"
-        && cfg.modelsByAgent?.clara === "opencode/deepseek-v4.1-flash-free",
+      "4.1: modelsByAgent.hugo e .clara primam em opencode-go/longcat-2.5-preview-free",
+      cfg.modelsByAgent?.hugo === "opencode-go/longcat-2.5-preview-free"
+        && cfg.modelsByAgent?.clara === "opencode-go/longcat-2.5-preview-free",
       `hugo=${cfg.modelsByAgent?.hugo} clara=${cfg.modelsByAgent?.clara}`,
     );
     check(

@@ -4,7 +4,7 @@ import { requireTeamMember } from "./shared"
 import { setMemberStandby } from "./team-standby"
 import { sendMessage } from "../messaging"
 import { resolveLeadWakeContext, promptModelAwareWake } from "../notify"
-import { formatModelSelector, resolveFallbackChainForAgent } from "../config"
+import { ensureTeamLeadAgent } from "../lead-agent"
 import { log } from "../log"
 
 export interface DecisionLeadArgs {
@@ -248,18 +248,37 @@ export async function executeDecisionLead(
   // 4. Wake the lead, punching through silentLead, on the lead's agent and its
   //    resilient fallback chain (resolveFallbackChainForAgent). The shared
   //    model-aware wake builds the retry ladder from that chain.
+  // TICKET-HARNESS-73 / TICKET-RELEASE-09 — legacy self-heal before the
+  // wake: a team created before the fix carries `lead_agent = NULL`, and a
+  // NULL agent means the wake would go out WITHOUT the `agent` field (the
+  // server then rebinds the session to its default agent — persona
+  // sequester). `ensureTeamLeadAgent` recovers the real persona from the
+  // SDK and persists it; on failure it degrades to "unknown" without ever
+  // inventing one.
+  await ensureTeamLeadAgent(deps.db, deps.client, teamInfo.teamId)
+
   const ctx = resolveLeadWakeContext(deps.db, teamInfo.teamId)
   if (ctx) {
-    const chain = resolveFallbackChainForAgent(deps.config, ctx.leadAgent)
-    const firstModel = chain[0]
-    const primaryModel = firstModel !== undefined ? formatModelSelector(firstModel) : undefined
+    // TICKET-HARNESS-73 / TICKET-RELEASE-09 — NO `primaryModel` here.
+    //
+    // The canonical TICKET-32B contract (src/notify.ts) says rung 0 of the
+    // model-aware wake PRESERVES THE SESSION'S NATIVE MODEL: with no
+    // `primaryModel` the `model` key is OMITTED from promptAsync, so the
+    // OpenCode server keeps whatever model the lead session is bound to.
+    //
+    // The pre-TICKET-32B shape (this code) computed `primaryModel` from
+    // chain[0] and handed it over, which turned rung 0 into an EXPLICIT
+    // selector = a PREMATURE DOWNGRADE of the Lead to the cheapest fallback
+    // on EVERY emergency decision wake — even when the lead's own model was
+    // perfectly healthy. The reactive ladder (rungs 1..n) still walks the
+    // chain on rejection/rate-limit, which is the ONLY legitimate use of
+    // the fallback chain.
     promptModelAwareWake(deps.client, {
       sessionID: ctx.leadSessionId,
       text: payload,
       logTag: `decision-lead:wake team=${teamInfo.teamId} member=${memberName}`,
       agent: ctx.leadAgent,
       config: deps.config,
-      primaryModel,
     })
   } else {
     log(`decision-lead:no-lead team=${teamInfo.teamId} member=${memberName} — decision recorded but lead could not be resolved`)

@@ -9,6 +9,7 @@ import { DASHBOARD_JS_RENDER } from "./dashboard-js-render"
 import { log } from "./log"
 import { broadcastMessage, sendMessage, markDelivered, hasReportedCompletion } from "./messaging"
 import { getMemberModel } from "./member-model"
+import { ensureTeamLeadAgent } from "./lead-agent"
 import { resolveStandbyWake } from "./tools/shared"
 import { abortInflight } from "./v2-session"
 import { notifyLead } from "./notify"
@@ -1062,14 +1063,31 @@ function handleDashboardRequest(
           messageId = sendMessage(db, { teamId, from: "human", to: "lead", content: text })
           recipients.push("lead")
           if (options?.client) {
-            const wake = resolveStandbyWake(db, teamId, "lead", `[Direct message from human]: ${text}`)
-            const model = getMemberModel(db, teamId, "lead")
-            options.client.session.promptAsync({
-              sessionID: team.lead_session_id,
-              parts: [{ type: "text", text: wake.text }],
-              synthetic: true,
-              agent: team.lead_agent ?? "dante",
-              ...(model ? { model } : {}),
+            // TICKET-RELEASE-09 — MESMA persona-sequester do wake de lead, agora
+            // fechada nesta rota (POST /api/chat/send com to="lead"). O código
+            // antigo injetava `agent: team.lead_agent ?? "dante"`: em sala
+            // legada (lead_agent NULL) isso ENVIAVA "dante" explicitamente e o
+            // servidor rebindava a sessão do lead para a persona Dante — o
+            // sequestro exato que o card elimina.
+            //
+            // Contrato novo (idêntico a resolveAgentForSession/notifyLead):
+            //   1. auto-cura oportunista via session.get (`ensureTeamLeadAgent`);
+            //   2. persona conhecida → `agent` explícito (preserva o vínculo);
+            //   3. persona DESCONHECIDA → chave `agent` AUSENTE (o servidor
+            //      mantém o vínculo nativo da sessão; nunca se inventa persona).
+            //
+            // Fire-and-forget preservado (promptAsync nunca é awaited).
+            const client = options.client
+            ensureTeamLeadAgent(db, client, teamId).then((leadAgent) => {
+              const wake = resolveStandbyWake(db, teamId, "lead", `[Direct message from human]: ${text}`)
+              const model = getMemberModel(db, teamId, "lead")
+              return client.session.promptAsync({
+                sessionID: team.lead_session_id,
+                parts: [{ type: "text", text: wake.text }],
+                synthetic: true,
+                ...(leadAgent ? { agent: leadAgent } : {}),
+                ...(model ? { model } : {}),
+              })
             }).then(() => {
               markDelivered(db, messageId)
             }).catch((err: unknown) => log(`dashboard:chat lead msg failed err=${err}`))

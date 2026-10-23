@@ -14,7 +14,8 @@
  *   (1) Sessão de membro (agent='hugo') SEM `agent` -> choke point injeta
  *       `agent:'hugo'` nos args repassados ao raw client.
  *   (2) Sessão do lead (team.lead_session_id) SEM `agent` -> injeta `lead_agent`
- *       ('dante'); lead legado com lead_agent NULL -> fallback seguro 'dante'.
+ *       ('dante'); lead legado com lead_agent NULL -> SEM persona inventada
+ *       (TICKET-RELEASE-09: verbatim, o vínculo nativo da sessão é preservado).
  *   (3) `agent` explícito -> NUNCA sobrescrito; string vazia tratada como ausente.
  *   (4) Sessão desconhecida -> repassa VERBATIM, sem erro e sem persona inventada;
  *       sessionID ausente idem.
@@ -185,13 +186,22 @@ const hasKey = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
     resolveAgentForSession(db, LEAD_SES) === "dante",
   );
 
-  // --- Cenário 2b: lead legado (lead_agent NULL) -> fallback seguro 'dante' ---
+  // --- Cenário 2b: lead legado (lead_agent NULL) -> agente DESCONHECIDO ---
+  // TICKET-RELEASE-09: `lead_agent = NULL` significa "não sei qual é a
+  // persona" — NUNCA "dante". O choke point repassa o payload VERBATIM (sem
+  // `agent`) para o servidor preservar o vínculo nativo da sessão; o fallback
+  // hardcoded é exatamente o sequestrador que este ticket elimina.
   await client.session.promptAsync({ sessionID: LEGACY_LEAD_SES, text: "Legacy wake." });
   const c2b = calls.promptAsync.at(-1);
   check(
-    "(2) lead legado (lead_agent NULL) -> fallback seguro 'dante'",
-    c2b?.agent === "dante",
+    "(2) lead legado (lead_agent NULL) -> verbatim, SEM persona inventada",
+    c2b?.agent === undefined && c2b?.sessionID === LEGACY_LEAD_SES && c2b?.text === "Legacy wake.",
     JSON.stringify(c2b),
+  );
+  check(
+    "(2) resolveAgentForSession(db, leadLegacyNull) === undefined",
+    resolveAgentForSession(db, LEGACY_LEAD_SES) === undefined,
+    String(resolveAgentForSession(db, LEGACY_LEAD_SES)),
   );
 
   // --- Cenário 3: agent explícito NUNCA é sobrescrito ---

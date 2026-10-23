@@ -12,6 +12,7 @@ import {
 } from "../config"
 import { log } from "../log"
 import { getTeamQAMember, getTeamSDETMember } from "../qa-role"
+import { ensureTeamLeadAgent } from "../lead-agent"
 import type { EnsembleConfig } from "../config"
 import { getTeamResourceParts, teamWorktreeName } from "./merge-helper"
 import { trackPrompt, endTracked } from "../v2-session"
@@ -134,6 +135,20 @@ export async function executeTeamSpawn(
   if (nameError) throw new Error(nameError)
 
   const teamInfo = requireLead(deps, sessionId)
+
+  // TICKET-HARNESS-73 / TICKET-RELEASE-09 — legacy self-heal.
+  //
+  // Teams created BEFORE this fix carry `team.lead_agent = NULL` (the
+  // column was added by Migration 5 but never written by team_create). A
+  // NULL lead agent used to be papered over with a hard-coded "dante",
+  // which silently rebound the lead session onto Dante's persona. The
+  // resolver now treats NULL as "unknown" — so we ask the SDK which agent
+  // the lead session is bound to and persist that answer (atomically, and
+  // only when the column is still empty).
+  //
+  // Opportunistic by design: a failure degrades to "agent unknown"
+  // (native binding preserved), never to an invented persona.
+  await ensureTeamLeadAgent(deps.db, deps.client, teamInfo.teamId)
 
   // Circuit breaker — stop retrying after 3 consecutive failures
   const failures = spawnFailures.get(teamInfo.teamId)

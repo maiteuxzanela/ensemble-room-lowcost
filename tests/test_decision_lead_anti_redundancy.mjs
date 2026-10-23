@@ -384,11 +384,13 @@ async function runBehavior(label, mods) {
         payload.includes("2. Caminho B"),
     );
     check(`[${label}] 1.11 wake usa o agent do lead (team.lead_agent='dante')`, p?.agent === LEAD_AGENT, String(p?.agent));
+    // TICKET-32B / TICKET-HARNESS-73: rung 0 do wake model-aware PRESERVA o
+    // modelo NATIVO da sessão do lead — `model` é OMITIDO. O downgrade
+    // prematuro para o head da cadeia em toda decisão de emergência foi
+    // removido; a cadeia só é caminhada reativamente, após rejeição/429.
     check(
-      `[${label}] 1.12 wake usa o modelo da cadeia resiliente (google/antigravity-gemini-3.8-flash#low)`,
-      p?.model?.providerID === "google" &&
-        p?.model?.modelID === "antigravity-gemini-3.8-flash" &&
-        p?.model?.variant === "low",
+      `[${label}] 1.12 rung 0 preserva o modelo nativo (sem chave 'model' no payload)`,
+      p !== undefined && !("model" in p),
       JSON.stringify(p?.model),
     );
     const chainHead = formatModelSelector(resolveFallbackChainForAgent(deps.config, LEAD_AGENT)[0]);
