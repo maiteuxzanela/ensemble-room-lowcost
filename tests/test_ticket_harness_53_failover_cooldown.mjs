@@ -509,26 +509,28 @@ for (const [scn, map] of Object.entries(DIST_MAPS)) {
     const diana = cfg.fallbackModelsByAgent?.diana ?? [];
     const hugo = cfg.fallbackModelsByAgent?.hugo ?? [];
     const clara = cfg.fallbackModelsByAgent?.clara ?? [];
-    // Cadeia canônica de Hugo e Clara (LongCat primário, MiniMax 1º fallback,
-    // seguido pela cadeia deepseek/mimo/gemini).
+    // Cadeia canônica de Hugo e Clara (RELEASE-12): cotas free primeiro
+    // (deepseek → mimo), depois a cota Go com deepseek#low ANTES do mimo,
+    // depois minimax e o piso antigravity. Os modelos mortos
+    // (longcat-2.5-preview-free / minimax-m3.1-flash-free) foram expurgados.
     const HUGO_CLARA_CHAIN = [
-      "opencode-go/longcat-2.5-preview-free",
-      "opencode-go/minimax-m3.1-flash-free",
       "opencode/deepseek-v4.1-flash-free",
-      "opencode-go/deepseek-v4.1-flash#low",
       "opencode/mimo-v2.6-flash-free",
+      "opencode-go/deepseek-v4.1-flash#low",
       "opencode-go/mimo-v2.6-flash",
+      "opencode-go/minimax-m3.1-flash",
       "google/antigravity-gemini-3.8-flash#low",
     ];
+    const CANON_PRIMARY = "opencode/deepseek-v4.1-flash-free";
     const DIANA_CHAIN_CANON = [
       "google/antigravity-gemini-4-argon#medium",
       "google/antigravity-gemini-3.8-flash#high",
       "opencode-go/deepseek-v4.1-flash#high",
     ];
     check(
-      "4.1: modelsByAgent.hugo e .clara primam em opencode-go/longcat-2.5-preview-free",
-      cfg.modelsByAgent?.hugo === "opencode-go/longcat-2.5-preview-free"
-        && cfg.modelsByAgent?.clara === "opencode-go/longcat-2.5-preview-free",
+      "4.1: modelsByAgent.hugo e .clara primam em opencode/deepseek-v4.1-flash-free (RELEASE-12)",
+      cfg.modelsByAgent?.hugo === CANON_PRIMARY
+        && cfg.modelsByAgent?.clara === CANON_PRIMARY,
       `hugo=${cfg.modelsByAgent?.hugo} clara=${cfg.modelsByAgent?.clara}`,
     );
     check(
