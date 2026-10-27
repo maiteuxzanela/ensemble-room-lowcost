@@ -1,7 +1,7 @@
 # AGENTS.md — OpenCode Ensemble Hardened (`ensemble-room-lowcost`)
 
 > **Repositório:** `/mnt/94CCB337CCB3130A/ensemble-room-lowcost`
-> **Pacote:** `ensemble-room-lowcost` (sem escopo, como publicado no NPM) v`0.18.2`
+> **Pacote:** `ensemble-room-lowcost` (sem escopo, como publicado no NPM) v`0.18.3`
 > **Base upstream:** `@hueyexe/opencode-ensemble@0.18.0` (derivado, endurecido — MIT)
 > **Runtime entrypoint:** `dist/index.js` (bundle autocontido)
 
@@ -34,7 +34,7 @@ Por isso, este repositório em `/mnt/94CCB337CCB3130A/ensemble-room-lowcost` exi
 
 ## 2. As 5 Blindagens Implementadas (sobre o upstream 0.18.0)
 
-O upstream `@hueyexe/opencode-ensemble@0.18.0` é funcional, mas **não foi projetado para operação de baixo custo de tokens**. As 5 melhorias abaixo foram implementadas em `src/` e homologadas pela **suíte determinística sem mocks** deste repositório — **48 arquivos de teste, milhares de verificações** (`npm test`, runner `tests/run_all.mjs`).
+O upstream `@hueyexe/opencode-ensemble@0.18.0` é funcional, mas **não foi projetado para operação de baixo custo de tokens**. As 5 melhorias abaixo foram implementadas em `src/` e homologadas pela **suíte determinística sem mocks** deste repositório — **60 arquivos de teste, milhares de verificações** (`npm test`, runner `tests/run_all.mjs`).
 
 ### Blindagem 1 — Standby Nativo (`standby: true`, spawn_context, zero tokens no spawn, despertar atômico)
 
@@ -111,8 +111,8 @@ Toda alteração neste repositório segue **obrigatoriamente** o ciclo abaixo, n
 
 3. **Testes determinísticos (sem mocks):**
    ```bash
-   npm run check   # node --check dist/index.js
-   npm test        # node tests/run_all.mjs → 48 suítes, milhares de checks
+   npm run check   # node --check dist/index.js + dist/rpc.js + dist/tui.js
+   npm test        # node tests/run_all.mjs → 60 suítes, milhares de checks
    ```
    Ambos devem sair com exit 0. Nenhum commit é permitido com teste falhando.
 

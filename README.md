@@ -24,12 +24,12 @@ The two structural wins:
 | | |
 |---|---|
 | Package | `ensemble-room-lowcost` |
-| Version | `0.18.2` (upstream base: `@hueyexe/opencode-ensemble@0.18.0`) |
+| Version | `0.18.3` (upstream base: `@hueyexe/opencode-ensemble@0.18.0`) |
 | Runtime entrypoint | `dist/index.js` — self-contained ESM bundle (`exports["."]`, `main`) |
 | Types entrypoint | `src/index.ts` — TypeScript consumers only (`exports["."].types`) |
 | Repository | `github.com/maiteuxzanela/ensemble-room-lowcost` (branch `main`) |
 | License | MIT |
-| Test suite | 48 deterministic suites, zero mocks, offline-capable |
+| Test suite | 60 deterministic suites, zero mocks, offline-capable |
 
 ---
 
@@ -41,7 +41,7 @@ The two structural wins:
 4. [Additional capabilities](#4-additional-capabilities)
 5. [Installation](#5-installation)
 6. [`ensemble.json` configuration reference](#6-ensemblejson-configuration-reference)
-7. [Deterministic tests](#7-deterministic-tests-48-suites-no-mocks)
+7. [Deterministic tests](#7-deterministic-tests-60-suites-no-mocks)
 8. [Troubleshooting](#8-troubleshooting)
 9. [Security](#9-security)
 10. [Provenance and license](#10-provenance-and-license)
@@ -464,20 +464,20 @@ that entry, never at the cost of emptying it).
 
 ---
 
-## 7. Deterministic tests (48 suites, no mocks)
+## 7. Deterministic tests (60 suites, no mocks)
 
 The runner executes the real artifacts — no mocks, no stubs, no fake fixtures.
 
 ```bash
-npm run check      # node --check dist/index.js   → syntax gate
-npm test           # node tests/run_all.mjs       → 48 suites, exit 0 only if all pass
+npm run check      # node --check dist/{index,rpc,tui}.js → syntax gate
+npm test           # node tests/run_all.mjs       → 60 suites, exit 0 only if all pass
 npm run typecheck  # tsc --noEmit
 npm run build      # esbuild → dist/index.js
 ```
 
 Properties of the suite:
 
-- **48 suites** executed in strict sequence (fail-report, no early abort); the consolidated exit code is
+- **60 suites** executed in strict sequence (fail-report, no early abort); the consolidated exit code is
   `0` only when every suite exits `0` and emits no `FAIL` line.
 - **Zero mocks.** The only seam is the **output transport** (`session.create`, `promptAsync`,
   `session.abort`, `showToast`), recorded into an array so assertions prove *what was called*. No
@@ -499,12 +499,20 @@ Representative coverage:
 | Standby lifecycle & hook shielding | 1 | wake exactly once, revert on failure, zero false alarms |
 | Silent lead & board wake | 1 | `delivered` queue, single closure wake, prompt coercion, legacy parity |
 | Model fallback & rate-limit failover | 7 | precedence, per-agent resolution, cooldown, abort + re-prompt, `#default` normalization |
-| Task board, dependencies & intra-card handover | 9 | atomic reassignment, SDET/QA unlocking, cyclic graphs, shutdown |
+| Failover cooldown, refinement & model-bound wakes | 5 | HARNESS-53/57 + RELEASE-10/15: immediate ladder advance, reactive deterministic failover, pre-spawn catalog validation, agent+model bound wake |
+| Task board, dependencies & intra-card handover | 7 | atomic reassignment, SDET/QA unlocking, cyclic graphs, shutdown, universal ledger discovery |
+| Anti-polling & auto-sizing prompts | 2 | HARNESS-54/55: conditional synthetic pulse only with an open board, pedagogical lead sizing, `depends_on` sanitation |
 | Governance roles (SDET / Quality Gate) | 4 | role exclusivity, anti-bypass, review flow |
+| Persona identity & hiring hygiene | 4 | multi-instance personas, identity on the 4 secondary nudges, HARNESS-77 Persona Gap alert, RELEASE-09 sequester fix |
 | Local auto-commit on approval | 3 | git real in sandbox, multi-repo ledger, shell-artifact ledger (before/after snapshot), clean-tree and non-repo cases |
 | Dashboard | 3 | endpoints, renderer, Host/Origin gate, CSRF/cross-origin hardening |
-| Messaging, discovery & lifecycle regressions | 19 | action strictness, schema parity, recovery, pause kill-switch |
-| **Total** | **48** | thousands of assertions, mutation-tested |
+| Messaging, discovery & lifecycle regressions | 14 | action strictness, schema parity, recovery, pause kill-switch, HARNESS-16/17/25/33-38 hardening |
+| Emergency pause & standby pausing | 3 | per-room kill-switch, RELEASE-11/17 abort determinism, loop-breaker and handover pause |
+| Release hardening (ledger partition, shared checkout, exports, CI pins) | 5 | HARNESS-78/82/87/89 + SDET Bloco C: per-card ledger, no per-specialist worktrees, `.ts`-free exported bundles, hardened Node pins, real tarball consumption |
+| **Total** | **60** | thousands of assertions, mutation-tested |
+
+The canonical membership is the `SUITES` array in `tests/run_all.mjs`; the table above is a
+representative grouping of that array.
 
 Runner report shape:
 
@@ -513,7 +521,7 @@ PASS | test_watchdog_heartbeat.mjs        | exit=0 |   … ms | RESULT: 55/55 ch
 PASS | test_standby_lifecycle.mjs         | exit=0 |   … ms | RESULT: 130/130 checks passed
 PASS | test_silent_lead_board_wake.mjs    | exit=0 |   … ms | RESULT: 151/151 checks passed
 …
-SUÍTES: 48/48 passaram
+SUÍTES: 60/60 passaram
 RESULT_ALL: ALL SUITES PASSED
 ```
 

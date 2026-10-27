@@ -1,6 +1,6 @@
 {
   "name": "ensemble-room-lowcost",
-  "version": "0.18.2",
+  "version": "0.18.3",
   "description": "OpenCode Ensemble Hardened - Low-cost multi-agent runtime with native standby, silent lead, and deterministic board wake",
   "types": "./src/index.ts",
   "module": "dist/index.js",

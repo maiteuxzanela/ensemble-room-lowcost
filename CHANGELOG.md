@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.18.3] - 2026-10-27
+
+Runtime hardening batch on top of `0.18.2`: hiring hygiene at spawn time, a partitioned auto-commit
+ledger, published exports that never leak TypeScript, and a CI matrix pinned to Node versions that can
+actually run the deterministic suite. The runtime entrypoints (`dist/index.js`, `dist/rpc.js`,
+`dist/tui.js`) are rebuilt from `src/` and validated against the **60** deterministic suites, zero mocks.
+
+### Added
+
+- **Deterministic Persona Gap hook in `team_spawn`** (TICKET-HARNESS-77). Spawning an agent whose
+  `build` / `plan` / `general` / unknown type does not match an official persona now yields a
+  `[PERSONA GAP ALERT]` banner in the `team_spawn` return demanding an explicit vacancy specification,
+  plus orienting notes in `team_status` and `team_cleanup`. The baseline classification lives in-code
+  (independent of `HOME`), so a missing user config cannot silence the alert.
+- **Per-card auto-commit ledger** (TICKET-HARNESS-82). Migration 21 adds a nullable `task_id` to
+  `team_modified_file`; `recordModifiedFile` / `listModifiedFiles(taskId)` filter strictly by card and
+  the completion hook commits surgically with a lean message (≤100 chars). Legacy v20 databases upgrade
+  in place, and files recorded without a card keep the previous safe fallback.
+- **Regression coverage for the batch**: `tests/test_ticket_harness_77_persona_gap.mjs`,
+  `tests/test_ticket_harness_82_ledger_partition.mjs`,
+  `tests/test_ticket_harness_87_exports.mjs` and `tests/test_ticket_harness_89_node_pins.mjs`,
+  bringing the runner (`tests/run_all.mjs`) to **60 suites**.
+
+### Changed
+
+- **Published `exports` sanitized** (TICKET-HARNESS-87). The root entry resolves to `dist/index.js`
+  through a real `import.meta.resolve` probe, and the `./rpc` / `./tui` subpaths now resolve to
+  `dist/rpc.js` / `dist/tui.js` instead of raw TypeScript. No runtime condition exposes `.ts`/`.tsx`;
+  `node --check` passes for all three bundles and the `files` allowlist ships exactly the compiled
+  runtime targets.
+- **Robust `HOME` fallback** (TICKET-HARNESS-87, `ensemble.ts`). `isUsableHome` now rejects relative and
+  empty candidates — including the literal `"~"` / `"~/sub"` — and accepts absolute paths only, so a
+  subprocess without `HOME`/`USERPROFILE` never resolves data under `./~`.
+- **Node pins hardened in CI** (TICKET-HARNESS-89). `ci.yml` pins the matrix to `22.23.4` and `24.22.1`
+  with `check-latest`, `publish.yml` runs on `22.23.4`, and the composite `setup-bun` action pins
+  `24.22.1` instead of a floating tag. A real `Bun.YAML` verifier plus a mutation proof (floating pin /
+  vulnerable version) guards the contract.
+- **Package version** bumped to `0.18.3`, with `package-lock.json` kept in lockstep at the root and
+  package entries.
+
+### Fixed
+
+- **Hermetic CI runner for the SDET block** (`tests/test_bloco_c_sdet_harness_87_89.mjs`). The suite now
+  degrades gracefully to `SKIP` when the sibling `opencode_repo` checkout or the `bun` binary is absent,
+  instead of failing the whole run for environment reasons; the deterministic checks still execute
+  whenever both are available.
+
 ## [0.18.2] - 2026-10-20
 
 Release-governance patch on top of `0.18.1`: the runtime code is unchanged, but the **published
@@ -191,7 +238,8 @@ sleeps, and the schema survives the upgrade.
 Initial baseline derived from `@hueyexe/opencode-ensemble@0.18.0` (MIT). Provides the multi-agent room,
 the SQLite-backed task board, `team_*` tools, worktree isolation and the base watchdog.
 
-[Unreleased]: https://github.com/maiteuxzanela/ensemble-room-lowcost/compare/v0.18.2...HEAD
+[Unreleased]: https://github.com/maiteuxzanela/ensemble-room-lowcost/compare/v0.18.3...HEAD
+[0.18.3]: https://github.com/maiteuxzanela/ensemble-room-lowcost/compare/v0.18.2...v0.18.3
 [0.18.2]: https://github.com/maiteuxzanela/ensemble-room-lowcost/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/maiteuxzanela/ensemble-room-lowcost/releases/tag/v0.18.1
 [0.18.0]: https://github.com/hueyexe/opencode-ensemble/releases/tag/v0.18.0

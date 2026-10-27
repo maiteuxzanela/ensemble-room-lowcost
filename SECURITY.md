@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| `0.18.2` (current) | Yes — security fixes are released on this line |
-| `0.18.x` | Yes — previous patches remain installable, but fixes land on `0.18.2` |
+| `0.18.3` (current) | Yes — security fixes are released on this line |
+| `0.18.x` | Yes — previous patches remain installable, but fixes land on `0.18.3` |
 | `< 0.18.0` | No |
 
 Only the latest patch of the supported minor line receives security fixes. Upgrading is always the
