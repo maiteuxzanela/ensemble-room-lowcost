@@ -1,4 +1,5 @@
 import { log } from "../log"
+import { knownPersonasFromConfig, personaGapClosingNote } from "../persona-gap"
 import type { ToolDeps } from "../types"
 import { requireTeamMember } from "./shared"
 
@@ -117,6 +118,18 @@ export async function executeTeamStatus(
     const parts = Array.from(byStatus.entries()).map(([s, n]) => `${n} ${s}`)
     lines.push("")
     lines.push(`Tasks: ${tasks.length} total (${parts.join(", ")})`)
+  }
+
+  // TICKET-HARNESS-77 — closing/status surface: whoever reads the room state
+  // is reminded that a generic agent was summoned and the hiring proposal for
+  // the missing persona is still pending. Only fires for generic agents.
+  const personaGapNote = personaGapClosingNote(
+    members.map((m) => ({ name: m.name, agent: m.agent })),
+    { knownPersonas: knownPersonasFromConfig(deps.config) },
+  )
+  if (personaGapNote) {
+    lines.push("")
+    lines.push(personaGapNote)
   }
 
   // Fire a toast so the user (not just the model) sees the status summary

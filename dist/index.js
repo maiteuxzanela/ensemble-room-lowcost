@@ -703,8 +703,8 @@ function getDbPath(env = process.env) {
   const home = env.HOME ?? env.USERPROFILE ?? "~";
   return path.join(home, ".config", "opencode", "ensemble.db");
 }
-function createDb(path8) {
-  const db = openDatabase(path8);
+function createDb(path9) {
+  const db = openDatabase(path9);
   db.exec("PRAGMA journal_mode=WAL");
   db.exec("PRAGMA foreign_keys=ON");
   applyMigrations(db);
@@ -3469,9 +3469,131 @@ async function executeTeamClaim(deps, args, sessionId) {
 
 // src/tools/team-spawn.ts
 init_log();
-import { existsSync, readFileSync as readFileSync2 } from "node:fs";
+
+// src/persona-gap.ts
+import { existsSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path3 from "node:path";
+var GENERIC_AGENT_TYPES = /* @__PURE__ */ new Set([
+  "build",
+  "plan",
+  "general",
+  "explore",
+  "code",
+  "chat"
+]);
+var OFFICIAL_PERSONAS = /* @__PURE__ */ new Set([
+  // Pool Global de Especialistas
+  "cris",
+  "ana",
+  "iara",
+  "lumi",
+  "bia",
+  "tulio",
+  "silas",
+  "kael",
+  "maya",
+  "morgan-sec",
+  "leticia",
+  "clara",
+  "hugo",
+  "otavio",
+  "sam",
+  "daniela",
+  "fernanda",
+  "ellis",
+  "tales",
+  "theo",
+  "davi",
+  // Quality Manager + orquestradores
+  "diana",
+  "sol",
+  "dante",
+  "nora",
+  "zelia",
+  "alex",
+  "cecilia",
+  "selene",
+  "jade",
+  "iris",
+  // Personas arquivadas/absorvidas (não geram lacuna: já foram catalogadas)
+  "juliana",
+  "noa",
+  "ariel",
+  "carla",
+  "rowan",
+  "camila",
+  "beatriz",
+  "isabela",
+  "gabriela",
+  "erica",
+  "valerio"
+]);
+var PERSONA_GAP_MARKER = "[PERSONA GAP ALERT]";
+function normalizePersonaName(value) {
+  return value.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+function resolveKnownPersonas(options = {}) {
+  const known = new Set(OFFICIAL_PERSONAS);
+  for (const candidate of options.knownPersonas ?? []) {
+    if (typeof candidate !== "string") continue;
+    const normalized = normalizePersonaName(candidate);
+    if (normalized) known.add(normalized);
+  }
+  const agentDir = options.agentDir ?? path3.join(os.homedir(), ".config", "opencode", "agent");
+  try {
+    if (existsSync(agentDir)) {
+      for (const entry of readdirSync(agentDir)) {
+        if (!entry.endsWith(".md")) continue;
+        const normalized = normalizePersonaName(entry.slice(0, -3));
+        if (normalized) known.add(normalized);
+      }
+    }
+  } catch {
+  }
+  return known;
+}
+function isPersonaGap(agent, options = {}) {
+  const raw = typeof agent === "string" ? normalizePersonaName(agent) : "";
+  if (!raw) return true;
+  if (GENERIC_AGENT_TYPES.has(raw)) return true;
+  const known = resolveKnownPersonas(options);
+  const candidates = /* @__PURE__ */ new Set([raw]);
+  const underscoreBase = normalizePersonaName(raw.split("_")[0] ?? raw);
+  if (underscoreBase) candidates.add(underscoreBase);
+  const hyphenBase = normalizePersonaName(raw.split("-")[0] ?? raw);
+  if (hyphenBase) candidates.add(hyphenBase);
+  const numericSuffixStripped = normalizePersonaName(raw.replace(/[-_]\d+$/, ""));
+  if (numericSuffixStripped) candidates.add(numericSuffixStripped);
+  for (const candidate of candidates) {
+    if (GENERIC_AGENT_TYPES.has(candidate)) return true;
+    if (known.has(candidate)) return false;
+  }
+  return true;
+}
+function personaGapBannerFor(agent, options = {}) {
+  if (!isPersonaGap(agent, options)) return null;
+  const label = typeof agent === "string" && agent.trim().length > 0 ? agent.trim() : "(unset)";
+  return `${PERSONA_GAP_MARKER} O agente convocado ("${label}") \xE9 gen\xE9rico ou n\xE3o possui persona formalizada no cat\xE1logo. Lembre-se de anexar ao relat\xF3rio executivo para a Fundadora Maiteux Zanela a especifica\xE7\xE3o de contrata\xE7\xE3o da nova persona (fun\xE7\xE3o, stack e proposta de template personas/<nome>.md).`;
+}
+function personaGapClosingNote(members, options = {}) {
+  const gaps = members.filter((member) => isPersonaGap(member.agent, options));
+  if (gaps.length === 0) return null;
+  const listed = gaps.map((member) => `${member.name} (agent: ${member.agent && member.agent.trim().length > 0 ? member.agent : "(unset)"})`).join(", ");
+  return [
+    PERSONA_GAP_MARKER,
+    `A sala possui ${gaps.length} membro(s) convocado(s) com agente gen\xE9rico ou sem persona formalizada no cat\xE1logo: ${listed}.`,
+    "Antes de encerrar, anexe ao relat\xF3rio executivo para a Fundadora Maiteux Zanela a especifica\xE7\xE3o de contrata\xE7\xE3o da nova persona (fun\xE7\xE3o, stack e proposta de template personas/<nome>.md)."
+  ].join("\n");
+}
+function knownPersonasFromConfig(config) {
+  return Object.keys(config?.modelsByAgent ?? {});
+}
+
+// src/tools/team-spawn.ts
+import { existsSync as existsSync2, readFileSync as readFileSync2 } from "node:fs";
+import os2 from "node:os";
+import path4 from "node:path";
 var spawnFailures = /* @__PURE__ */ new Map();
 function resolveBasePersona3(memberName) {
   return (memberName.split(/[-_]/)[0] ?? memberName).toLowerCase();
@@ -3479,8 +3601,8 @@ function resolveBasePersona3(memberName) {
 var MAX_PERSONA_CONTEXT_CHARS = 2400;
 function readBasePersonaFile(basePersonaName) {
   try {
-    const file = path3.join(os.homedir(), ".config", "opencode", "agent", `${basePersonaName}.md`);
-    if (!existsSync(file)) return null;
+    const file = path4.join(os2.homedir(), ".config", "opencode", "agent", `${basePersonaName}.md`);
+    if (!existsSync2(file)) return null;
     const body = readFileSync2(file, "utf-8").trim();
     if (!body) return null;
     return body.length > MAX_PERSONA_CONTEXT_CHARS ? `${body.slice(0, MAX_PERSONA_CONTEXT_CHARS)}
@@ -3957,7 +4079,13 @@ async function executeTeamSpawn(deps, args, sessionId) {
   const claimInfo = claimedTaskContent ? ` (claimed task: ${args.claim_task})` : claimWarning ? ` (could not claim task: ${claimWarning})` : "";
   spawnFailures.delete(teamInfo.teamId);
   log(`spawn:done name=${args.name} sessionId=${childSessionId}`);
-  return `Teammate "${args.name}" spawned (agent: ${agent}, shared-checkout)${standbyInfo}${planInfo}${claimInfo}. They are working on: ${args.prompt.slice(0, 120)}${args.prompt.length > 120 ? "..." : ""}`;
+  const personaGapBanner = personaGapBannerFor(agent, {
+    knownPersonas: knownPersonasFromConfig(deps.config)
+  });
+  const spawnLine = `Teammate "${args.name}" spawned (agent: ${agent}, shared-checkout)${standbyInfo}${planInfo}${claimInfo}. They are working on: ${args.prompt.slice(0, 120)}${args.prompt.length > 120 ? "..." : ""}`;
+  return personaGapBanner ? `${spawnLine}
+
+${personaGapBanner}` : spawnLine;
 }
 
 // src/tools/team-standby.ts
@@ -4392,7 +4520,7 @@ init_process();
 
 // src/modified-files.ts
 init_log();
-import path4 from "node:path";
+import path5 from "node:path";
 import { spawnSync } from "node:child_process";
 import { statSync } from "node:fs";
 var FILE_MUTATING_TOOLS = /* @__PURE__ */ new Set([
@@ -4433,9 +4561,9 @@ function porcelainEntries(root, raw) {
     const isRenameOrCopy = status.startsWith("R") || status.startsWith("C");
     const original = isRenameOrCopy ? tokens[i + 1] : void 0;
     if (isRenameOrCopy) i += 1;
-    if (rel && !isLedgerIgnoredPath(rel)) out.push([path4.resolve(root, rel), status]);
+    if (rel && !isLedgerIgnoredPath(rel)) out.push([path5.resolve(root, rel), status]);
     if (original && original.length > 0 && !isLedgerIgnoredPath(original)) {
-      out.push([path4.resolve(root, original), status]);
+      out.push([path5.resolve(root, original), status]);
     }
   }
   return out;
@@ -4476,12 +4604,12 @@ function resolveShellCwd(db, sessionId, args, workspaceDir) {
     const raw = args;
     for (const key of ["workdir", "cwd"]) {
       const candidate = raw[key];
-      if (typeof candidate === "string" && candidate.length > 0) return path4.resolve(candidate);
+      if (typeof candidate === "string" && candidate.length > 0) return path5.resolve(candidate);
     }
   }
   const row = db.query("SELECT worktree_dir FROM team_member WHERE session_id = ?").get(sessionId);
   if (row?.worktree_dir) return row.worktree_dir;
-  return workspaceDir ? path4.resolve(workspaceDir) : null;
+  return workspaceDir ? path5.resolve(workspaceDir) : null;
 }
 function prunePendingShellBaselines(now) {
   for (const [sessionId, queue] of pendingShellBaselines) {
@@ -4542,7 +4670,7 @@ function recordShellDiff(db, teamId, baseline, current, taskId) {
   return limited;
 }
 function normalizeModifiedPath(filePath) {
-  return path4.resolve(filePath);
+  return path5.resolve(filePath);
 }
 function activeTaskIdForMember(db, teamId, memberName) {
   try {
@@ -4643,8 +4771,8 @@ function modifiedFilesUnderRepo(ledger, repoRoot) {
   for (const file of ledger) {
     const abs = normalizeModifiedPath(file);
     if (seen.has(abs)) continue;
-    const rel = path4.relative(root, abs);
-    if (rel.length > 0 && !rel.startsWith("..") && !path4.isAbsolute(rel)) {
+    const rel = path5.relative(root, abs);
+    if (rel.length > 0 && !rel.startsWith("..") && !path5.isAbsolute(rel)) {
       seen.add(abs);
       out.push(abs);
     }
@@ -4654,8 +4782,8 @@ function modifiedFilesUnderRepo(ledger, repoRoot) {
 
 // src/tools/team-tasks-complete.ts
 init_log();
-import path5 from "node:path";
-import { existsSync as existsSync2, readdirSync, statSync as statSync2 } from "node:fs";
+import path6 from "node:path";
+import { existsSync as existsSync3, readdirSync as readdirSync2, statSync as statSync2 } from "node:fs";
 var TEAM_TASK_ACTIONS = ["complete", "submit_review", "reject", "sdet_pass"];
 function wakeReviewTarget(deps, teamId, taskId, caller, target, notes, kind) {
   if (!target.sessionId) return false;
@@ -4790,7 +4918,7 @@ async function gitToplevel(cwd) {
   return top.length > 0 ? normalizeDir(top) : null;
 }
 function isRepoRoot(dir) {
-  return existsSync2(path5.join(dir, ".git"));
+  return existsSync3(path6.join(dir, ".git"));
 }
 function findNestedRepoRoots(root, maxDepth) {
   const found = [];
@@ -4798,13 +4926,13 @@ function findNestedRepoRoots(root, maxDepth) {
     if (depth > maxDepth) return;
     let entries;
     try {
-      entries = readdirSync(dir).sort();
+      entries = readdirSync2(dir).sort();
     } catch {
       return;
     }
     for (const entry of entries) {
       if (entry.startsWith(".") || entry === "node_modules") continue;
-      const child = path5.join(dir, entry);
+      const child = path6.join(dir, entry);
       let isDir = false;
       try {
         isDir = statSync2(child).isDirectory();
@@ -4824,18 +4952,18 @@ function findNestedRepoRoots(root, maxDepth) {
 }
 function findSiblingRepoRoots(dir) {
   const normalized = normalizeDir(dir);
-  const parent = path5.dirname(normalized);
-  const self = path5.basename(normalized);
+  const parent = path6.dirname(normalized);
+  const self = path6.basename(normalized);
   const found = [];
   let entries;
   try {
-    entries = readdirSync(parent).sort();
+    entries = readdirSync2(parent).sort();
   } catch {
     return found;
   }
   for (const entry of entries) {
     if (entry === self || entry.startsWith(".")) continue;
-    const child = path5.join(parent, entry);
+    const child = path6.join(parent, entry);
     try {
       if (!statSync2(child).isDirectory()) continue;
     } catch {
@@ -4878,7 +5006,7 @@ async function discoverCandidateRepos(dir, ledger = []) {
     const abs = normalizeModifiedPath(rawPath);
     if (abs === "") continue;
     try {
-      const top = await gitToplevel(path5.dirname(abs));
+      const top = await gitToplevel(path6.dirname(abs));
       if (top) add(top);
     } catch {
     }
@@ -4886,7 +5014,7 @@ async function discoverCandidateRepos(dir, ledger = []) {
   return candidates;
 }
 function resolveCommitTargets(candidates, ledger) {
-  const depth = (p) => p.split(path5.sep).filter(Boolean).length;
+  const depth = (p) => p.split(path6.sep).filter(Boolean).length;
   const sorted = [...candidates].sort((a, b) => depth(b) - depth(a));
   const owned = /* @__PURE__ */ new Map();
   const claimed = /* @__PURE__ */ new Set();
@@ -4906,13 +5034,13 @@ function resolveCommitTargets(candidates, ledger) {
   for (const repo of sorted) {
     const files = owned.get(repo);
     if (files && files.length > 0) {
-      targets.push({ path: repo, name: path5.basename(repo), files });
+      targets.push({ path: repo, name: path6.basename(repo), files });
     }
   }
   return targets;
 }
 async function stageableLedgerPaths(repoRoot, relPaths) {
-  const missing = relPaths.filter((rel) => !existsSync2(path5.join(repoRoot, rel)));
+  const missing = relPaths.filter((rel) => !existsSync3(path6.join(repoRoot, rel)));
   if (missing.length === 0) return relPaths;
   const indexed = /* @__PURE__ */ new Set();
   const res = await runCommand(["git", "-C", repoRoot, "ls-files", "-z", "--", ...missing], { cwd: repoRoot });
@@ -4981,12 +5109,12 @@ async function autoCommitApprovedTask(deps, teamId, taskContent, taskId) {
       try {
         const addSet = /* @__PURE__ */ new Set();
         for (const f of target.files) {
-          const rel = path5.relative(target.path, f);
-          if (rel.length > 0 && !rel.startsWith("..") && !path5.isAbsolute(rel)) addSet.add(rel);
+          const rel = path6.relative(target.path, f);
+          if (rel.length > 0 && !rel.startsWith("..") && !path6.isAbsolute(rel)) addSet.add(rel);
         }
         for (const nested of committedPaths) {
-          const rel = path5.relative(target.path, nested);
-          if (rel.length > 0 && !rel.startsWith("..") && !path5.isAbsolute(rel) && !rel.includes(path5.sep)) {
+          const rel = path6.relative(target.path, nested);
+          if (rel.length > 0 && !rel.startsWith("..") && !path6.isAbsolute(rel) && !rel.includes(path6.sep)) {
             addSet.add(rel);
           }
         }
@@ -5027,7 +5155,7 @@ async function autoCommitApprovedTask(deps, teamId, taskContent, taskId) {
     }
     for (const repo of candidates) {
       if (committedPaths.includes(normalizeDir(repo))) continue;
-      const gitlinks = committedPaths.filter((c) => normalizeDir(c) !== normalizeDir(repo)).map((c) => path5.relative(repo, c)).filter((rel) => rel.length > 0 && !rel.startsWith("..") && !path5.isAbsolute(rel) && !rel.includes(path5.sep));
+      const gitlinks = committedPaths.filter((c) => normalizeDir(c) !== normalizeDir(repo)).map((c) => path6.relative(repo, c)).filter((rel) => rel.length > 0 && !rel.startsWith("..") && !path6.isAbsolute(rel) && !rel.includes(path6.sep));
       if (gitlinks.length === 0) continue;
       try {
         const status = await runCommand(["git", "status", "--porcelain"], { cwd: repo });
@@ -5045,8 +5173,8 @@ async function autoCommitApprovedTask(deps, teamId, taskContent, taskId) {
         }
         const rev = await runCommand(["git", "rev-parse", "--short", "HEAD"], { cwd: repo });
         const hash = rev.exitCode === 0 ? rev.stdout.trim() : "";
-        committed.push({ name: path5.basename(repo), hash, path: normalizeDir(repo) });
-        log(`tasks-complete:autocommit:committed dir=${repo} repo=${path5.basename(repo)} hash=${hash || "?"} files=${addList.length} (gitlink) task="${title}"`);
+        committed.push({ name: path6.basename(repo), hash, path: normalizeDir(repo) });
+        log(`tasks-complete:autocommit:committed dir=${repo} repo=${path6.basename(repo)} hash=${hash || "?"} files=${addList.length} (gitlink) task="${title}"`);
       } catch (err) {
         log(`tasks-complete:autocommit:error dir=${repo} err=${err instanceof Error ? err.message : String(err)}`);
       }
@@ -5715,7 +5843,7 @@ async function executeTeamCleanup(deps, args, sessionId, isDirty = checkWorktree
     return `Permanently deleted ${targets.length} ${noun}: ${targets.map((target) => target.name).join(", ")}.`;
   }
   const teamInfo = requireLead(deps, sessionId);
-  const members = deps.db.query("SELECT name, session_id, status, worktree_dir, worktree_branch, workspace_id FROM team_member WHERE team_id = ?").all(teamInfo.teamId);
+  const members = deps.db.query("SELECT name, session_id, agent, status, worktree_dir, worktree_branch, workspace_id FROM team_member WHERE team_id = ?").all(teamInfo.teamId);
   const active = members.filter((m) => m.status !== "shutdown" && m.status !== "shutdown_requested" && m.status !== "error");
   if (active.length > 0 && !args.force) {
     const names = active.map((m) => m.name).join(", ");
@@ -5819,6 +5947,11 @@ Commit or merge their work first, then call team_cleanup with acknowledge_uncomm
 ${overlapWarnings.map((w) => `  - ${w}`).join("\n")}
 Review with: git diff`);
   }
+  const personaGapNote = personaGapClosingNote(
+    members.map((member) => ({ name: member.name, agent: member.agent })),
+    { knownPersonas: knownPersonasFromConfig(deps.config) }
+  );
+  if (personaGapNote) parts.push(personaGapNote);
   return parts.join("\n");
 }
 
@@ -6128,6 +6261,14 @@ async function executeTeamStatus(deps, sessionId) {
     const parts = Array.from(byStatus.entries()).map(([s, n]) => `${n} ${s}`);
     lines.push("");
     lines.push(`Tasks: ${tasks.length} total (${parts.join(", ")})`);
+  }
+  const personaGapNote = personaGapClosingNote(
+    members.map((m) => ({ name: m.name, agent: m.agent })),
+    { knownPersonas: knownPersonasFromConfig(deps.config) }
+  );
+  if (personaGapNote) {
+    lines.push("");
+    lines.push(personaGapNote);
   }
   if (members.length > 0) {
     const memberParts = members.map((m) => {
@@ -8532,12 +8673,12 @@ async function emitNoticeEvent(registration, data) {
 
 // src/watchdog.ts
 import { createRequire as createRequire2 } from "node:module";
-import path6 from "node:path";
+import path7 from "node:path";
 init_log();
 var requireSessionModule = createRequire2(import.meta.url);
 function sessionStorePath(env = process.env) {
   const home = env.HOME ?? env.USERPROFILE ?? "~";
-  return path6.join(home, ".local", "share", "opencode", "opencode.db");
+  return path7.join(home, ".local", "share", "opencode", "opencode.db");
 }
 function openSessionStore(dbPath) {
   if (typeof process.versions.bun === "string") {
@@ -9077,7 +9218,7 @@ async function setupEnsemble(ctx, options = {}) {
 // src/index.ts
 import { tool } from "@opencode-ai/plugin";
 import { OpencodeClient } from "@opencode-ai/sdk/v2";
-import path7 from "node:path";
+import path8 from "node:path";
 import { mkdirSync } from "node:fs";
 
 // src/client.ts
@@ -9243,7 +9384,7 @@ var DEFAULT_RATE_LIMIT_INTERVAL_MS = 1e3;
 var DEFAULT_WATCHDOG_CHECK_MS = 60 * 1e3;
 var plugin = async (input) => {
   const dbPath = getDbPath();
-  mkdirSync(path7.dirname(dbPath), { recursive: true });
+  mkdirSync(path8.dirname(dbPath), { recursive: true });
   const db = createDb(dbPath);
   const config = loadConfig(input.directory);
   const registry = new MemberRegistry();

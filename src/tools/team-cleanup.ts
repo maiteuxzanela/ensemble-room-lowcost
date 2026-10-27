@@ -5,6 +5,7 @@ import { spawnFailures } from "./team-spawn"
 import { getTeamResourceParts, mergeBranch, deleteBranch, preserveBranch, preservedBranchName, getOverlappingFiles, teamResourceSegment } from "./merge-helper"
 import type { MergeBranchFn, DeleteBranchFn, PreserveBranchFn, OverlapCheckFn } from "./merge-helper"
 import { log } from "../log"
+import { knownPersonasFromConfig, personaGapClosingNote } from "../persona-gap"
 import { runCommand } from "../process"
 
 type PurgeApprovalFn = (preview: string) => Promise<void>
@@ -459,8 +460,8 @@ export async function executeTeamCleanup(
 
   const teamInfo = requireLead(deps, sessionId)
 
-  const members = deps.db.query("SELECT name, session_id, status, worktree_dir, worktree_branch, workspace_id FROM team_member WHERE team_id = ?")
-    .all(teamInfo.teamId) as Array<{ name: string; session_id: string; status: string; worktree_dir: string | null; worktree_branch: string | null; workspace_id: string | null }>
+  const members = deps.db.query("SELECT name, session_id, agent, status, worktree_dir, worktree_branch, workspace_id FROM team_member WHERE team_id = ?")
+    .all(teamInfo.teamId) as Array<{ name: string; session_id: string; agent: string; status: string; worktree_dir: string | null; worktree_branch: string | null; workspace_id: string | null }>
 
   const active = members.filter(m => m.status !== "shutdown" && m.status !== "shutdown_requested" && m.status !== "error")
 
@@ -574,5 +575,13 @@ export async function executeTeamCleanup(
   if (overlapWarnings.length > 0) {
     parts.push(`Warning: safety-net merge overwrote local changes to overlapping files:\n${overlapWarnings.map(w => `  - ${w}`).join("\n")}\nReview with: git diff`)
   }
+  // TICKET-HARNESS-77 — room-closing surface: if any member was summoned with a
+  // generic agent, the hiring/role-spec proposal for the missing persona is
+  // still owed to the founder. Deterministic reminder, never a blocker.
+  const personaGapNote = personaGapClosingNote(
+    members.map(member => ({ name: member.name, agent: member.agent })),
+    { knownPersonas: knownPersonasFromConfig(deps.config) },
+  )
+  if (personaGapNote) parts.push(personaGapNote)
   return parts.join("\n")
 }

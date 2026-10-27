@@ -2,10 +2,10 @@
 /**
  * Runner determinístico das suítes do ensemble-room-lowcost.
  *
- * Executa as 59 suítes determinísticas do repositório em sequência estrita
+ * Executa as 60 suítes determinísticas do repositório em sequência estrita
  * (fail-report, sem aborte antecipado): cada arquivo listado em SUITES roda
  * até o fim mesmo que um anterior falhe, e o relatório consolidado final
- * agrega PASS/FAIL de todas elas. Total atual: 59 arquivos de teste
+ * agrega PASS/FAIL de todas elas. Total atual: 60 arquivos de teste
  * (milhares de verificações, zero mocks).
  *
  * As 3 suítes históricas seguem sendo o núcleo das 5 blindagens e re-executam
@@ -17,7 +17,7 @@
  *   3. test_silent_lead_board_wake.mjs — Silent lead + despertar sistemático por board (151 checks,
  *                                        re-executa as suítes 1 e 2 como regressão)
  *
- * As demais 56 suítes cobrem standby/auto-wake, failover model-aware e cooldown,
+ * As demais 57 suítes cobrem standby/auto-wake, failover model-aware e cooldown,
  * Quality Gate/SDET/handover, dashboard HTTP, auto-commit multi-repo, pausa de
  * emergência e saneamento de schema e de exports publicados (HARNESS-16 … HARNESS-87, RELEASE-03 … RELEASE-17). A lista canônica
  * é o array SUITES abaixo — ele é a fonte da verdade da cobertura.
@@ -98,6 +98,7 @@ const SUITES = [
   { file: "test_ticket_harness_78_shared_checkout.mjs", label: "HARNESS-78 (Expurgar worktrees individuais: spawn NUNCA chama worktree.create/workspace.create mesmo com worktree:true explícito ou omitido, colunas worktree_dir/branch/workspace_id NULL no SQLite, prompt declara checkout compartilhado + handover, schema V1/V2 mantém worktree deprecado [DEPRECATED - IGNORED], helper isWorktreeDirectory removido, read-only sem worktree, paridade src↔dist e 4 mutantes)" },
   { file: "test_ticket_harness_87_exports.mjs", label: "HARNESS-87/Item 2 (exports publicados) resolvedor REAL do Node (import.meta.resolve) entrega dist/index.js para a entry raiz e dist/rpc.js + dist/tui.js para os subpaths, nenhuma condição de runtime expõe .ts/.tsx, node --check dos 3 bundles, layout de node_modules com os arquivos de `files` e prova de mutação com o package.json pré-fix (pin 486d2fc) reprovando EX2/EX3)" },
   { file: "test_ticket_harness_89_node_pins.mjs", label: "HARNESS-89 (Pins de Node endurecidos: CI matrix [22.23.4, 24.22.1] + check-latest, publish node-version 22.23.4, composite setup-bun 24.22.1 sem flutuante; verificador real Bun.YAML verde + prova de mutação que reprova pin flutuante e versão vulnerável)" },
+  { file: "test_ticket_harness_77_persona_gap.mjs", label: "HARNESS-77 (Hook determinístico de Persona Gap: classificador build/plan/general/desconhecido vs personas oficiais, banner [PERSONA GAP ALERT] com cobrança de especificação de vaga no retorno do team_spawn, nota orientadora em team_status e team_cleanup, baseline in-code independente do HOME, paridade src↔dist + V1/V2 e prova de mutação MUT1/MUT2)" },
   { file: "test_bloco_c_sdet_harness_87_89.mjs", label: "SDET Bloco C (independente): HARNESS-87/Item1 fallback de HOME em subprocesso real com HOME/USERPROFILE ausentes, vazio e literal \"~\"/\"~/sub\" (nunca ./~), HOME ausente de verdade e prova de mutação do predicado isUsableHome; HARNESS-87/Item2 tarball REAL do npm extraído em node_modules de consumidor (import.meta.resolve → dist/index.js, /rpc → dist/rpc.js, /tui → dist/tui.js), node --check, mutação .ts e build byte-idêntico; HARNESS-89 Bun.YAML.parse real dos 3 arquivos + verificador real (allowlist/X.Y.Z/vulnerável) com 5 mutações; anti-mock estático" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;

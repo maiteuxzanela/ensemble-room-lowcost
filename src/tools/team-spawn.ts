@@ -19,6 +19,7 @@ import {
 } from "../model-catalog"
 import { getTeamQAMember, getTeamSDETMember } from "../qa-role"
 import { ensureTeamLeadAgent } from "../lead-agent"
+import { knownPersonasFromConfig, personaGapBannerFor } from "../persona-gap"
 import type { EnsembleConfig } from "../config"
 import { trackPrompt, endTracked } from "../v2-session"
 import { existsSync, readFileSync } from "node:fs"
@@ -840,5 +841,15 @@ export async function executeTeamSpawn(
   // Reset circuit breaker on success
   spawnFailures.delete(teamInfo.teamId)
   log(`spawn:done name=${args.name} sessionId=${childSessionId}`)
-  return `Teammate "${args.name}" spawned (agent: ${agent}, shared-checkout)${standbyInfo}${planInfo}${claimInfo}. They are working on: ${args.prompt.slice(0, 120)}${args.prompt.length > 120 ? "..." : ""}`
+
+  // TICKET-HARNESS-77 — deterministic Persona Gap alert. Leading the demand
+  // never stalls, but summoning a generic agent (`build`, `plan`, `general`…)
+  // or any agent absent from the official catalog OBLIGES the Lead to attach a
+  // hiring/role-spec proposal to the executive report. The rule is surfaced in
+  // the tool result itself (behavioural prompt text alone was being forgotten).
+  const personaGapBanner = personaGapBannerFor(agent, {
+    knownPersonas: knownPersonasFromConfig(deps.config),
+  })
+  const spawnLine = `Teammate "${args.name}" spawned (agent: ${agent}, shared-checkout)${standbyInfo}${planInfo}${claimInfo}. They are working on: ${args.prompt.slice(0, 120)}${args.prompt.length > 120 ? "..." : ""}`
+  return personaGapBanner ? `${spawnLine}\n\n${personaGapBanner}` : spawnLine
 }
