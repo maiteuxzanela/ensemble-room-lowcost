@@ -28,6 +28,10 @@
  *      B6 MUTAÇÃO: exports apontando para ./src/*.ts faz o resolvedor real
  *         entregar TypeScript cru (prova de sensibilidade)
  *      B7 build determinístico: `npm run build` não altera nenhum bundle
+ *      B8 os 3 bundles estão RASTREADOS (git ls-files --error-unmatch) e
+ *         dist/ não tem untracked nem drift — regressão do Portão 2 em que
+ *         dist/rpc.js e dist/tui.js ficaram fora do commit (o
+ *         `git diff --exit-code dist/` do CI é cego para untracked)
  *
  *   C. HARNESS-89 — pins de Node
  *      C1..C4 Bun.YAML.parse REAL dos 3 arquivos (matrix, check-latest,
@@ -153,7 +157,8 @@ const cwdB = path.join(TMP, "cwd-b");
 const cwdC = path.join(TMP, "cwd-c");
 const cwdD = path.join(TMP, "cwd-d");
 const cwdMut = path.join(TMP, "cwd-mut");
-for (const d of [cwdA, cwdB, cwdC, cwdD, cwdMut]) mkdirSync(d, { recursive: true });
+const cwdRel = path.join(TMP, "cwd-rel");
+for (const d of [cwdA, cwdB, cwdC, cwdD, cwdMut, cwdRel]) mkdirSync(d, { recursive: true });
 
 // A1 — HOME e USERPROFILE ausentes
 const a1 = runHomeProbe({ scenario: "resolve", cwd: cwdA });
@@ -193,6 +198,26 @@ check(
   "A2b HOME='~/sub' não vira caminho relativo literal",
   a2b.status === 0 && a2b.parsed && !a2b.parsed.home.startsWith("~"),
   JSON.stringify(a2b.parsed ?? a2b.stderr),
+);
+
+// A2c — HOME relativo SEM tilde (ex.: "relative/home"): com path.isAbsolute no
+// predicado, nem o tilde nem qualquer relativo pode virar dir no cwd.
+const a2c = runHomeProbe({ scenario: "ensure", home: "relative/home", cwd: cwdRel });
+check(
+  "A2c HOME relativo 'relative/home' rejeitado (isAbsolute) → home real, nada no cwd",
+  a2c.status === 0 &&
+    a2c.parsed &&
+    a2c.parsed.home === a2c.parsed.realHome &&
+    a2c.parsed.dir === path.join(a2c.parsed.realHome, ".config", "opencode") &&
+    // Atribuição: `relative` no cwd é $HOME/.bun/install/cache do Bun no import.
+    // O que seria do PRODUTO ao aceitar o relativo é relative/home/.config/opencode.
+    !existsSync(path.join(cwdRel, "relative", "home", ".config", "opencode")),
+  JSON.stringify({
+    home: a2c.parsed?.home,
+    dir: a2c.parsed?.dir,
+    bunCache: existsSync(path.join(cwdRel, "relative", "home", ".bun")),
+    productDir: existsSync(path.join(cwdRel, "relative", "home", ".config", "opencode")),
+  }),
 );
 
 // A3 — HOME vazio é ignorado (||, não ??)
@@ -253,7 +278,7 @@ check(
 const ENSEMBLE_ORIGINAL = readFileSync(ENSEMBLE_TS);
 const ensembleHash = sha256(ENSEMBLE_ORIGINAL);
 const originalText = ENSEMBLE_ORIGINAL.toString("utf8");
-const PREDICATE = 'return Boolean(candidate) && candidate !== "~" && !candidate.startsWith("~/")';
+const PREDICATE = 'return Boolean(candidate) && path.isAbsolute(candidate)';
 const iPred = originalText.indexOf(PREDICATE);
 const predOccurrences = iPred < 0 ? 0 : originalText.split(PREDICATE).length - 1;
 let mutationApplied = false;
@@ -403,6 +428,33 @@ check(
   "B7 `npm run build` reproduz os bundles byte-a-byte (gate de drift do CI)",
   build.status === 0 && before.every((h, i) => h && h === after[i]),
   `exit=${build.status} ${distFiles.map((f, i) => `${path.basename(f)}=${before[i] === after[i] ? "stable" : "DRIFT"}`).join(",")}`,
+);
+
+// B8 — os bundles estão RASTREADOS no Git (regressão do Portão 2: dist/rpc.js e
+// dist/tui.js ficaram untracked fora do commit e `git diff --exit-code dist/` é
+// CEGO para untracked). Em checkout limpo de CI o porcelain é vazio; antes do
+// commit do Portão 1 admite-se apenas a ADIÇÃO STAGED dos bundles novos.
+const gitCmd = (args) => run("git", args, { cwd: ENSEMBLE });
+const bundlesRel = ["dist/index.js", "dist/rpc.js", "dist/tui.js"];
+const trackedRes = gitCmd(["ls-files", "--error-unmatch", ...bundlesRel]);
+check(
+  "B8 dist/index.js, dist/rpc.js e dist/tui.js RASTREADOS (git ls-files --error-unmatch, exit 0)",
+  trackedRes.status === 0,
+  (trackedRes.stderr ?? "").trim() || (trackedRes.stdout ?? "").trim(),
+);
+const porcelainRes = gitCmd(["status", "--porcelain", "dist/"]);
+const porcelainLines = (porcelainRes.stdout ?? "").split("\n").filter(Boolean);
+const untrackedDist = porcelainLines.filter((l) => l.startsWith("??"));
+check(
+  "B8 dist/ sem arquivos UNTRACKED (o buraco que `git diff --exit-code` não vê)",
+  porcelainRes.status === 0 && untrackedDist.length === 0,
+  JSON.stringify({ porcelain: porcelainLines, untracked: untrackedDist }),
+);
+const unexpectedDist = porcelainLines.filter((l) => !/^A\s/.test(l));
+check(
+  "B8 dist/ sem drift de worktree (pós-commit vazio; pré-commit só adições staged)",
+  porcelainRes.status === 0 && unexpectedDist.length === 0,
+  JSON.stringify(porcelainLines),
 );
 
 /* ===================================================================== *

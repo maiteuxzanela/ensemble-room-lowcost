@@ -52,12 +52,20 @@ jobs:
       - name: Build bundle (dist/index.js)
         run: npm run build
 
-      # Deterministic bundle-drift gate: the committed dist/index.js must be
+      # Deterministic bundle-drift gate: every committed dist bundle must be
       # byte-identical to a fresh build from src/. Any drift (src changed
       # without rebuilding, or a hand-edited bundle) fails the job here, before
       # the test suite can mask it.
+      #
+      # `git diff --exit-code dist/` alone is BLIND to untracked files, so a
+      # brand-new bundle (dist/rpc.js, dist/tui.js) could be built, never
+      # committed, and the gate would still go green while `main` shipped
+      # without it. The second command closes that hole: any untracked or
+      # staged-but-uncommitted path under dist/ fails the job.
       - name: Verify bundle is in sync with src (dist drift)
-        run: git diff --exit-code dist/
+        run: |
+          git diff --exit-code dist/
+          test -z "$(git status --porcelain dist/)"
 
       - name: Syntax check bundle
         run: npm run check

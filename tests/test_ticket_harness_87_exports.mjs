@@ -29,6 +29,10 @@
  *        PRÉ-FIX (`".": "./src/index.ts"`, subpaths em `.ts`), o mesmo
  *        resolvedor real entrega um arquivo `.ts` — ou seja, EX2/EX3
  *        reprovariam a versão pinada que a Diana apontou.
+ *   EX7  Os 3 bundles estão RASTREADOS (`git ls-files --error-unmatch`) e
+ *        `dist/` não tem untracked nem drift de worktree — fecha a regressão
+ *        do Portão 2 em que `dist/rpc.js` e `dist/tui.js` ficaram fora do
+ *        commit porque `git diff --exit-code dist/` é cego para untracked.
  *
  * SEM MOCKS: `package.json` REAL do repositório, arquivos REALMENTE
  * publicados (mesma lista de `files`), resolvedor REAL do Node
@@ -244,6 +248,37 @@ check(
 );
 
 rmSync(SCRATCH, { recursive: true, force: true });
+
+/* ------------------------------------------------------------------ *
+ * EX7. Os bundles estão RASTREADOS no Git e dist/ não tem untracked
+ *      (regressão do Portão 2: dist/rpc.js e dist/tui.js ficaram
+ *      untracked fora do commit e `git diff --exit-code dist/` é CEGO
+ *      para untracked). Em checkout limpo de CI o porcelain é vazio;
+ *      antes do commit do Portão 1 admite-se apenas a ADIÇÃO STAGED.
+ * ------------------------------------------------------------------ */
+const git = (args) => spawnSync("git", args, { cwd: PKG, encoding: "utf8" });
+const BUNDLES = ["dist/index.js", "dist/rpc.js", "dist/tui.js"];
+
+const tracked = git(["ls-files", "--error-unmatch", ...BUNDLES]);
+check(
+  "EX7 git ls-files --error-unmatch dist/index.js dist/rpc.js dist/tui.js (os 3 rastreados)",
+  tracked.status === 0,
+  ((tracked.stderr ?? "").trim() || (tracked.stdout ?? "").trim()) || "",
+);
+
+const porcelainRun = git(["status", "--porcelain", "dist/"]);
+const porcelain = (porcelainRun.stdout ?? "").split("\n").filter(Boolean);
+const untrackedBundles = porcelain.filter((line) => line.startsWith("??"));
+check(
+  "EX7 dist/ sem UNTRACKED (o buraco que `git diff --exit-code` não vê)",
+  porcelainRun.status === 0 && untrackedBundles.length === 0,
+  JSON.stringify({ porcelain, untracked: untrackedBundles }),
+);
+check(
+  "EX7 dist/ sem drift de worktree (pós-commit vazio; pré-commit só adições staged)",
+  porcelainRun.status === 0 && porcelain.filter((line) => !/^A\s/.test(line)).length === 0,
+  JSON.stringify(porcelain),
+);
 
 /* ------------------------------------------------------------------ *
  * Resultado
