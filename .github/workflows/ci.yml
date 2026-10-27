@@ -23,9 +23,10 @@ jobs:
       matrix:
         # node:sqlite ships unflagged from 22.13; package.json "engines"
         # declares >=22.23.4 (hard floor: the nested dependency ini@7 requires
-        # ^22.22.2 || ^24.15.0). setup-node resolves the current 22.x/24.x
-        # release, always above both floors, so both matrix legs are valid.
-        node: [22, 24]
+        # ^22.22.2 || ^24.15.0). TICKET-HARNESS-89: pins EXATOS por patch —
+        # `check-latest: true` resolve o release mais recente QUE SATISFAZ o pin,
+        # nunca um major flutuante. Floors: 22.23.4 e 24.22.1.
+        node: ["22.23.4", "24.22.1"]
 
     steps:
       - name: Checkout repository
@@ -35,6 +36,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+          check-latest: true
           cache: npm
 
       - name: Install dependencies (clean, lockfile-exact)

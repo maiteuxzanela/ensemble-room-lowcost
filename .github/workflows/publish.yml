@@ -18,10 +18,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          # node:sqlite é nativo sem flag a partir de 22.13; o piso declarado
-          # em package.json "engines" é "node": ">=22.23.4" (alinhado à
-          # dependência aninhada ini@7, que exige ^22.22.2 || ^24.15.0).
-          node-version: 22
+          # TICKET-HARNESS-89: pin EXATO no piso do "engines" (>=22.23.4) com
+          # check-latest: true — pega o patch mais recente da linha 22.x sem
+          # nunca cair em major flutuante nem abaixo do piso exato.
+          node-version: "22.23.4"
+          check-latest: true
           registry-url: 'https://registry.npmjs.org'
           cache: npm
 

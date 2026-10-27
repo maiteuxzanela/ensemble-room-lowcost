@@ -8,10 +8,19 @@
   "exports": {
     ".": {
       "types": "./src/index.ts",
+      "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
-    "./rpc": "./src/rpc.ts",
-    "./tui": "./src/tui.tsx",
+    "./rpc": {
+      "types": "./src/rpc.ts",
+      "import": "./dist/rpc.js",
+      "default": "./dist/rpc.js"
+    },
+    "./tui": {
+      "types": "./src/tui.tsx",
+      "import": "./dist/tui.js",
+      "default": "./dist/tui.js"
+    },
     "./package.json": "./package.json"
   },
   "type": "module",
@@ -50,9 +59,9 @@
   ],
   "scripts": {
     "test": "node tests/run_all.mjs",
-    "check": "node --check dist/index.js",
+    "check": "node --check dist/index.js && node --check dist/rpc.js && node --check dist/tui.js",
     "typecheck": "tsc --noEmit",
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/index.js"
+    "build": "esbuild src/index.ts src/rpc.ts src/tui.tsx --bundle --platform=node --format=esm --packages=external --outdir=dist"
   },
   "engines": {
     "node": ">=22.23.4",
