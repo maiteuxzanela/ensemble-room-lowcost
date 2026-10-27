@@ -707,7 +707,7 @@ const plugin: Plugin = async (input) => {
 
       team_spawn: tool({
         description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). " +
-          "Each teammate gets their own git worktree for file isolation. " +
+          "TICKET-HARNESS-78: every teammate operates in the shared checkout directory (shared working tree, no per-specialist git worktree) - the `worktree` flag is deprecated and ignored. " +
           "Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. " +
           "Dispatch the SDET for deterministic tests (born in standby by default) and the Quality Gate reviewer for the final audit.",
         args: {
@@ -716,7 +716,7 @@ const plugin: Plugin = async (input) => {
           prompt: tool.schema.string().describe("Task instructions for the teammate"),
           model: tool.schema.string().optional().describe("Model in provider/model format (optional, uses default)"),
           claim_task: tool.schema.string().optional().describe("Task ID to auto-claim for this teammate (optional)"),
-          worktree: tool.schema.boolean().default(true).describe("Create a git worktree for file isolation (default: true, set false for read-only agents)"),
+          worktree: tool.schema.boolean().default(true).describe("[DEPRECATED - IGNORED] Individual git worktrees per specialist are discontinued (TICKET-HARNESS-78). Every teammate operates in the shared checkout directory. Kept for backward compatibility only."),
           plan_approval: tool.schema.boolean().default(false).describe("Require teammate to send a plan for approval before writing files (default: false)"),
           standby: tool.schema.boolean().default(false).describe("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)"),
           role: tool.schema.enum(["sdet", "qa", "member"]).optional().describe("Teammate role: 'sdet' marks the deterministic-test engineer (exclusive per room, persists role='sdet'; also auto-detected for agent 'hugo'), 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)"),

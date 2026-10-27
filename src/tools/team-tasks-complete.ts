@@ -552,19 +552,110 @@ async function stageableLedgerPaths(repoRoot: string, relPaths: string[]): Promi
   return relPaths.filter((rel) => !dropped.includes(rel))
 }
 
-async function autoCommitApprovedTask(deps: ToolDeps, teamId: string, taskContent: string): Promise<string> {
+/**
+ * TICKET-HARNESS-82 / TICKET-HARNESS-87 (Item 3) — commit message contract.
+ *
+ * The Portão 2 ressalva: the auto-commit used to dump the ENTIRE card content
+ * (a ~695-char orchestrator prompt) into `git log`. The subject is now a
+ * collapsed, word-boundary-truncated summary capped at 100 characters TOTAL
+ * (prefix included), followed by an OPTIONAL structured body. The raw card
+ * prompt never reaches git anymore.
+ *
+ * `COMMIT_PREFIX` is 15 chars ("feat(runtime): "), so the title budget is 85.
+ */
+const COMMIT_PREFIX = "feat(runtime): "
+const COMMIT_FIRST_LINE_MAX = 100
+const COMMIT_TITLE_MAX = COMMIT_FIRST_LINE_MAX - COMMIT_PREFIX.length
+
+/** Collapse all whitespace so a multi-line prompt can never leak into a subject. */
+function collapseCommitText(text: string): string {
+  return text.replace(/\s+/g, " ").trim()
+}
+
+/**
+ * Build the concise card title: the first non-empty line of the card content,
+ * stripped of markdown noise (heading marks, bullets, code fences) and
+ * hard-capped at `maxLen` UTF-16 units at a word boundary, with an ellipsis
+ * when truncated. Deterministic and idempotent.
+ */
+export function summarizeCommitTitle(content: string, maxLen: number = COMMIT_TITLE_MAX): string {
+  const budget = Math.max(1, Math.floor(maxLen))
+  const firstLine =
+    content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0) ?? ""
+  let title = collapseCommitText(
+    firstLine
+      .replace(/^#{1,6}\s*/, "")
+      .replace(/^[-*+]\s+/, ""),
+  )
+  if (title.length === 0) title = "task completed"
+  if (title.length <= budget) return title
+  const cut = title.slice(0, budget - 1)
+  const lastSpace = cut.lastIndexOf(" ")
+  // Only honour the word boundary when it does not gut the title.
+  const floor = Math.max(20, Math.floor(budget * 0.4))
+  const base = lastSpace > floor ? cut.slice(0, lastSpace) : cut
+  return `${base.trimEnd()}…`
+}
+
+/**
+ * Format the full commit message for an approved card:
+ *
+ *   feat(runtime): <concise title, first line ≤ 100 chars>
+ *
+ *   Card: <task id>
+ *   Files: <n>
+ *
+ * The body is structured and optional (omitted when neither value is known).
+ * It carries only metadata — never the raw card prompt.
+ */
+export function formatCardCommitMessage(
+  taskContent: string,
+  taskId?: string | null,
+  fileCount?: number,
+): string {
+  const title = summarizeCommitTitle(taskContent)
+  const subject = `${COMMIT_PREFIX}${title}`.slice(0, COMMIT_FIRST_LINE_MAX)
+  const body: string[] = []
+  if (taskId) body.push(`Card: ${taskId}`)
+  if (typeof fileCount === "number" && fileCount > 0) body.push(`Files: ${fileCount}`)
+  return body.length > 0 ? `${subject}\n\n${body.join("\n")}` : subject
+}
+
+async function autoCommitApprovedTask(
+  deps: ToolDeps,
+  teamId: string,
+  taskContent: string,
+  taskId?: string | null,
+): Promise<string> {
   const dir = deps.directory
   try {
+    // TICKET-HARNESS-82 — PER-CARD partition. When the completed card is known,
+    // only the files bound to it are eligible for the commit: approving card A
+    // never sweeps card B's still-in-progress edits.
+    //
     // TICKET-32A — ledger gate. No room-touched file → no commit anywhere
     // (fail-closed; never sweeps an unrelated tree, never false-success).
-    const ledger = listModifiedFiles(deps.db, teamId)
+    //
+    // SAFE FALLBACK: a card with NO file of its own (legacy rows written before
+    // Migration 21, or work done outside a task context) falls back to the whole
+    // room ledger so a legitimate edit is never orphaned.
+    let ledger = taskId ? listModifiedFiles(deps.db, teamId, taskId) : listModifiedFiles(deps.db, teamId)
+    if (taskId && ledger.length === 0) {
+      ledger = listModifiedFiles(deps.db, teamId)
+      log(`tasks-complete:autocommit:ledger-fallback team=${teamId} task=${taskId} roomFiles=${ledger.length}`)
+    }
     if (ledger.length === 0) return ""
 
     const candidates = await discoverCandidateRepos(dir, ledger)
     const targets = resolveCommitTargets(candidates, ledger)
     if (targets.length === 0) return ""
 
-    const message = `feat(runtime): ${taskContent}`
+    const title = summarizeCommitTitle(taskContent)
+    const fileCount = targets.reduce((sum, target) => sum + target.files.length, 0)
+    const message = formatCardCommitMessage(title, taskId, fileCount)
     const committed: Array<{ name: string; hash: string; path: string }> = []
     // Nested target repos already committed this run — their parents must stage
     // the gitlink so the parent tree ends clean (27A guarantee).
@@ -628,7 +719,7 @@ async function autoCommitApprovedTask(deps: ToolDeps, teamId: string, taskConten
         const hash = rev.exitCode === 0 ? rev.stdout.trim() : ""
         committed.push({ name: target.name, hash, path: target.path })
         committedPaths.push(normalizeDir(target.path))
-        log(`tasks-complete:autocommit:committed dir=${target.path} repo=${target.name} hash=${hash || "?"} files=${addList.length} task="${taskContent}"`)
+        log(`tasks-complete:autocommit:committed dir=${target.path} repo=${target.name} hash=${hash || "?"} files=${addList.length} task="${title}"`)
       } catch (err) {
         // Fail-graceful per repo: one bad repo never aborts the others.
         log(`tasks-complete:autocommit:error dir=${target.path} err=${err instanceof Error ? err.message : String(err)}`)
@@ -664,7 +755,7 @@ async function autoCommitApprovedTask(deps: ToolDeps, teamId: string, taskConten
         const rev = await runCommand(["git", "rev-parse", "--short", "HEAD"], { cwd: repo })
         const hash = rev.exitCode === 0 ? rev.stdout.trim() : ""
         committed.push({ name: path.basename(repo), hash, path: normalizeDir(repo) })
-        log(`tasks-complete:autocommit:committed dir=${repo} repo=${path.basename(repo)} hash=${hash || "?"} files=${addList.length} (gitlink) task="${taskContent}"`)
+        log(`tasks-complete:autocommit:committed dir=${repo} repo=${path.basename(repo)} hash=${hash || "?"} files=${addList.length} (gitlink) task="${title}"`)
       } catch (err) {
         log(`tasks-complete:autocommit:error dir=${repo} err=${err instanceof Error ? err.message : String(err)}`)
       }
@@ -688,7 +779,7 @@ async function autoCommitApprovedTask(deps: ToolDeps, teamId: string, taskConten
           .filter((p) => p.length > 0)
         if (remaining.length === 0) continue
         log(
-          `tasks-complete:autocommit:ledger-gap dir=${repo} omitted=${remaining.length} sample=${remaining.slice(0, 5).join(",")} task="${taskContent}"`,
+          `tasks-complete:autocommit:ledger-gap dir=${repo} omitted=${remaining.length} sample=${remaining.slice(0, 5).join(",")} task="${title}"`,
         )
       } catch (err) {
         log(`tasks-complete:autocommit:ledger-gap-check-failed dir=${repo} err=${err instanceof Error ? err.message : String(err)}`)
@@ -1008,7 +1099,9 @@ export async function executeTeamTasksComplete(
   if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {
     // TICKET-32A — ledger-gated surgical auto-commit: staged from the room's
     // `team_modified_file` rows for this team (no mtime freshness window).
-    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content)
+    // TICKET-HARNESS-82 — the card id partitions the ledger so only THIS card's
+    // files are committed (safe whole-room fallback lives in the hook).
+    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content, task.id)
   }
 
   // Systematic board wake (silent-lead design): when the last active task on the

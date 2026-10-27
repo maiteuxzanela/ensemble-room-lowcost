@@ -100,7 +100,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
       name: "team_spawn",
       description:
         "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). " +
-        "Each teammate gets their own git worktree for file isolation. " +
+        "TICKET-HARNESS-78: every teammate operates in the shared checkout directory (shared working tree, no per-specialist git worktree) - the `worktree` flag is deprecated and ignored. " +
         "Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. " +
         "Dispatch the SDET for deterministic tests (born in standby by default) and the Quality Gate reviewer for the final audit.",
       input: {
@@ -111,7 +111,7 @@ export async function registerV2Tools(domain: V2ToolDomain, deps: ToolDeps): Pro
           prompt: str("Task instructions for the teammate"),
           model: str("Model in provider/model format (optional, uses default). Optional '#variant' suffix, e.g. provider/model#low"),
           claim_task: str("Task ID to auto-claim for this teammate (optional)"),
-          worktree: bool("Create a git worktree for file isolation (default: true, set false for read-only agents)", true),
+          worktree: bool("[DEPRECATED - IGNORED] Individual git worktrees per specialist are discontinued (TICKET-HARNESS-78). Every teammate operates in the shared checkout directory. Kept for backward compatibility only.", true),
           plan_approval: bool("Require teammate to send a plan for approval before writing files (default: false)", false),
           standby: bool("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)", false),
           role: {

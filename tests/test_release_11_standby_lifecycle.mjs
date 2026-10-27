@@ -283,7 +283,11 @@ async function runBehavior(label, mods) {
 
   /* --- 5.2 UPGRADE v19 → v20 (fixture legada real) --- */
   {
-    const LEGACY_USER_VERSION = migrationsLen - 1;
+    // A fixture legada é o schema ANTERIOR à Migration 20 (o CHECK sem
+    // 'throttled'), ou seja, user_version = 19 — NÃO "migrationsLen - 1".
+    // Fixar em 19 mantém a semântica do cenário quando migrations posteriores
+    // (ex.: Migration 21 do TICKET-HARNESS-82) são acrescentadas ao fim do array.
+    const LEGACY_USER_VERSION = 19;
     const tmp = path.join(root, "legacy_v19.db");
     rmSync(tmp, { force: true, maxRetries: 5, retryDelay: 50 });
     const SEED_NOW = 1_700_000_000_000;

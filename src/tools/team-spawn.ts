@@ -20,7 +20,6 @@ import {
 import { getTeamQAMember, getTeamSDETMember } from "../qa-role"
 import { ensureTeamLeadAgent } from "../lead-agent"
 import type { EnsembleConfig } from "../config"
-import { getTeamResourceParts, teamWorktreeName } from "./merge-helper"
 import { trackPrompt, endTracked } from "../v2-session"
 import { existsSync, readFileSync } from "node:fs"
 import os from "node:os"
@@ -97,22 +96,17 @@ export function resolveModel(
   return undefined
 }
 
-/** Timeout for worktree.create and session.create to prevent hanging on git lock contention. */
+/** Timeout for session.create to prevent hanging on lock contention. */
 function getSpawnTimeout(): number {
   return Number(process.env.SPAWN_TIMEOUT_MS) || 120_000
-}
-
-/** Returns true if the directory is already inside an OpenCode worktree. */
-function isWorktreeDirectory(dir: string): boolean {
-  return dir.includes("/opencode/worktree/")
 }
 
 /**
  * Actionable pre-spawn failure: the configured model is absent from the live
  * catalog AND every configured fallback entry is absent too.
  *
- * TICKET-RELEASE-10 (F1): this error is raised BEFORE worktree/workspace/
- * session creation, so there is nothing to roll back and no orphan session to
+ * TICKET-RELEASE-10 (F1): this error is raised BEFORE session creation, so
+ * there is nothing to roll back and no orphan session to
  * reap — the operator gets the diagnosis synchronously in the tool result.
  * Suggestion list is catalog-derived ("Did you mean"), never hardcoded.
  */
@@ -145,8 +139,12 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 
 /**
  * Execute the team_spawn tool. Creates a child session and starts a teammate.
- * By default, each teammate gets their own git worktree for file isolation.
- * Pass worktree: false for read-only agents that don't need isolation.
+ *
+ * TICKET-HARNESS-78: individual git worktrees per specialist are DISCONTINUED.
+ * Every teammate operates in the shared checkout directory of the room
+ * (Modo Sala de Reunião). The `worktree` spawn flag is deprecated and ignored —
+ * it is kept in the arg shape only for backward compatibility with old callers.
+ *
  * Pass plan_approval: true to require the teammate to send a plan before writing.
  * Pass standby: true to register the member WITHOUT sending its init prompt
  * (zero tokens at birth) — the prompt is stored in spawn_context and replayed,
@@ -154,6 +152,9 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  */
 export async function executeTeamSpawn(
   deps: ToolDeps,
+  // TICKET-HARNESS-78: `worktree` is DEPRECATED and IGNORED — kept in the shape
+  // only for backward compatibility with old callers. Every teammate operates
+  // in the shared checkout directory (Modo Sala de Reunião).
   args: { name: string; agent?: string | null; prompt: string; model?: string; claim_task?: string; worktree?: boolean; plan_approval?: boolean; standby?: boolean; role?: "qa" | "member" | "sdet"; is_qa?: boolean },
   sessionId: string,
 ): Promise<string> {
@@ -214,7 +215,7 @@ export async function executeTeamSpawn(
   // Quality Gate uniqueness lock: audit roles are exclusive. While another
   // ACTIVE Quality Gate reviewer (is_qa flag or clara retrocompat family) exists
   // in the team, no second reviewer may spawn. Deterministic, fail-fast
-  // (before any worktree/session side effect).
+  // (before any session side effect).
   //
   // Message shape (runtime-asserted by test_multi_instance_spawn and
   // test_auto_standby_seq for the retrocompat QA 'clara'; the dist structural
@@ -237,7 +238,7 @@ export async function executeTeamSpawn(
   // exclusive. While another ACTIVE SDET exists in the team (qa-role.ts:
   // role='sdet' flag, agent type "hugo", or base persona of a multi-instance
   // name such as "hugo-sdet"), no second SDET may spawn. Deterministic,
-  // fail-fast (before any worktree/session side effect).
+  // fail-fast (before any session side effect).
   //
   // Message shape (runtime-asserted by test_hugo_sdet_integration — keep the
   // template byte-stable): the NAME slot interpolates the ACTUAL active SDET
@@ -267,7 +268,9 @@ export async function executeTeamSpawn(
   const roomSdet = spawnIsSDET ? null : getTeamSDETMember(deps.db, teamInfo.teamId)
 
   const isReadOnly = agent === "plan" || agent === "explore"
-  const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory)
+  // TICKET-HARNESS-78: individual git worktrees per specialist are DISCONTINUED.
+  // Every teammate operates in the shared checkout directory of the room
+  // (Modo Sala de Reunião). The `worktree` flag is deprecated and ignored.
   const usePlanApproval = args.plan_approval === true
 
   // Auto-standby check: the board is a flat, fully-parallel pool — there is no
@@ -322,10 +325,10 @@ export async function executeTeamSpawn(
   //
   // Live bug (2026-10-22): a configured model absent from the server catalog
   // (ensemble.json → defaultModel/modelsByAgent/fallbackModels[0]) let the
-  // worktree and session be created, then `promptAsync` died asynchronously
+  // session be created, then `promptAsync` died asynchronously
   // with ProviderModelNotFoundError — and native failover never reacted (it
   // only handles quota/rate-limit). Resolution now happens here, before
-  // worktree.create/workspace.create/session.create, and the effective model
+  // session.create, and the effective model
   // is validated against the LIVE catalog. When the configured selector is
   // absent the configured fallback chain is walked to the first served entry;
   // when nothing resolves the spawn fails fast with an actionable message.
@@ -383,62 +386,24 @@ export async function executeTeamSpawn(
   const fallbackModel = selectFallbackModel(agentFallbackChain, resolvedModel)
   if (fallbackModel) log(`spawn:fallback name=${args.name} agent=${agent} fallback=${formatModelSelector(fallbackModel)}`)
 
-  log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`)
+  // TICKET-HARNESS-78: individual git worktrees per specialist are DISCONTINUED.
+  // worktreeDir / worktreeBranch are hardcoded null — the DB columns are kept
+  // nullable for retrocompat with existing rows, but new spawns never write them.
+  // All file operations happen in the shared checkout directory (Modo Sala de
+  // Reunião), coordinated via P2P alignment and team_task_handover.
+  log(`spawn:start name=${args.name} agent=${agent} shared-checkout=true${useStandby ? " standby=true" : ""}`)
 
-  // Create worktree if enabled
-  let worktreeDir: string | null = null
-  let worktreeBranch: string | null = null
+  const worktreeDir: string | null = null
+  const worktreeBranch: string | null = null
 
-  if (useWorktree) {
-    const resource = getTeamResourceParts(deps.db, teamInfo.teamId)
-    const worktreeName = teamWorktreeName(resource.projectName, resource.teamName, resource.teamId, args.name)
-    try {
-      log(`spawn:worktree:start name=${args.name}`)
-      const result = await withTimeout(
-        deps.client.worktree.create({ worktreeCreateInput: { name: worktreeName } }),
-        getSpawnTimeout(), `worktree.create for "${args.name}"`
-      )
-      if (result.data) {
-        worktreeDir = result.data.directory
-        worktreeBranch = result.data.branch
-      }
-      log(`spawn:worktree:done name=${args.name} dir=${worktreeDir}`)
-    } catch (err) {
-      log(`spawn:worktree:failed name=${args.name} err=${err instanceof Error ? err.message : String(err)}`)
-      try {
-        await deps.client.tui.showToast({
-          title: "Team",
-          message: `Worktree creation failed for ${args.name}, using shared directory`,
-          variant: "warning",
-          duration: 4000,
-        })
-      } catch { /* TUI may not be available */ }
-    }
-  }
-
-  // Create workspace from worktree branch — links session to worktree directory.
-  // OQ-workspace: assumes workspace.create({ branch }) auto-links to the worktree at that branch.
-  let workspaceId: string | null = null
-  if (worktreeDir && worktreeBranch) {
-    try {
-      log(`spawn:workspace:start name=${args.name}`)
-      const wsResult = await withTimeout(
-        deps.client.workspace.create({ branch: worktreeBranch }),
-        getSpawnTimeout(), `workspace.create for "${args.name}"`
-      )
-      if (wsResult.data) {
-        workspaceId = wsResult.data.id
-      }
-      log(`spawn:workspace:done name=${args.name} id=${workspaceId}`)
-    } catch (err) {
-      log(`spawn:workspace:failed name=${args.name} err=${err instanceof Error ? err.message : String(err)}`)
-      // Non-fatal — prompt-based CWD instruction is the fallback
-    }
-  }
+  // No workspace binding — the session runs directly in the shared checkout.
+  const workspaceId: string | null = null
 
   // Permission rules on session.create are the hard gate (server-enforced).
+  // TICKET-HARNESS-78: shared checkout mode — no per-worktree path allowlist.
+  // Non-read-only teammates inherit the parent's edit/bash permissions on the
+  // shared directory (same behaviour as the legacy `worktree: false` path).
   // For read-only agents, deny write tools and explicitly allow team tools.
-  // For all agents with worktrees, allowlist the worktree path for edit/bash.
   // The member-accessible tools: the worker tools plus the inspection tools
   // (team_results/team_status/team_view — any member) and decision_lead
   // (HARNESS-22 — any member may escalate a blocking ruling to the lead).
@@ -459,15 +424,6 @@ export async function executeTeamSpawn(
     "decision_lead",
   ] as const
   const permission: PermissionRule[] = []
-
-  if (worktreeDir) {
-    permission.push(
-      { permission: "edit", pattern: `${worktreeDir}/**`, action: "allow" },
-    )
-    if (!isReadOnly) {
-      permission.push({ permission: "bash", pattern: "*", action: "allow" })
-    }
-  }
 
   if (isReadOnly) {
     permission.push(
@@ -504,8 +460,7 @@ export async function executeTeamSpawn(
   // permissions, so explore stays read-only.
   permission.push({ permission: "execute", pattern: "*", action: "allow" })
 
-  // Create child session — bind to workspace if available (server-enforced CWD isolation).
-  // Falls back to no workspace binding if workspace.create failed.
+  // Create child session — no workspace binding (shared checkout mode, HARNESS-78).
   let childSessionId: string | undefined
   try {
     log(`spawn:session:start name=${args.name}`)
@@ -526,23 +481,11 @@ export async function executeTeamSpawn(
     const errMsg = err instanceof Error ? err.message : String(err)
     const prev = spawnFailures.get(teamInfo.teamId)
     spawnFailures.set(teamInfo.teamId, { count: (prev?.count ?? 0) + 1, lastError: errMsg })
-    // Rollback workspace and worktree if session creation failed
-    if (workspaceId) {
-      try { await deps.client.workspace.remove({ id: workspaceId }) } catch { /* best effort */ }
-    }
-    if (worktreeDir) {
-      try { await deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } }) } catch { /* best effort */ }
-    }
+    // TICKET-HARNESS-78: no workspace/worktree to roll back — shared checkout only.
     throw new Error(`Failed to create session for teammate "${args.name}": ${err instanceof Error ? err.message : String(err)}`)
   }
 
   if (!childSessionId) {
-    if (workspaceId) {
-      try { await deps.client.workspace.remove({ id: workspaceId }) } catch { /* best effort */ }
-    }
-    if (worktreeDir) {
-      try { await deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } }) } catch { /* best effort */ }
-    }
     throw new Error("Failed to create teammate session")
   }
 
@@ -637,23 +580,11 @@ export async function executeTeamSpawn(
     context.push(`Other teammates: ${otherMembers.map(m => m.name).join(", ")}`)
   }
 
-  if (worktreeBranch && worktreeDir && !workspaceId) {
-    // Workspace binding failed — fallback to prompt-based CWD instruction
-    context.push(
-      `You are working on branch "${worktreeBranch}" in your own worktree at: ${worktreeDir}`,
-      `Your changes are isolated from other teammates.`,
-      `IMPORTANT: All file operations and shell commands MUST target your worktree directory.`,
-      `Before running shell commands, cd to: ${worktreeDir}`,
-    )
-  } else if (worktreeBranch && worktreeDir) {
-    // Workspace binding active — server handles CWD
-    context.push(
-      `You are working on branch "${worktreeBranch}" in your own isolated worktree.`,
-      `Your changes are isolated from other teammates.`,
-    )
-  } else if (worktreeBranch) {
-    context.push(`You are working on branch "${worktreeBranch}". Your changes are isolated from other teammates.`)
-  }
+  // TICKET-HARNESS-78: shared checkout — no per-worktree CWD instructions.
+  context.push(
+    `You operate in the SHARED checkout directory of the room: ${deps.directory}`,
+    `All teammates edit the same working tree. Coordinate via team_message and team_task_handover before touching the same files.`,
+  )
 
   // Plan approval mode — teammate must send plan before writing
   if (usePlanApproval) {
@@ -757,15 +688,9 @@ export async function executeTeamSpawn(
   }
 
   context.push("", "When you finish your task:")
-  if (!isReadOnly && worktreeBranch) {
-    context.push(`1. Commit your changes: git add -A && git commit -m "your summary"`)
-    context.push(finishStep2("a task"))
+  if (!isReadOnly) {
     context.push(
-      "3. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:",
-    )
-  } else if (!isReadOnly) {
-    context.push(
-      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for inspection and anti-early-commit governance). The runtime commits the shared workspace LOCALLY and automatically the moment the Quality Gate reviewer approves your card via team_tasks_complete(action: 'complete') — no manual git commit is needed. Pushing stays reserved for the pre-push batch gate.",
+      "1. In shared checkout mode (TICKET-HARNESS-78 — the only mode), do NOT commit git changes directly (keep changes unstaged for inspection and anti-early-commit governance). The runtime commits the shared workspace LOCALLY and automatically the moment the Quality Gate reviewer approves your card via team_tasks_complete(action: 'complete') — no manual git commit is needed. Pushing stays reserved for the pre-push batch gate.",
     )
     context.push(finishStep2("a standalone task"))
     context.push(
@@ -788,11 +713,8 @@ export async function executeTeamSpawn(
     "<status>completed or failed</status>",
     "<summary>One-line summary of what you did</summary>",
     "<details>Full findings or changes made</details>",
+    "</task-result>",
   )
-  if (worktreeBranch) {
-    context.push(`<branch>${worktreeBranch}</branch>`)
-  }
-  context.push("</task-result>")
   const lastStep = !isReadOnly ? "4" : "3"
   context.push(
     `${lastStep}. STOP. Do not send follow-up confirmations, status updates, or 'standing by' messages.`,
@@ -886,12 +808,6 @@ export async function executeTeamSpawn(
           )
         }
         deps.client.session.abort({ sessionID: childSessionId }).catch(() => { /* best effort */ })
-        if (workspaceId) {
-          deps.client.workspace.remove({ id: workspaceId }).catch(() => { /* best effort */ })
-        }
-        if (worktreeDir) {
-          deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } }).catch(() => { /* best effort */ })
-        }
         const modelInfo = resolvedModel ? ` (model: ${resolvedModel})` : ""
         deps.client.tui.showToast({
           title: "Team",
@@ -914,7 +830,6 @@ export async function executeTeamSpawn(
     })
   }
 
-  const branchInfo = worktreeBranch ? ` (branch: ${worktreeBranch})` : ""
   const standbyInfo = autoStandby
     ? ` (auto-standby: ${autoStandbyReason})`
     : useStandby ? " [standby — no prompt sent; wakes on first team_message]" : ""
@@ -925,5 +840,5 @@ export async function executeTeamSpawn(
   // Reset circuit breaker on success
   spawnFailures.delete(teamInfo.teamId)
   log(`spawn:done name=${args.name} sessionId=${childSessionId}`)
-  return `Teammate "${args.name}" spawned (agent: ${agent})${branchInfo}${standbyInfo}${planInfo}${claimInfo}. They are working on: ${args.prompt.slice(0, 120)}${args.prompt.length > 120 ? "..." : ""}`
+  return `Teammate "${args.name}" spawned (agent: ${agent}, shared-checkout)${standbyInfo}${planInfo}${claimInfo}. They are working on: ${args.prompt.slice(0, 120)}${args.prompt.length > 120 ? "..." : ""}`
 }

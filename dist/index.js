@@ -611,8 +611,27 @@ var MIGRATIONS = [
    INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, time_created, time_updated, worktree_dir, worktree_branch, plan_approval, workspace_id, reported_to_lead, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message, spawn_context, is_qa, role)
      SELECT team_id, name, session_id, agent, status, execution_status, model, prompt, time_created, time_updated, worktree_dir, worktree_branch, plan_approval, workspace_id, reported_to_lead, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message, spawn_context, is_qa, role FROM team_member_old_m20;
    DROP TABLE team_member_old_m20;
-   CREATE INDEX IF NOT EXISTS team_member_session_idx ON team_member(session_id);
-   CREATE INDEX IF NOT EXISTS team_member_status_idx ON team_member(team_id, status);`
+    CREATE INDEX IF NOT EXISTS team_member_session_idx ON team_member(session_id);
+    CREATE INDEX IF NOT EXISTS team_member_status_idx ON team_member(team_id, status);`,
+  // Migration 21 (TICKET-HARNESS-82 / TICKET-HARNESS-87 Item 3): partition the
+  // room's modified-file ledger PER CARD. `task_id` binds a recorded file to the
+  // card that was being worked on when the edit happened, so the Portão 1
+  // auto-commit of one approved card no longer sweeps the files of sibling
+  // cards that are still in progress.
+  //
+  // NULLABILITY IS INTENTIONAL (retrocompatibilidade): existing rows and every
+  // edit made with no unambiguous task context (lead edits, tool calls outside
+  // a card) keep `task_id = NULL`. `autoCommitApprovedTask` treats those rows as
+  // the safe fallback when the completed card has no file of its own, so a
+  // legitimate edit is never orphaned.
+  //
+  // Additive-only (same non-negotiable as Migrations 9-11/14/15/16/17/18):
+  // nullable TEXT column on the existing table, no CHECK constraint, no rebuild
+  // of team_modified_file (its PRIMARY KEY (team_id, file_path) is preserved —
+  // re-editing the same file refreshes the row in place and the latest
+  // non-NULL task binding wins, see recordModifiedFile).
+  `ALTER TABLE team_modified_file ADD COLUMN task_id TEXT;
+   CREATE INDEX IF NOT EXISTS team_modified_file_task_idx ON team_modified_file(team_id, task_id);`
 ];
 function applyMigrations(db) {
   const { user_version: current } = db.query("PRAGMA user_version").get();
@@ -3450,7 +3469,6 @@ async function executeTeamClaim(deps, args, sessionId) {
 
 // src/tools/team-spawn.ts
 init_log();
-init_merge_helper();
 import { existsSync, readFileSync as readFileSync2 } from "node:fs";
 import os from "node:os";
 import path3 from "node:path";
@@ -3495,9 +3513,6 @@ function resolveModel(explicitModel, agentType, teamMemberCount, config, memberN
 }
 function getSpawnTimeout() {
   return Number(process.env.SPAWN_TIMEOUT_MS) || 12e4;
-}
-function isWorktreeDirectory(dir) {
-  return dir.includes("/opencode/worktree/");
 }
 function unavailableSpawnModelError(memberName, decision, chain) {
   const configured = decision.configured ?? "(unset)";
@@ -3550,7 +3565,6 @@ async function executeTeamSpawn(deps, args, sessionId) {
   const roomQa = getTeamQAMember(deps.db, teamInfo.teamId);
   const roomSdet = spawnIsSDET ? null : getTeamSDETMember(deps.db, teamInfo.teamId);
   const isReadOnly = agent === "plan" || agent === "explore";
-  const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory);
   const usePlanApproval = args.plan_approval === true;
   let autoStandby = false;
   let autoStandbyReason = "";
@@ -3606,54 +3620,10 @@ async function executeTeamSpawn(deps, args, sessionId) {
   }
   const fallbackModel = selectFallbackModel(agentFallbackChain, resolvedModel);
   if (fallbackModel) log(`spawn:fallback name=${args.name} agent=${agent} fallback=${formatModelSelector(fallbackModel)}`);
-  log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}${useStandby ? " standby=true" : ""}`);
-  let worktreeDir = null;
-  let worktreeBranch = null;
-  if (useWorktree) {
-    const resource = getTeamResourceParts(deps.db, teamInfo.teamId);
-    const worktreeName = teamWorktreeName(resource.projectName, resource.teamName, resource.teamId, args.name);
-    try {
-      log(`spawn:worktree:start name=${args.name}`);
-      const result = await withTimeout(
-        deps.client.worktree.create({ worktreeCreateInput: { name: worktreeName } }),
-        getSpawnTimeout(),
-        `worktree.create for "${args.name}"`
-      );
-      if (result.data) {
-        worktreeDir = result.data.directory;
-        worktreeBranch = result.data.branch;
-      }
-      log(`spawn:worktree:done name=${args.name} dir=${worktreeDir}`);
-    } catch (err) {
-      log(`spawn:worktree:failed name=${args.name} err=${err instanceof Error ? err.message : String(err)}`);
-      try {
-        await deps.client.tui.showToast({
-          title: "Team",
-          message: `Worktree creation failed for ${args.name}, using shared directory`,
-          variant: "warning",
-          duration: 4e3
-        });
-      } catch {
-      }
-    }
-  }
-  let workspaceId = null;
-  if (worktreeDir && worktreeBranch) {
-    try {
-      log(`spawn:workspace:start name=${args.name}`);
-      const wsResult = await withTimeout(
-        deps.client.workspace.create({ branch: worktreeBranch }),
-        getSpawnTimeout(),
-        `workspace.create for "${args.name}"`
-      );
-      if (wsResult.data) {
-        workspaceId = wsResult.data.id;
-      }
-      log(`spawn:workspace:done name=${args.name} id=${workspaceId}`);
-    } catch (err) {
-      log(`spawn:workspace:failed name=${args.name} err=${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
+  log(`spawn:start name=${args.name} agent=${agent} shared-checkout=true${useStandby ? " standby=true" : ""}`);
+  const worktreeDir = null;
+  const worktreeBranch = null;
+  const workspaceId = null;
   const TEAM_TOOLS = [
     "team_message",
     "team_broadcast",
@@ -3669,14 +3639,6 @@ async function executeTeamSpawn(deps, args, sessionId) {
     "decision_lead"
   ];
   const permission = [];
-  if (worktreeDir) {
-    permission.push(
-      { permission: "edit", pattern: `${worktreeDir}/**`, action: "allow" }
-    );
-    if (!isReadOnly) {
-      permission.push({ permission: "bash", pattern: "*", action: "allow" });
-    }
-  }
   if (isReadOnly) {
     permission.push(
       { permission: "edit", pattern: "*", action: "deny" },
@@ -3719,33 +3681,9 @@ async function executeTeamSpawn(deps, args, sessionId) {
     const errMsg = err instanceof Error ? err.message : String(err);
     const prev = spawnFailures.get(teamInfo.teamId);
     spawnFailures.set(teamInfo.teamId, { count: (prev?.count ?? 0) + 1, lastError: errMsg });
-    if (workspaceId) {
-      try {
-        await deps.client.workspace.remove({ id: workspaceId });
-      } catch {
-      }
-    }
-    if (worktreeDir) {
-      try {
-        await deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } });
-      } catch {
-      }
-    }
     throw new Error(`Failed to create session for teammate "${args.name}": ${err instanceof Error ? err.message : String(err)}`);
   }
   if (!childSessionId) {
-    if (workspaceId) {
-      try {
-        await deps.client.workspace.remove({ id: workspaceId });
-      } catch {
-      }
-    }
-    if (worktreeDir) {
-      try {
-        await deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } });
-      } catch {
-      }
-    }
     throw new Error("Failed to create teammate session");
   }
   const planApproval = usePlanApproval ? "pending" : "none";
@@ -3821,21 +3759,10 @@ async function executeTeamSpawn(deps, args, sessionId) {
   if (otherMembers.length > 0) {
     context.push(`Other teammates: ${otherMembers.map((m) => m.name).join(", ")}`);
   }
-  if (worktreeBranch && worktreeDir && !workspaceId) {
-    context.push(
-      `You are working on branch "${worktreeBranch}" in your own worktree at: ${worktreeDir}`,
-      `Your changes are isolated from other teammates.`,
-      `IMPORTANT: All file operations and shell commands MUST target your worktree directory.`,
-      `Before running shell commands, cd to: ${worktreeDir}`
-    );
-  } else if (worktreeBranch && worktreeDir) {
-    context.push(
-      `You are working on branch "${worktreeBranch}" in your own isolated worktree.`,
-      `Your changes are isolated from other teammates.`
-    );
-  } else if (worktreeBranch) {
-    context.push(`You are working on branch "${worktreeBranch}". Your changes are isolated from other teammates.`);
-  }
+  context.push(
+    `You operate in the SHARED checkout directory of the room: ${deps.directory}`,
+    `All teammates edit the same working tree. Coordinate via team_message and team_task_handover before touching the same files.`
+  );
   if (usePlanApproval) {
     context.push(
       "",
@@ -3911,15 +3838,9 @@ async function executeTeamSpawn(deps, args, sessionId) {
     );
   }
   context.push("", "When you finish your task:");
-  if (!isReadOnly && worktreeBranch) {
-    context.push(`1. Commit your changes: git add -A && git commit -m "your summary"`);
-    context.push(finishStep2("a task"));
+  if (!isReadOnly) {
     context.push(
-      "3. ONLY when your task is fully complete, send ONE message to the lead using team_message with this format:"
-    );
-  } else if (!isReadOnly) {
-    context.push(
-      "1. In shared workspace mode (worktree: false), do NOT commit git changes directly (keep changes unstaged for inspection and anti-early-commit governance). The runtime commits the shared workspace LOCALLY and automatically the moment the Quality Gate reviewer approves your card via team_tasks_complete(action: 'complete') \u2014 no manual git commit is needed. Pushing stays reserved for the pre-push batch gate."
+      "1. In shared checkout mode (TICKET-HARNESS-78 \u2014 the only mode), do NOT commit git changes directly (keep changes unstaged for inspection and anti-early-commit governance). The runtime commits the shared workspace LOCALLY and automatically the moment the Quality Gate reviewer approves your card via team_tasks_complete(action: 'complete') \u2014 no manual git commit is needed. Pushing stays reserved for the pre-push batch gate."
     );
     context.push(finishStep2("a standalone task"));
     context.push(
@@ -3937,12 +3858,9 @@ async function executeTeamSpawn(deps, args, sessionId) {
     "<task-result>",
     "<status>completed or failed</status>",
     "<summary>One-line summary of what you did</summary>",
-    "<details>Full findings or changes made</details>"
+    "<details>Full findings or changes made</details>",
+    "</task-result>"
   );
-  if (worktreeBranch) {
-    context.push(`<branch>${worktreeBranch}</branch>`);
-  }
-  context.push("</task-result>");
   const lastStep = !isReadOnly ? "4" : "3";
   context.push(
     `${lastStep}. STOP. Do not send follow-up confirmations, status updates, or 'standing by' messages.`,
@@ -4011,14 +3929,6 @@ async function executeTeamSpawn(deps, args, sessionId) {
         }
         deps.client.session.abort({ sessionID: childSessionId }).catch(() => {
         });
-        if (workspaceId) {
-          deps.client.workspace.remove({ id: workspaceId }).catch(() => {
-          });
-        }
-        if (worktreeDir) {
-          deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } }).catch(() => {
-          });
-        }
         const modelInfo = resolvedModel ? ` (model: ${resolvedModel})` : "";
         deps.client.tui.showToast({
           title: "Team",
@@ -4042,13 +3952,12 @@ async function executeTeamSpawn(deps, args, sessionId) {
       }
     });
   }
-  const branchInfo = worktreeBranch ? ` (branch: ${worktreeBranch})` : "";
   const standbyInfo = autoStandby ? ` (auto-standby: ${autoStandbyReason})` : useStandby ? " [standby \u2014 no prompt sent; wakes on first team_message]" : "";
   const planInfo = usePlanApproval ? " [plan mode \u2014 will send plan for approval]" : "";
   const claimInfo = claimedTaskContent ? ` (claimed task: ${args.claim_task})` : claimWarning ? ` (could not claim task: ${claimWarning})` : "";
   spawnFailures.delete(teamInfo.teamId);
   log(`spawn:done name=${args.name} sessionId=${childSessionId}`);
-  return `Teammate "${args.name}" spawned (agent: ${agent})${branchInfo}${standbyInfo}${planInfo}${claimInfo}. They are working on: ${args.prompt.slice(0, 120)}${args.prompt.length > 120 ? "..." : ""}`;
+  return `Teammate "${args.name}" spawned (agent: ${agent}, shared-checkout)${standbyInfo}${planInfo}${claimInfo}. They are working on: ${args.prompt.slice(0, 120)}${args.prompt.length > 120 ? "..." : ""}`;
 }
 
 // src/tools/team-standby.ts
@@ -4612,7 +4521,7 @@ function consumeShellBaseline(db, registry, sessionId, tool2, args, workspaceDir
   else pendingShellBaselines.set(sessionId, queue);
   return { baseline: pending?.snapshot ?? null, current: gitStatusSnapshot(cwd) };
 }
-function recordShellDiff(db, teamId, baseline, current) {
+function recordShellDiff(db, teamId, baseline, current, taskId) {
   if (!current) return [];
   const before = baseline && baseline.root === current.root ? baseline.entries : /* @__PURE__ */ new Map();
   const touched = [];
@@ -4629,18 +4538,41 @@ function recordShellDiff(db, teamId, baseline, current) {
       `modified-file:shell-truncated team=${teamId} touched=${touched.length} recorded=${limited.length} max=${MAX_SHELL_LEDGER_FILES}`
     );
   }
-  for (const abs of limited) recordModifiedFile(db, teamId, abs);
+  for (const abs of limited) recordModifiedFile(db, teamId, abs, taskId);
   return limited;
 }
 function normalizeModifiedPath(filePath) {
   return path4.resolve(filePath);
 }
-function recordModifiedFile(db, teamId, filePath) {
+function activeTaskIdForMember(db, teamId, memberName) {
+  try {
+    if (memberName) {
+      const own = db.query(
+        "SELECT id FROM team_task WHERE team_id = ? AND assignee = ? AND status = 'in_progress' ORDER BY time_updated DESC LIMIT 1"
+      ).get(teamId, memberName);
+      if (own?.id) return own.id;
+    }
+    const active = db.query(
+      "SELECT id FROM team_task WHERE team_id = ? AND status = 'in_progress' ORDER BY time_updated DESC LIMIT 2"
+    ).all(teamId);
+    if (active.length === 1) return active[0]?.id ?? null;
+    const reviewing = db.query(
+      "SELECT id FROM team_task WHERE team_id = ? AND status = 'in_review' ORDER BY time_updated DESC LIMIT 2"
+    ).all(teamId);
+    if (reviewing.length === 1) return reviewing[0]?.id ?? null;
+    return null;
+  } catch {
+    return null;
+  }
+}
+function recordModifiedFile(db, teamId, filePath, taskId) {
   const normalized = normalizeModifiedPath(filePath);
   db.run(
-    `INSERT INTO team_modified_file (team_id, file_path, time_created) VALUES (?, ?, ?)
-     ON CONFLICT(team_id, file_path) DO UPDATE SET time_created = excluded.time_created`,
-    [teamId, normalized, Date.now()]
+    `INSERT INTO team_modified_file (team_id, file_path, task_id, time_created) VALUES (?, ?, ?, ?)
+     ON CONFLICT(team_id, file_path) DO UPDATE SET
+       time_created = excluded.time_created,
+       task_id = COALESCE(excluded.task_id, team_modified_file.task_id)`,
+    [teamId, normalized, taskId ?? null, Date.now()]
   );
 }
 function extractFilePath(tool2, args) {
@@ -4665,15 +4597,16 @@ function recordFileFromToolCall(db, registry, sessionId, tool2, args, workspaceD
     if (SHELL_TOOLS.has(tool2)) {
       const teamInfo2 = findTeamBySession(db, registry, sessionId);
       if (!teamInfo2) return;
+      const taskId2 = activeTaskIdForMember(db, teamInfo2.teamId, teamInfo2.memberName);
       const snapshots = consumeShellBaseline(db, registry, sessionId, tool2, args, workspaceDir, callId);
       if (!snapshots) return;
       if (!snapshots.baseline) {
         log(`modified-file:shell-baseline-missing team=${teamInfo2.teamId} tool=${tool2}`);
         return;
       }
-      const recorded = recordShellDiff(db, teamInfo2.teamId, snapshots.baseline, snapshots.current);
+      const recorded = recordShellDiff(db, teamInfo2.teamId, snapshots.baseline, snapshots.current, taskId2);
       log(
-        `modified-file:shell-recorded team=${teamInfo2.teamId} tool=${tool2} files=${recorded.length}` + (recorded.length > 0 ? ` first=${recorded[0]}` : "")
+        `modified-file:shell-recorded team=${teamInfo2.teamId} tool=${tool2} files=${recorded.length}` + (taskId2 ? ` task=${taskId2}` : "") + (recorded.length > 0 ? ` first=${recorded[0]}` : "")
       );
       return;
     }
@@ -4682,13 +4615,22 @@ function recordFileFromToolCall(db, registry, sessionId, tool2, args, workspaceD
     if (!filePath) return;
     const teamInfo = findTeamBySession(db, registry, sessionId);
     if (!teamInfo) return;
-    recordModifiedFile(db, teamInfo.teamId, filePath);
-    log(`modified-file:recorded team=${teamInfo.teamId} tool=${tool2} file=${normalizeModifiedPath(filePath)}`);
+    const taskId = activeTaskIdForMember(db, teamInfo.teamId, teamInfo.memberName);
+    recordModifiedFile(db, teamInfo.teamId, filePath, taskId);
+    log(
+      `modified-file:recorded team=${teamInfo.teamId} tool=${tool2} file=${normalizeModifiedPath(filePath)}` + (taskId ? ` task=${taskId}` : "")
+    );
   } catch (err) {
     log(`modified-file:record-failed tool=${tool2} err=${err instanceof Error ? err.message : String(err)}`);
   }
 }
-function listModifiedFiles(db, teamId) {
+function listModifiedFiles(db, teamId, taskId) {
+  if (taskId) {
+    const rows2 = db.query(
+      "SELECT file_path FROM team_modified_file WHERE team_id = ? AND task_id = ? ORDER BY time_created DESC"
+    ).all(teamId, taskId);
+    return rows2.map((r) => r.file_path);
+  }
   const rows = db.query(
     "SELECT file_path FROM team_modified_file WHERE team_id = ? ORDER BY time_created DESC"
   ).all(teamId);
@@ -4987,15 +4929,51 @@ async function stageableLedgerPaths(repoRoot, relPaths) {
   }
   return relPaths.filter((rel) => !dropped.includes(rel));
 }
-async function autoCommitApprovedTask(deps, teamId, taskContent) {
+var COMMIT_PREFIX = "feat(runtime): ";
+var COMMIT_FIRST_LINE_MAX = 100;
+var COMMIT_TITLE_MAX = COMMIT_FIRST_LINE_MAX - COMMIT_PREFIX.length;
+function collapseCommitText(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+function summarizeCommitTitle(content, maxLen = COMMIT_TITLE_MAX) {
+  const budget = Math.max(1, Math.floor(maxLen));
+  const firstLine = content.split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0) ?? "";
+  let title = collapseCommitText(
+    firstLine.replace(/^#{1,6}\s*/, "").replace(/^[-*+]\s+/, "")
+  );
+  if (title.length === 0) title = "task completed";
+  if (title.length <= budget) return title;
+  const cut = title.slice(0, budget - 1);
+  const lastSpace = cut.lastIndexOf(" ");
+  const floor = Math.max(20, Math.floor(budget * 0.4));
+  const base = lastSpace > floor ? cut.slice(0, lastSpace) : cut;
+  return `${base.trimEnd()}\u2026`;
+}
+function formatCardCommitMessage(taskContent, taskId, fileCount) {
+  const title = summarizeCommitTitle(taskContent);
+  const subject = `${COMMIT_PREFIX}${title}`.slice(0, COMMIT_FIRST_LINE_MAX);
+  const body = [];
+  if (taskId) body.push(`Card: ${taskId}`);
+  if (typeof fileCount === "number" && fileCount > 0) body.push(`Files: ${fileCount}`);
+  return body.length > 0 ? `${subject}
+
+${body.join("\n")}` : subject;
+}
+async function autoCommitApprovedTask(deps, teamId, taskContent, taskId) {
   const dir = deps.directory;
   try {
-    const ledger = listModifiedFiles(deps.db, teamId);
+    let ledger = taskId ? listModifiedFiles(deps.db, teamId, taskId) : listModifiedFiles(deps.db, teamId);
+    if (taskId && ledger.length === 0) {
+      ledger = listModifiedFiles(deps.db, teamId);
+      log(`tasks-complete:autocommit:ledger-fallback team=${teamId} task=${taskId} roomFiles=${ledger.length}`);
+    }
     if (ledger.length === 0) return "";
     const candidates = await discoverCandidateRepos(dir, ledger);
     const targets = resolveCommitTargets(candidates, ledger);
     if (targets.length === 0) return "";
-    const message = `feat(runtime): ${taskContent}`;
+    const title = summarizeCommitTitle(taskContent);
+    const fileCount = targets.reduce((sum, target) => sum + target.files.length, 0);
+    const message = formatCardCommitMessage(title, taskId, fileCount);
     const committed = [];
     const committedPaths = [];
     let sawDirty = false;
@@ -5042,7 +5020,7 @@ async function autoCommitApprovedTask(deps, teamId, taskContent) {
         const hash = rev.exitCode === 0 ? rev.stdout.trim() : "";
         committed.push({ name: target.name, hash, path: target.path });
         committedPaths.push(normalizeDir(target.path));
-        log(`tasks-complete:autocommit:committed dir=${target.path} repo=${target.name} hash=${hash || "?"} files=${addList.length} task="${taskContent}"`);
+        log(`tasks-complete:autocommit:committed dir=${target.path} repo=${target.name} hash=${hash || "?"} files=${addList.length} task="${title}"`);
       } catch (err) {
         log(`tasks-complete:autocommit:error dir=${target.path} err=${err instanceof Error ? err.message : String(err)}`);
       }
@@ -5068,7 +5046,7 @@ async function autoCommitApprovedTask(deps, teamId, taskContent) {
         const rev = await runCommand(["git", "rev-parse", "--short", "HEAD"], { cwd: repo });
         const hash = rev.exitCode === 0 ? rev.stdout.trim() : "";
         committed.push({ name: path5.basename(repo), hash, path: normalizeDir(repo) });
-        log(`tasks-complete:autocommit:committed dir=${repo} repo=${path5.basename(repo)} hash=${hash || "?"} files=${addList.length} (gitlink) task="${taskContent}"`);
+        log(`tasks-complete:autocommit:committed dir=${repo} repo=${path5.basename(repo)} hash=${hash || "?"} files=${addList.length} (gitlink) task="${title}"`);
       } catch (err) {
         log(`tasks-complete:autocommit:error dir=${repo} err=${err instanceof Error ? err.message : String(err)}`);
       }
@@ -5081,7 +5059,7 @@ async function autoCommitApprovedTask(deps, teamId, taskContent) {
         const remaining = status.stdout.split("\n").filter((line) => line.trim().length > 3).map((line) => line.slice(3).trim()).filter((p) => p.length > 0);
         if (remaining.length === 0) continue;
         log(
-          `tasks-complete:autocommit:ledger-gap dir=${repo} omitted=${remaining.length} sample=${remaining.slice(0, 5).join(",")} task="${taskContent}"`
+          `tasks-complete:autocommit:ledger-gap dir=${repo} omitted=${remaining.length} sample=${remaining.slice(0, 5).join(",")} task="${title}"`
         );
       } catch (err) {
         log(`tasks-complete:autocommit:ledger-gap-check-failed dir=${repo} err=${err instanceof Error ? err.message : String(err)}`);
@@ -5255,7 +5233,7 @@ async function executeTeamTasksComplete(deps, args, sessionId) {
   }
   let commitSuffix = "";
   if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {
-    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content);
+    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content, task.id);
   }
   if (total > 0 && completed === total && activeRemaining === 0) {
     const leadRow = deps.db.query("SELECT lead_session_id, lead_agent FROM team WHERE id = ?").get(teamInfo.teamId);
@@ -6231,7 +6209,7 @@ async function registerV2Tools(domain, deps) {
     });
     editor.add({
       name: "team_spawn",
-      description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). Each teammate gets their own git worktree for file isolation. Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. Dispatch the SDET for deterministic tests (born in standby by default) and the Quality Gate reviewer for the final audit.",
+      description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). TICKET-HARNESS-78: every teammate operates in the shared checkout directory (shared working tree, no per-specialist git worktree) - the `worktree` flag is deprecated and ignored. Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. Dispatch the SDET for deterministic tests (born in standby by default) and the Quality Gate reviewer for the final audit.",
       input: {
         type: "object",
         properties: {
@@ -6240,7 +6218,7 @@ async function registerV2Tools(domain, deps) {
           prompt: str("Task instructions for the teammate"),
           model: str("Model in provider/model format (optional, uses default). Optional '#variant' suffix, e.g. provider/model#low"),
           claim_task: str("Task ID to auto-claim for this teammate (optional)"),
-          worktree: bool("Create a git worktree for file isolation (default: true, set false for read-only agents)", true),
+          worktree: bool("[DEPRECATED - IGNORED] Individual git worktrees per specialist are discontinued (TICKET-HARNESS-78). Every teammate operates in the shared checkout directory. Kept for backward compatibility only.", true),
           plan_approval: bool("Require teammate to send a plan for approval before writing files (default: false)", false),
           standby: bool("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)", false),
           role: {
@@ -9669,14 +9647,14 @@ var plugin = async (input) => {
         }
       }),
       team_spawn: tool({
-        description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). Each teammate gets their own git worktree for file isolation. Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. Dispatch the SDET for deterministic tests (born in standby by default) and the Quality Gate reviewer for the final audit.",
+        description: "Spawn a new teammate that works in parallel. With standby: false it starts immediately on the given prompt; with standby: true it is registered without sending its init prompt (woken later by the first team_message/broadcast). TICKET-HARNESS-78: every teammate operates in the shared checkout directory (shared working tree, no per-specialist git worktree) - the `worktree` flag is deprecated and ignored. Teammates work asynchronously; under silentLead they do not wake you on each completion, so track progress on the board. Dispatch the SDET for deterministic tests (born in standby by default) and the Quality Gate reviewer for the final audit.",
         args: {
           name: tool.schema.string().describe("Teammate name (lowercase alphanumeric with hyphens)"),
           agent: tool.schema.string().default("build").describe("Agent type (e.g. 'build', 'plan', 'explore')"),
           prompt: tool.schema.string().describe("Task instructions for the teammate"),
           model: tool.schema.string().optional().describe("Model in provider/model format (optional, uses default)"),
           claim_task: tool.schema.string().optional().describe("Task ID to auto-claim for this teammate (optional)"),
-          worktree: tool.schema.boolean().default(true).describe("Create a git worktree for file isolation (default: true, set false for read-only agents)"),
+          worktree: tool.schema.boolean().default(true).describe("[DEPRECATED - IGNORED] Individual git worktrees per specialist are discontinued (TICKET-HARNESS-78). Every teammate operates in the shared checkout directory. Kept for backward compatibility only."),
           plan_approval: tool.schema.boolean().default(false).describe("Require teammate to send a plan for approval before writing files (default: false)"),
           standby: tool.schema.boolean().default(false).describe("Register the teammate WITHOUT sending its init prompt (zero tokens at birth). Stored as ready/standby with the full prompt in spawn_context; woken with the context prepended by the first team_message/team_broadcast (default: false)"),
           role: tool.schema.enum(["sdet", "qa", "member"]).optional().describe("Teammate role: 'sdet' marks the deterministic-test engineer (exclusive per room, persists role='sdet'; also auto-detected for agent 'hugo'), 'qa' marks the Quality Gate reviewer (exclusive per room, persists is_qa=1), 'member' is a regular teammate (default: auto-detect from agent/persona)"),

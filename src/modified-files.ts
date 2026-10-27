@@ -287,6 +287,7 @@ export function recordShellDiff(
   teamId: string,
   baseline: RepoSnapshot | null,
   current: RepoSnapshot | null,
+  taskId?: string | null,
 ): string[] {
   if (!current) return []
   const before = baseline && baseline.root === current.root ? baseline.entries : new Map<string, string>()
@@ -306,7 +307,7 @@ export function recordShellDiff(
       `modified-file:shell-truncated team=${teamId} touched=${touched.length} recorded=${limited.length} max=${MAX_SHELL_LEDGER_FILES}`,
     )
   }
-  for (const abs of limited) recordModifiedFile(db, teamId, abs)
+  for (const abs of limited) recordModifiedFile(db, teamId, abs, taskId)
   return limited
 }
 
@@ -321,19 +322,67 @@ export function normalizeModifiedPath(filePath: string): string {
 }
 
 /**
+ * Resolve the card a member's edit belongs to, when the ledger can attribute it
+ * unambiguously (TICKET-HARNESS-82). Precedence:
+ *
+ *   1. the member's OWN card in `in_progress` (the normal implementation path);
+ *   2. the room's ONLY card in `in_progress` (sequential bench handover: the
+ *      card is being worked on by the room as a whole);
+ *   3. the room's ONLY card in `in_review` (SDET writing the deterministic
+ *      suite, or a review-driven fix — the card under review owns those edits).
+ *
+ * When more than one card is active the context is ambiguous, so the row stays
+ * unattributed (`task_id = NULL`) and the auto-commit's safe fallback covers it.
+ * Never throws: a ledger attribution failure must never break a tool call.
+ */
+function activeTaskIdForMember(db: Database, teamId: string, memberName?: string): string | null {
+  try {
+    if (memberName) {
+      const own = db.query(
+        "SELECT id FROM team_task WHERE team_id = ? AND assignee = ? AND status = 'in_progress' ORDER BY time_updated DESC LIMIT 1",
+      ).get(teamId, memberName) as { id: string } | null
+      if (own?.id) return own.id
+    }
+    const active = db.query(
+      "SELECT id FROM team_task WHERE team_id = ? AND status = 'in_progress' ORDER BY time_updated DESC LIMIT 2",
+    ).all(teamId) as Array<{ id: string }>
+    if (active.length === 1) return active[0]?.id ?? null
+    const reviewing = db.query(
+      "SELECT id FROM team_task WHERE team_id = ? AND status = 'in_review' ORDER BY time_updated DESC LIMIT 2",
+    ).all(teamId) as Array<{ id: string }>
+    if (reviewing.length === 1) return reviewing[0]?.id ?? null
+    return null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Record one modified file for a team (INSERT ... ON CONFLICT DO UPDATE so a
  * re-edit refreshes time_created without duplicating the row).
+ *
+ * TICKET-HARNESS-82 — `taskId` persists the card partition. A non-NULL binding
+ * always wins; an edit with no task context (NULL) preserves the previous
+ * binding instead of erasing it (`COALESCE`), so a file keeps belonging to its
+ * card when the same file is touched again outside a card context.
  *
  * Exported for deterministic tests (the SDET suite drives the REAL dist
  * bundle and calls this directly to seed the ledger before exercising the
  * auto-commit). Production callers reach it via recordFileFromToolCall.
  */
-export function recordModifiedFile(db: Database, teamId: string, filePath: string): void {
+export function recordModifiedFile(
+  db: Database,
+  teamId: string,
+  filePath: string,
+  taskId?: string | null,
+): void {
   const normalized = normalizeModifiedPath(filePath)
   db.run(
-    `INSERT INTO team_modified_file (team_id, file_path, time_created) VALUES (?, ?, ?)
-     ON CONFLICT(team_id, file_path) DO UPDATE SET time_created = excluded.time_created`,
-    [teamId, normalized, Date.now()],
+    `INSERT INTO team_modified_file (team_id, file_path, task_id, time_created) VALUES (?, ?, ?, ?)
+     ON CONFLICT(team_id, file_path) DO UPDATE SET
+       time_created = excluded.time_created,
+       task_id = COALESCE(excluded.task_id, team_modified_file.task_id)`,
+    [teamId, normalized, taskId ?? null, Date.now()],
   )
 }
 
@@ -403,15 +452,17 @@ export function recordFileFromToolCall(
     if (SHELL_TOOLS.has(tool)) {
       const teamInfo = findTeamBySession(db, registry, sessionId)
       if (!teamInfo) return
+      const taskId = activeTaskIdForMember(db, teamInfo.teamId, teamInfo.memberName)
       const snapshots = consumeShellBaseline(db, registry, sessionId, tool, args, workspaceDir, callId)
       if (!snapshots) return
       if (!snapshots.baseline) {
         log(`modified-file:shell-baseline-missing team=${teamInfo.teamId} tool=${tool}`)
         return
       }
-      const recorded = recordShellDiff(db, teamInfo.teamId, snapshots.baseline, snapshots.current)
+      const recorded = recordShellDiff(db, teamInfo.teamId, snapshots.baseline, snapshots.current, taskId)
       log(
         `modified-file:shell-recorded team=${teamInfo.teamId} tool=${tool} files=${recorded.length}` +
+          (taskId ? ` task=${taskId}` : "") +
           (recorded.length > 0 ? ` first=${recorded[0]}` : ""),
       )
       return
@@ -424,8 +475,12 @@ export function recordFileFromToolCall(
     const teamInfo = findTeamBySession(db, registry, sessionId)
     if (!teamInfo) return
 
-    recordModifiedFile(db, teamInfo.teamId, filePath)
-    log(`modified-file:recorded team=${teamInfo.teamId} tool=${tool} file=${normalizeModifiedPath(filePath)}`)
+    const taskId = activeTaskIdForMember(db, teamInfo.teamId, teamInfo.memberName)
+    recordModifiedFile(db, teamInfo.teamId, filePath, taskId)
+    log(
+      `modified-file:recorded team=${teamInfo.teamId} tool=${tool} file=${normalizeModifiedPath(filePath)}` +
+        (taskId ? ` task=${taskId}` : ""),
+    )
   } catch (err) {
     // Fail-graceful: a ledger error must never break the tool call.
     log(`modified-file:record-failed tool=${tool} err=${err instanceof Error ? err.message : String(err)}`)
@@ -435,8 +490,22 @@ export function recordFileFromToolCall(
 /**
  * List every file a room touched, normalized absolute paths, newest first.
  * Exported for the auto-commit filter and for deterministic tests.
+ *
+ * TICKET-HARNESS-82 — when `taskId` is provided the result is STRICTLY the
+ * files bound to that card (WHERE task_id = ?); without it the whole room
+ * ledger is returned (legacy behaviour, also the auto-commit safe fallback).
  */
-export function listModifiedFiles(db: Database, teamId: string): string[] {
+export function listModifiedFiles(
+  db: Database,
+  teamId: string,
+  taskId?: string | null,
+): string[] {
+  if (taskId) {
+    const rows = db.query(
+      "SELECT file_path FROM team_modified_file WHERE team_id = ? AND task_id = ? ORDER BY time_created DESC",
+    ).all(teamId, taskId) as Array<{ file_path: string }>
+    return rows.map((r) => r.file_path)
+  }
   const rows = db.query(
     "SELECT file_path FROM team_modified_file WHERE team_id = ? ORDER BY time_created DESC",
   ).all(teamId) as Array<{ file_path: string }>

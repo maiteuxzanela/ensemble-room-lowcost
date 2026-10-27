@@ -694,9 +694,9 @@ check(
 );
 check(
   "paridade M7: auto-commit aparece ANTES do bloco de wake do board (src e dist)",
-  srcTasksComplete.indexOf("autoCommitApprovedTask(deps, teamInfo.teamId, task.content)") <
+  srcTasksComplete.indexOf("autoCommitApprovedTask(deps, teamInfo.teamId, task.content, task.id)") <
     srcTasksComplete.indexOf("tasks-complete:wake-lead:sent") &&
-    distRaw.indexOf("autoCommitApprovedTask(deps, teamInfo.teamId, task.content)") <
+    distRaw.indexOf("autoCommitApprovedTask(deps, teamInfo.teamId, task.content, task.id)") <
     distRaw.indexOf("tasks-complete:wake-lead:sent"),
   "",
 );
@@ -729,7 +729,7 @@ check(
 // PROVA DE MUTAÇÃO: patch determinístico no bundle dist + reexecução cirúrgica.
 // ---------------------------------------------------------------------------
 const moveCommitAfterWake = (raw) => {
-  const block = '\n  let commitSuffix = "";\n  if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {\n    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content);\n  }\n';
+  const block = '\n  let commitSuffix = "";\n  if (teamInfo.role === "lead" || isQAMember(deps.db, teamInfo.teamId, caller)) {\n    commitSuffix = await autoCommitApprovedTask(deps, teamInfo.teamId, task.content, task.id);\n  }\n';
   const i = raw.indexOf(block);
   if (i < 0) return raw;
   const without = raw.slice(0, i) + raw.slice(i + block.length);

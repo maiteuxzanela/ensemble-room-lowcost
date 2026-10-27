@@ -25,7 +25,9 @@
  *         • cada arquivo atribuído ao repo MAIS FUNDO que o contém;
  *         • gitlink aninhado preservado (os dois status terminam limpos);
  *         • sujo FORA do ledger NUNCA entra no commit (cirúrgico).
- *       Mensagem posicional `feat(runtime): <task.content>`, nunca push.
+ *       Mensagem posicional `feat(runtime): <task.content>` (TICKET-HARNESS-82:
+ *       título enxuto ≤ 100 chars na primeira linha + corpo estruturado
+ *       opcional), nunca push.
  *       Contratos: guarda "o dir precisa SER o toplevel do repo" (caminho
  *       aninhado é pulado), árvore limpa → "already clean", qualquer falha de
  *       git é engolida (nunca quebra a transição SQLite), gating estrito a
@@ -657,8 +659,8 @@ const MUTATIONS = [
   {
     id: "M5",
     desc: "mensagem de commit adulterada (conteúdo do card perdido)",
-    from: "const message = `feat(runtime): ${taskContent}`;",
-    to: "const message = `feat(runtime): TAMPERED`;",
+    from: "const message = formatCardCommitMessage(title, taskId, fileCount)",
+    to: "const message = `feat(runtime): TAMPERED`",
     detect: ["AC1.commit-message-exact", "AC5.lead-commit-message", "AC9.injection-message-exact"],
     unaffected: ["AC1.commit-suffix-hash-matches-head", "AC2.already-clean-message", "AC4.implementer-no-commit-suffix", "AC6.no-commit-suffix"],
   },

@@ -2,10 +2,10 @@
 /**
  * Runner determinístico das suítes do ensemble-room-lowcost.
  *
- * Executa as 54 suítes determinísticas do repositório em sequência estrita
+ * Executa as 55 suítes determinísticas do repositório em sequência estrita
  * (fail-report, sem aborte antecipado): cada arquivo listado em SUITES roda
  * até o fim mesmo que um anterior falhe, e o relatório consolidado final
- * agrega PASS/FAIL de todas elas. Total atual: 54 arquivos de teste
+ * agrega PASS/FAIL de todas elas. Total atual: 55 arquivos de teste
  * (milhares de verificações, zero mocks).
  *
  * As 3 suítes históricas seguem sendo o núcleo das 5 blindagens e re-executam
@@ -94,6 +94,8 @@ const SUITES = [
   { file: "test_release_15_wake_model_binding.mjs", label: "RELEASE-15 (Wake de lead com modelo BOUND explícito: board closure agent+model via session.get, variante default normalizada, decision_lead idêntico, mensagem durável consumida pelo system prompt após falha do wake, ladder sem chain[0] como rung 0 + prova de mutação M1-M3; SQLite real, dist+src)" },
   { file: "test_release_11_standby_lifecycle.mjs", label: "RELEASE-11 (Ciclo de vida Standby/Wake: retry longo → 'throttled' Migration 20 com 1 aviso ao lead e liberação busy/idle, ledger de rungs mortos por paywall nunca re-selecionados (sala+isolado) — inclui B7 de restart de cadeia —, guarda de um-escritor em checkout compartilhado com deferred delivered=0 e flush no release do bastão; SQLite real, dist+src)" },
   { file: "test_release_17_standby_pause.mjs", label: "RELEASE-17 (Standby que pausa: abort determinístico pós-resultado via setImmediate no caller, absorção wording-agnostic do abort intencional em handleSessionErrorEvent, loop-breaker estreito no 3º team_standby com reset por qualquer outra tool, pausa do transmissor no handover sem perder o wake do receptor, abort fire-and-forget, watchdog sem checkStalled/TTL e checkRoomInactivity intacto; SQLite real, dist+src, prova de mutação M17a-M17f)" },
+  { file: "test_ticket_harness_82_ledger_partition.mjs", label: "HARNESS-82/87-Item3 (Ledger de auto-commit PARTICIONADO por task_id: Migration 21 declarativa nullable + retrocompat v20, recordModifiedFile/listModifiedFiles(taskId) com filtro estrito e atribuição pelo hook, autoCommitApprovedTask por card com fallback seguro e mensagem enxuta ≤100 chars; SQLite real, git real em sandbox, paridade src↔dist e anti-mock)" },
+  { file: "test_ticket_harness_78_shared_checkout.mjs", label: "HARNESS-78 (Expurgar worktrees individuais: spawn NUNCA chama worktree.create/workspace.create mesmo com worktree:true explícito ou omitido, colunas worktree_dir/branch/workspace_id NULL no SQLite, prompt declara checkout compartilhado + handover, schema V1/V2 mantém worktree deprecado [DEPRECATED - IGNORED], helper isWorktreeDirectory removido, read-only sem worktree, paridade src↔dist e 4 mutantes)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

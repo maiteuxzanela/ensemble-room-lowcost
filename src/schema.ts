@@ -428,8 +428,27 @@ export const MIGRATIONS: string[] = [
    INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, time_created, time_updated, worktree_dir, worktree_branch, plan_approval, workspace_id, reported_to_lead, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message, spawn_context, is_qa, role)
      SELECT team_id, name, session_id, agent, status, execution_status, model, prompt, time_created, time_updated, worktree_dir, worktree_branch, plan_approval, workspace_id, reported_to_lead, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message, spawn_context, is_qa, role FROM team_member_old_m20;
    DROP TABLE team_member_old_m20;
-   CREATE INDEX IF NOT EXISTS team_member_session_idx ON team_member(session_id);
-   CREATE INDEX IF NOT EXISTS team_member_status_idx ON team_member(team_id, status);`,
+    CREATE INDEX IF NOT EXISTS team_member_session_idx ON team_member(session_id);
+    CREATE INDEX IF NOT EXISTS team_member_status_idx ON team_member(team_id, status);`,
+  // Migration 21 (TICKET-HARNESS-82 / TICKET-HARNESS-87 Item 3): partition the
+  // room's modified-file ledger PER CARD. `task_id` binds a recorded file to the
+  // card that was being worked on when the edit happened, so the Portão 1
+  // auto-commit of one approved card no longer sweeps the files of sibling
+  // cards that are still in progress.
+  //
+  // NULLABILITY IS INTENTIONAL (retrocompatibilidade): existing rows and every
+  // edit made with no unambiguous task context (lead edits, tool calls outside
+  // a card) keep `task_id = NULL`. `autoCommitApprovedTask` treats those rows as
+  // the safe fallback when the completed card has no file of its own, so a
+  // legitimate edit is never orphaned.
+  //
+  // Additive-only (same non-negotiable as Migrations 9-11/14/15/16/17/18):
+  // nullable TEXT column on the existing table, no CHECK constraint, no rebuild
+  // of team_modified_file (its PRIMARY KEY (team_id, file_path) is preserved —
+  // re-editing the same file refreshes the row in place and the latest
+  // non-NULL task binding wins, see recordModifiedFile).
+  `ALTER TABLE team_modified_file ADD COLUMN task_id TEXT;
+   CREATE INDEX IF NOT EXISTS team_modified_file_task_idx ON team_modified_file(team_id, task_id);`,
 ]
 
 /**
