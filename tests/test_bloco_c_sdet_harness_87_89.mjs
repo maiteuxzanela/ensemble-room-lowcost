@@ -48,6 +48,12 @@
  * SEM MOCKS: subprocessos reais (node/bun/npm/tar), YAML real do Bun,
  * tarball real do npm, resolvedor real do Node, arquivos reais.
  *
+ * AMBIENTE DEGRADADO (CI): no GitHub Actions só ensemble-room-lowcost é
+ * clonado (sem o irmão ../opencode_repo) e `bun` não está no PATH. Nesse caso
+ * as seções A (HOME), C (pins via Bun.YAML/verificador) e D3 (suíte entregue
+ * de pins) emitem SKIP gracioso — exit 0, jamais FAIL. A seção B (exports do
+ * pacote publicado) permanece 100% ativa e hermética em qualquer ambiente.
+ *
  * Uso: node tests/test_bloco_c_sdet_harness_87_89.mjs
  * Exit: 0 = todos os checks PASS; 1 = há FAIL.
  */
@@ -82,6 +88,21 @@ const DELIVERED_HOME_TEST = path.join(OPENCODE, "packages", "core", "test", "bui
 const DELIVERED_EXPORTS_TEST = path.join(ENSEMBLE, "tests", "test_ticket_harness_87_exports.mjs");
 const DELIVERED_PINS_TEST = path.join(ENSEMBLE, "tests", "test_ticket_harness_89_node_pins.mjs");
 
+// ---------------------------------------------------------------------------
+// Detecção de ambiente (tratamento canônico de test_ticket_harness_89_node_pins.mjs).
+// No GitHub Actions apenas o repositório ensemble-room-lowcost é clonado (o
+// repositório irmão ../opencode_repo NÃO existe) e o binário `bun` pode não
+// estar no PATH (o runner provê apenas Node 22/24). As seções que dependem de
+// opencode_repo/bun degradam para SKIP gracioso — nunca FAIL.
+// ---------------------------------------------------------------------------
+const bunProbe = spawnSync("bun", ["--version"], { encoding: "utf8" });
+const hasBun = bunProbe.status === 0 && /\d+\.\d+\.\d+/.test(bunProbe.stdout ?? "");
+const hasOpencodeRepo =
+  existsSync(OPENCODE) &&
+  existsSync(ENSEMBLE_TS) &&
+  existsSync(SETUP_BUN) &&
+  existsSync(VERIFIER);
+
 const results = [];
 const skips = [];
 const check = (name, ok, detail = "") => {
@@ -104,6 +125,12 @@ process.on("exit", () => rmSync(TMP, { recursive: true, force: true }));
  * ===================================================================== */
 console.log("\n=== A. HARNESS-87 Item 1: fallback de HOME ===");
 
+if (!hasBun || !existsSync(ENSEMBLE_TS)) {
+  skip(
+    "A. HARNESS-87 Item 1 (fallback de HOME)",
+    "opencode_repo ou bun indisponível no ambiente",
+  );
+} else {
 const HOME_PROBE = path.join(TMP, "home-probe.mjs");
 writeFileSync(
   HOME_PROBE,
@@ -325,6 +352,7 @@ try {
     `sha256=${ensembleHash.slice(0, 16)}…`,
   );
 }
+} // fim da seção A condicionada a opencode_repo + bun
 
 /* ===================================================================== *
  * B. HARNESS-87 / Item 2 — exports publicados (tarball REAL do npm)
@@ -462,6 +490,14 @@ check(
  * ===================================================================== */
 console.log("\n=== C. HARNESS-89: pins de Node ===");
 
+if (!hasBun || !hasOpencodeRepo) {
+  skip(
+    "C. HARNESS-89 (pins de Node via Bun.YAML + verificador real)",
+    !hasBun
+      ? "binário `bun` ausente no PATH (Bun.YAML indisponível)"
+      : "opencode_repo indisponível no ambiente (setup-bun/verificador ausentes)",
+  );
+} else {
 const YAML_PROBE = path.join(TMP, "yaml-probe.mjs");
 writeFileSync(
   YAML_PROBE,
@@ -574,6 +610,7 @@ check(
   `exit=${c8.status}`,
 );
 writeFileSync(mutPublish, publishOrig);
+} // fim da seção C condicionada a opencode_repo + bun
 
 /* ===================================================================== *
  * D. Anti-mock + integração das suítes entregues
@@ -597,12 +634,19 @@ check(
   delivered87.status === 0 && /all checks passed/.test(delivered87.stdout ?? ""),
   `exit=${delivered87.status}`,
 );
-const delivered89 = run(process.execPath, [DELIVERED_PINS_TEST], { cwd: ENSEMBLE });
-check(
-  "D3 suíte entregue HARNESS-89 (pins) verde: 12/12 sem skip",
-  delivered89.status === 0 && /12\/12 checks passed, 0 skipped/.test(delivered89.stdout ?? ""),
-  `exit=${delivered89.status}`,
-);
+if (!hasBun || !hasOpencodeRepo) {
+  skip(
+    "D3 suíte entregue HARNESS-89 (pins) verde: 12/12 sem skip",
+    "opencode_repo ou bun indisponível no ambiente",
+  );
+} else {
+  const delivered89 = run(process.execPath, [DELIVERED_PINS_TEST], { cwd: ENSEMBLE });
+  check(
+    "D3 suíte entregue HARNESS-89 (pins) verde: 12/12 sem skip",
+    delivered89.status === 0 && /12\/12 checks passed, 0 skipped/.test(delivered89.stdout ?? ""),
+    `exit=${delivered89.status}`,
+  );
+}
 
 /* ===================================================================== *
  * Relatório
