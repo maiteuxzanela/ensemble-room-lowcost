@@ -270,21 +270,21 @@ const srcAll = () => [srcComplete, srcWatchdog, srcSpawn, srcNotify].join("\n");
     "paridade F2 (dist): wrapper notifyLead repassa { config } condicionalmente",
     /this\.config \? \{ config: this\.config \} : \{\}/.test(distRaw),
   );
-  // TICKET-HARNESS-34 (A1): o wrapper ganhou o 3º parâmetro forceWake (só o
-  // timeout o usa — stall/chatty são ruído não-fatal e ficam silenciados).
+  // TICKET-RELEASE-17: o caminho de timeout foi removido, e com ele o
+  // forceWake do watchdog. O wrapper permanece model-aware e silencioso.
   check(
-    "paridade HARNESS-34 (src): wrapper notifyLead aceita forceWake (timeout)",
-    /notifyLead\(teamId: string, message: string, forceWake = false\)/.test(srcWatchdog) &&
-      /\.\.\.\(forceWake \? \{ forceWake: true \} : \{\}\)/.test(srcWatchdog),
+    "RELEASE-17 (src): wrapper notifyLead SEM forceWake (timeout removido)",
+    /private notifyLead\(teamId: string, message: string\): void/.test(srcWatchdog) &&
+      !/forceWake/.test(srcWatchdog),
   );
   check(
-    "paridade HARNESS-34 (dist): wrapper notifyLead aceita forceWake (timeout)",
-    /forceWake \? \{ forceWake: true \} : \{\}/.test(distRaw),
+    "RELEASE-17 (dist): bundle sem o wrapper forceWake do watchdog",
+    !/notifyLead\([^)]*forceWake = false\)/.test(distRaw),
   );
   const countCalls = (text) => (text.match(/this\.notifyLead\(/g) ?? []).length;
   check(
-    "paridade F2: exatamente 3 call sites this.notifyLead( (stall, chatty, timeout)",
-    countCalls(srcWatchdog) === 3 && countCalls(distRaw) === 3,
+    "paridade F2: exatamente 1 call site this.notifyLead( (chatty)",
+    countCalls(srcWatchdog) === 1 && countCalls(distRaw) === 1,
     `src=${countCalls(srcWatchdog)} dist=${countCalls(distRaw)}`,
   );
 }
@@ -499,132 +499,67 @@ async function runBehavior(label, mods) {
    * B) [F2] watchdog.ts — wrapper notifyLead com config               *
    * ================================================================ */
 
-  /* --- B1: timeout COM config → degrau 0 nativo + STEP-DOWN na rejeição --- */
+  /* --- B1 (RELEASE-17): nenhum abort por tempo --- */
   {
-    const f = scenario("f2_wd_timeout_cfg");
+    const f = scenario("f2_wd_no_timeout");
     const LEAD = "ses_wd1_lead";
     seedTeam(f.db, "team_wd1", LEAD, "dante");
-    seedMember(f.db, "team_wd1", "wd1", "ses_wd1_m1", { status: "busy", exec: "running", time: Date.now() - 600_000 });
+    // Membro busy com time_updated de 10h atrás + card in_progress: exatamente o
+    // caso que o TTL antigo matava (field evidence: abort 19s após iniciar uma
+    // espera deliberada de 8,5 min).
+    seedMember(f.db, "team_wd1", "wd1", "ses_wd1_m1", { status: "busy", exec: "running", time: Date.now() - 10 * 3600_000 });
+    f.db.run(
+      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, rejection_count, time_created, time_updated) VALUES (?,?,?,?,'high',?,0,?,?)",
+      ["t_wd1", "team_wd1", "long running work", "in_progress", "wd1", Date.now(), Date.now()],
+    );
 
     const wd = new Watchdog({
       db: f.db, client: f.client, registry: f.registry,
-      ttlMs: 60_000, progressTracker: f.progressTracker,
-      stallThresholdMs: 0, peerMessageLimit: 0, roomInactivityThresholdMs: 0,
+      progressTracker: f.progressTracker,
+      peerMessageLimit: 0, roomInactivityThresholdMs: 0,
       config: CFG,
-      // cwd omitido → preserveBranch fora de jogo (nenhum worktree no fixture)
     });
-    // TICKET-32B: a 1ª tentativa (nativa) do LEAD é rejeitada pelo transporte
-    // (ex.: 429) — é a REJEIÇÃO, e não o wake, que caminha a escada.
-    f.failOnce.add(LEAD);
     const base = f.calls.promptAsync.length;
     await withHome(f.root, () => wd.check());
     await tick();
-    const wakes = f.leadWakes(LEAD, base);
-    check(
-      `[${label}] B1 timeout COM config + rejeição: EXATAMENTE 2 tentativas (nativo → cadeia)`,
-      wakes.length === 2,
-      `delta=${wakes.length}`,
-    );
-    check(
-      `[${label}] B2 timeout: agent 'dante' explícito em TODOS os degraus`,
-      wakes.length === 2 && wakes.every((w) => w.agent === "dante"),
-      JSON.stringify(wakes.map((w) => w.agent)),
-    );
-    check(
-      `[${label}] B3 degrau 0 preserva o modelo NATIVO da sessão (sem chave 'model')`,
-      !("model" in wakes[0]),
-      wakes[0] ? Object.keys(wakes[0]).join(",") : "sem wake",
-    );
-    check(
-      `[${label}] B3b STEP-DOWN: degrau 1 usa o 1º fallback da cadeia dante`,
-      eq(wakes[1]?.model, DANTE1),
-      JSON.stringify(wakes[1]?.model),
-    );
-    check(
-      `[${label}] B4 timeout: texto de wake do notifyLead + synthetic`,
-      wakes[0]?.parts?.[0]?.text === "[System: New team message from system]" && wakes[0]?.synthetic === true,
-      JSON.stringify(wakes[0]?.parts?.[0]?.text),
-    );
     const row = f.db.query("SELECT status, execution_status FROM team_member WHERE team_id=? AND name=?").get("team_wd1", "wd1");
     check(
-      `[${label}] B5 membro transiciona error/timed_out`,
-      row?.status === "error" && row?.execution_status === "timed_out",
+      `[${label}] B1 busy há 10h: permanece busy/running (sem abort por tempo)`,
+      row?.status === "busy" && row?.execution_status === "running",
       `${row?.status}/${row?.execution_status}`,
     );
-    check(`[${label}] B6 session.abort disparado contra o membro`, f.calls.abort.some((a) => a.sessionID === "ses_wd1_m1"), JSON.stringify(f.calls.abort.map((a) => a.sessionID)));
+    check(`[${label}] B2 busy há 10h: session.abort NÃO chamado`, f.calls.abort.length === 0, JSON.stringify(f.calls.abort.map((a) => a.sessionID)));
+    const task = f.db.query("SELECT status FROM team_task WHERE id='t_wd1'").get();
+    check(`[${label}] B3 card in_progress NÃO é devolvido ao pool`, task?.status === "in_progress", String(task?.status));
     const sys = f.db.query("SELECT content FROM team_message WHERE team_id=? AND from_name='system'").all("team_wd1");
-    check(`[${label}] B7 mensagem 'timed out' persistida para o lead`, sys.some((m) => m.content.includes("timed out")), sys[0]?.content.slice(0, 60) ?? "(vazia)");
-    check(`[${label}] B8 toast de timeout disparado`, f.calls.toast.some((t) => String(t.message).includes("timed out")), `toast=${f.calls.toast.length}`);
+    check(`[${label}] B4 nenhuma mensagem de timeout ao lead`, !sys.some((m) => m.content.includes("timed out")), `rows=${sys.length}`);
+    check(`[${label}] B5 nenhum toast de timeout`, !f.calls.toast.some((t) => String(t.message).includes("timed out")), `toast=${f.calls.toast.length}`);
+    check(`[${label}] B6 nenhum wake do lead`, f.leadWakes(LEAD, base).length === 0, `delta=${f.calls.promptAsync.length - base}`);
+    check(`[${label}] B7 checkStalled removido da classe`, typeof wd.checkStalled === "undefined");
     f.close();
   }
 
-  /* --- B2: timeout SEM config → 1 tentativa nativa (sem escada) --- */
+  /* --- B3 (RELEASE-17): sweep de stall removido — nenhum nudge/wake por steps --- */
   {
-    const f = scenario("f2_wd_timeout_nocfg");
-    const LEAD = "ses_wd2_lead";
-    seedTeam(f.db, "team_wd2", LEAD, "dante");
-    seedMember(f.db, "team_wd2", "wd2", "ses_wd2_m1", { status: "busy", exec: "running", time: Date.now() - 600_000 });
-
-    const wd = new Watchdog({
-      db: f.db, client: f.client, registry: f.registry,
-      ttlMs: 60_000, progressTracker: f.progressTracker,
-      stallThresholdMs: 0, peerMessageLimit: 0, roomInactivityThresholdMs: 0,
-      // config OMITIDO — degrada para o wake legado (assinatura retrocompatível)
-    });
-    // Mesma rejeição de transporte do B1 — SEM config não há degrau seguinte,
-    // então a escada reativa prova ser exatamente o `config` threading (32B-2).
-    f.failOnce.add(LEAD);
-    const base = f.calls.promptAsync.length;
-    await withHome(f.root, () => wd.check());
-    await tick();
-    const wakes = f.leadWakes(LEAD, base);
-    check(
-      `[${label}] B9 timeout SEM config + rejeição: EXATAMENTE 1 tentativa (nenhum retry sem config)`,
-      wakes.length === 1,
-      `delta=${wakes.length}`,
-    );
-    check(
-      `[${label}] B10 contraste: SEM config o wake é modelless (sem chave 'model'), agent segue explícito`,
-      wakes.length === 1 && !("model" in wakes[0]) && wakes[0]?.agent === "dante",
-      wakes[0] ? JSON.stringify({ model: "model" in wakes[0] ? wakes[0].model : "(ausente)", agent: wakes[0].agent }) : "sem wake",
-    );
-    f.close();
-  }
-
-  /* --- B3: stall COM config → notifyLead model-aware + nudge ao membro --- */
-  {
-    const f = scenario("f2_stall_cfg");
+    const f = scenario("f2_stall_removed");
     const LEAD = "ses_st1_lead";
     seedTeam(f.db, "team_st1", LEAD, "dante");
     seedMember(f.db, "team_st1", "st1", "ses_st1_m1", { status: "busy", exec: "running" });
-    for (let i = 0; i < 3; i++) f.progressTracker.recordStep("ses_st1_m1", 0); // 3 steps < 500 tokens
+    for (let i = 0; i < 3; i++) f.progressTracker.recordStep("ses_st1_m1", 0);
 
     const wd = new Watchdog({
       db: f.db, client: f.client, registry: f.registry,
-      ttlMs: 0, progressTracker: f.progressTracker,
-      stallThresholdMs: 300_000, stallMinSteps: 3, stallTokenThreshold: 500,
+      progressTracker: f.progressTracker,
       peerMessageLimit: 0, roomInactivityThresholdMs: 0,
-      // TICKET-HARNESS-34 (A1): o cenário isola a ESCADA de modelo — com o
-      // default silentLead:true o wake de stall é (corretamente) suprimido.
-      // silentLead:false mantém o foco no degrau nativo → cadeia.
       config: { ...CFG, silentLead: false },
     });
     const base = f.calls.promptAsync.length;
-    await wd.checkStalled();
+    await wd.check();
     await tick();
-    const wakes = f.leadWakes(LEAD, base);
-    check(`[${label}] B11 stall COM config: wake do lead 1x`, wakes.length === 1, `delta=${wakes.length}`);
-    check(
-      `[${label}] B12 stall: degrau 0 NATIVO (sem chave 'model') + agent 'dante'`,
-      wakes[0]?.agent === "dante" && !("model" in wakes[0]),
-      JSON.stringify({ agent: wakes[0]?.agent, model: "model" in (wakes[0] ?? {}) ? wakes[0].model : "(nativo)" }),
-    );
-    const nudges = f.calls.promptAsync.slice(base).filter((c) => c.sessionID === "ses_st1_m1");
-    check(`[${label}] B13 stall: nudge ao membro disparado 1x`, nudges.length === 1, `nudges=${nudges.length}`);
-    const nudged = f.db.query("SELECT last_nudged_at FROM team_member WHERE team_id=? AND name=?").get("team_st1", "st1");
-    check(`[${label}] B14 stall: last_nudged_at persistido`, typeof nudged?.last_nudged_at === "number" && nudged.last_nudged_at > 0, String(nudged?.last_nudged_at));
+    check(`[${label}] B11 steps de baixo token NÃO geram nudge ao membro`, f.calls.promptAsync.slice(base).filter((c) => c.sessionID === "ses_st1_m1").length === 0);
+    check(`[${label}] B12 steps de baixo token NÃO acordam o lead`, f.leadWakes(LEAD, base).length === 0);
     const sys = f.db.query("SELECT content FROM team_message WHERE team_id=? AND from_name='system'").all("team_st1");
-    check(`[${label}] B15 stall: mensagem 'appears stalled' persistida`, sys.some((m) => m.content.includes("appears stalled")), sys[0]?.content.slice(0, 60) ?? "(vazia)");
+    check(`[${label}] B13 nenhuma mensagem 'appears stalled' persistida`, !sys.some((m) => m.content.includes("appears stalled")));
     f.close();
   }
 

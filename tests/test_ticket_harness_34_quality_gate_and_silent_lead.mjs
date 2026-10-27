@@ -574,7 +574,10 @@ check(
 );
 check(
   "paridade A2: filtro invoca isAbortError antes do notify (src E dist)",
-  /if \(isAbortError\(error\)\)/.test(srcHooks) && /if \(isAbortError\(error\)\)/.test(distRaw),
+  // TICKET-RELEASE-17: o gate aceita também o marcador de abort INTENCIONAL
+  // (team_standby / team_task_handover encerram o turno pelo runtime).
+  /if \(isAbortError\(error\) \|\| intentionalAbort\)/.test(srcHooks) &&
+    /if \(isAbortError\(error\) \|\| intentionalAbort\)/.test(distRaw),
 );
 check(
   "paridade A1: gate silencioso notifyLead:silent em src E dist",
@@ -588,14 +591,18 @@ check(
   srcNotify.match(/options\?\.config !== (?:undefined|void 0)[^\n]*/)?.[0] ?? "(ausente)",
 );
 check(
-  "paridade A1: forceWake presente em hooks/notify/watchdog/team-spawn E dist",
-  [srcHooks, srcNotify, srcWatchdog, srcSpawn].every((s) => s.includes("forceWake")) && distRaw.includes("forceWake"),
+  // TICKET-RELEASE-17: o watchdog deixou de forçar wake (timeout removido);
+  // forceWake segue vivo apenas nas falhas irrecuperáveis (session.error e
+  // rollback de spawn).
+  "paridade A1: forceWake presente em hooks/notify/team-spawn E dist (não no watchdog)",
+  [srcHooks, srcNotify, srcSpawn].every((s) => s.includes("forceWake")) &&
+    !srcWatchdog.includes("forceWake") && distRaw.includes("forceWake"),
 );
 check(
-  "paridade A1: wrapper do watchdog ganha forceWake (timeout)",
-  /notifyLead\(teamId: string, message: string, forceWake = false\)/.test(srcWatchdog) &&
-    /\.\.\.\(forceWake \? \{ forceWake: true \} : \{\}\)/.test(srcWatchdog) &&
-    /forceWake \? \{ forceWake: true \} : \{\}/.test(distRaw),
+  "TICKET-RELEASE-17: wrapper do watchdog SEM forceWake (caminho de timeout removido)",
+  !/forceWake/.test(srcWatchdog) &&
+    !/notifyLead\([^)]*forceWake = false\)/.test(distRaw) &&
+    /private notifyLead\(teamId: string, message: string\): void/.test(srcWatchdog),
 );
 check(
   "paridade A2/A1: session.error genuíno repassa { config, forceWake: true } (src E dist)",
@@ -658,7 +665,8 @@ const MUTATIONS = [
   {
     id: "M4",
     desc: "filtro de abort do session.error removido (abort vira alarme falso)",
-    from: "if (isAbortError(error)) {",
+    // TICKET-RELEASE-17: o gate carrega também o marcador de abort intencional.
+    from: "if (isAbortError(error) || intentionalAbort) {",
     to: "if (false) {",
     detect: ["A2.7 abort-event-persists-nothing", "A2.8 abort-event-zero-wake", "A2.9 abort-message-only-filtered"],
     unaffected: ["A2.10 genuine-error-persists-row", "A2.11 genuine-error-force-wakes-through-silent", "A1.1 silent-suppresses-wake-persists-row", "A6.1 implementer-blocked-in-progress"],

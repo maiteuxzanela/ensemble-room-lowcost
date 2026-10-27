@@ -23,6 +23,7 @@ import { startDashboard, type DashboardServer } from "./dashboard"
 import { EnsembleRpc, emitMemberEvent, emitNoticeEvent } from "./v2-rpc"
 import { isWorktreeInstance } from "./util"
 import { Watchdog } from "./watchdog"
+import { noteToolCall, resetStandbyLoop } from "./standby-guard"
 import { vlog } from "./log"
 
 /** Structural subset of the REAL V2 setup context provided by the runtime. */
@@ -177,6 +178,13 @@ export async function setupEnsemble(
 
   const dispatch = async (event: V2EventLike): Promise<void> => {
     const transition = dispatchV2Event(db, registry, tracker, event, failoverCtx)
+    // TICKET-RELEASE-17 (F2): a fresh busy turn (message wake / spawn) breaks
+    // any consecutive-`team_standby` chain — the loop-breaker counts only
+    // repetitions inside the SAME turn.
+    if (transition?.to === "busy") {
+      const busyEntry = registry.getByName(transition.teamId, transition.memberName)
+      if (busyEntry) resetStandbyLoop(busyEntry.sessionId)
+    }
     // Idle-without-report nudge (parity with V1): a member that went idle
     // without ever messaging the lead gets ONE reminder to report via
     // team_message. Without this, weak models finish silently and the lead
@@ -286,6 +294,9 @@ export async function setupEnsemble(
   await ctx.tool.hook("execute.before", (raw) => {
     const input = raw as unknown as { tool: string; sessionID: string; input?: unknown; args?: unknown; callID?: string }
     checkToolIsolation(registry, tracker, input.tool, input.sessionID, db)
+    // TICKET-RELEASE-17 (F2): narrow standby repetition alarm — any tool other
+    // than team_standby breaks the consecutive chain (see src/standby-guard.ts).
+    noteToolCall(input.sessionID, input.tool)
     if (input.tool.startsWith("team_")) {
       if (!rateLimiter.tryConsume()) {
         return rateLimiter.waitForToken().then(() => undefined)
@@ -415,13 +426,8 @@ export async function setupEnsemble(
       db,
       client,
       registry,
-      ttlMs: config.timeoutMs,
       checkIntervalMs: 60 * 1000,
       progressTracker,
-      stallThresholdMs: config.stallThresholdMs,
-      stallMinSteps: config.stallMinSteps,
-      stallTokenThreshold: config.stallTokenThreshold,
-      cwd: ctx.location.directory,
       peerMessageLimit: config.peerMessageLimit,
       peerMessageWindowMs: config.peerMessageWindowMs,
       roomInactivityThresholdMs: config.roomInactivityThresholdMs,

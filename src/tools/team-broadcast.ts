@@ -66,6 +66,7 @@ export async function executeTeamBroadcast(
 
   const baseText = `[Team broadcast from ${senderName}]: ${args.text}`
   let skipped = 0
+  let deferred = 0
   for (const recipient of recipients) {
     if (!recipient.prompt) {
       // silentLead: the lead's row waits in SQLite for its next system prompt.
@@ -77,9 +78,21 @@ export async function executeTeamBroadcast(
     // transitions execution_status 'standby' -> 'starting'. The lead and every
     // non-standby member get the payload untouched; the wake carries the
     // member's `agent`, which spawn normally passes on the first promptAsync.
-    const wake: { text: string; woke: boolean; agent?: string } = recipient.name !== "lead"
-      ? resolveStandbyWake(deps.db, teamInfo.teamId, recipient.name, baseText)
+    //
+    // TICKET-RELEASE-11 (Frente C, OPT-IN sharedCheckoutSingleWriter): `blocked:
+    // true` = the formal-baton gate refused the wake (target and another
+    // shared-checkout member both hold in_progress cards). The fan-out row
+    // stays delivered=0 — replay is multi-trigger (re-send, idle, card
+    // completion, init recovery) with spawn_context; no promptAsync fires
+    // here (never an amnesia wake). Default flag OFF = pass-through.
+    const wake: { text: string; woke: boolean; agent?: string; blocked?: boolean } = recipient.name !== "lead"
+      ? resolveStandbyWake(deps.db, teamInfo.teamId, recipient.name, baseText, deps.config?.sharedCheckoutSingleWriter === true)
       : { text: baseText, woke: false }
+    if (wake.blocked) {
+      deferred++
+      log(`team_broadcast:deferred-shared-checkout to=${recipient.name} (formal dual card-holder — opt-in single-writer gate)`)
+      continue
+    }
 
     const memberModel = recipient.name !== "lead"
       ? getMemberModel(deps.db, teamInfo.teamId, recipient.name)
@@ -109,6 +122,7 @@ export async function executeTeamBroadcast(
     })
   }
 
-  const sent = recipients.length - skipped
-  return `Broadcast sent to ${sent} recipient${sent !== 1 ? "s" : ""}.`
+  const sent = recipients.length - skipped - deferred
+  const deferredNote = deferred > 0 ? ` (${deferred} deferred by the shared-checkout single-writer gate — delivered when the formal baton is released)` : ""
+  return `Broadcast sent to ${sent} recipient${sent !== 1 ? "s" : ""}${deferredNote}.`
 }

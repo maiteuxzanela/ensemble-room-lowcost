@@ -8,8 +8,10 @@ import { abortInflight } from "./v2-session"
 import { notifyLead } from "./notify"
 import { sendMessage } from "./messaging"
 import { releaseMemberTasks } from "./tasks"
+import { deliverDeferredStandbyWakes } from "./recovery"
 import { findTeamBySession } from "./types"
 import { isQAMember } from "./qa-role"
+import { consumeIntentionalAbort } from "./standby-guard"
 import { log } from "./log"
 
 const TEAM_TOOL_PREFIX = "team_"
@@ -63,8 +65,22 @@ export interface StatusTransition {
  * Returns the transition if one occurred, for toast notifications.
  *
  * `retryPayload` is only consulted when `status === "retry"` — it persists
- * the four additive retry_* columns (Fix 2) without changing `status`/
- * `execution_status` at all (Fix 1's non-goal: no FSM change).
+ * the four additive retry_* columns (Fix 2). TICKET-RELEASE-11 (Frente A)
+ * extends the retry branch: a retry whose SCHEDULED NEXT ATTEMPT lies beyond
+ * `config.paywallRetryThresholdMs` (default 1 h) is a paywall/out-of-quota
+ * stall, not a transient rate limit — the member flips to the VISIBLE
+ * 'throttled' state (Migration 20), nudges/checkChatty stay suppressed (they
+ * key on status='busy'/'ready'), and the lead receives EXACTLY ONE system
+ * notification (fired only on the transition INTO 'throttled', persisted
+ * passively under silentLead). When the provider unblocks, the next busy
+ * event releases 'throttled' → 'busy' (see the busy branch below) and the
+ * next idle event releases 'throttled' → 'ready' (the idle ternary already
+ * covers every non-shutdown status).
+ *
+ * `client`/`config` are OPTIONAL (retrocompatible): the HORIZON decision
+ * degrades to the documented 1 h default without config, so the FSM state
+ * stays truthful on every caller — but the lead notification (which needs a
+ * client) is skipped when absent, and no error is thrown either way.
  */
 export function handleSessionStatusEvent(
   db: Database,
@@ -72,6 +88,8 @@ export function handleSessionStatusEvent(
   sessionId: string,
   status: "idle" | "busy" | "retry",
   retryPayload?: RetryStatusPayload,
+  client?: PluginClient,
+  config?: Required<EnsembleConfig>,
 ): StatusTransition | undefined {
   const entry = registry.getBySession(sessionId)
   if (!entry) return undefined
@@ -96,6 +114,18 @@ export function handleSessionStatusEvent(
     if (newStatus === "shutdown") {
       releaseMemberTasks(db, entry.teamId, entry.memberName)
     }
+    // TICKET-RELEASE-11 (Frente C) — BATON RELEASE (one of the FOUR replay
+    // triggers, OPT-IN sharedCheckoutSingleWriter): this member just went
+    // idle, so their baton may have been released. Replay the standby wakes
+    // the formal-baton gate deferred (fire-and-forget — the flush only
+    // prompts members still in standby with queued delivered=0 rows; the
+    // gate re-evaluates per recipient and re-defers if another card-holder
+    // remains). With the default flag OFF this is a cheap no-op.
+    if (client) {
+      void deliverDeferredStandbyWakes(db, client, registry, entry.teamId, config?.sharedCheckoutSingleWriter === true).catch((err) => {
+        log(`status:baton-release-flush:failed team=${entry.teamId} err=${err instanceof Error ? err.message : String(err)}`)
+      })
+    }
     // Mark teammate as having reported if they sent at least one message to lead (issue #3).
     // Set on busy→ready transition so Q&A messages during work don't prematurely block delivery.
     if (member.status === "busy" && newStatus === "ready") {
@@ -111,7 +141,11 @@ export function handleSessionStatusEvent(
     }
     return { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: newStatus }
   } else if (status === "busy") {
-    if (member.status === "ready" || member.status === "error") {
+    // TICKET-RELEASE-11 (Frente A): 'throttled' joins ready/error as a valid
+    // SOURCE of the busy transition — a paywall-blocked member whose provider
+    // unblocked (retry succeeded / new turn started) must be released back to
+    // 'busy' instead of being frozen until an idle event.
+    if (member.status === "ready" || member.status === "error" || member.status === "throttled") {
       // Reset reported_to_lead so re-activated teammates can receive messages again (issue #3).
       // INVARIANT: every promptAsync delivery path must check hasReportedCompletion() to prevent loops.
       db.run(
@@ -142,6 +176,16 @@ export function handleSessionStatusEvent(
     // — status/execution_status are untouched, and there is no "provider
     // throttled" language baked in here: the SDK's retry status is generic,
     // so we surface whatever action.message/status.message actually says.
+    //
+    // TICKET-RELEASE-11 (Frente A): on TOP of the retry_* persistence, a
+    // retry whose scheduled next attempt (`retryPayload.next`, absolute
+    // epoch-ms) lies BEYOND `config.paywallRetryThresholdMs` (default 1 h)
+    // is a paywall/out-of-quota stall — the provider is not going to let the
+    // session through for a long horizon. The member is flipped to the
+    // VISIBLE 'throttled' state (Migration 20) so nudges/checkChatty stay
+    // suppressed and the dashboard shows the real cause, and the lead
+    // receives EXACTLY ONE system notification — fired only on the
+    // transition INTO 'throttled' (idempotent across the retry burst).
     if (retryPayload) {
       // Coerce before binding: older server versions may emit a partial retry
       // payload, and an undefined bind throws synchronously inside this event
@@ -159,6 +203,39 @@ export function handleSessionStatusEvent(
           entry.memberName,
         ]
       )
+
+      // Paywall horizon: a finite `next` beyond the configured threshold is a
+      // long-retry (paywall) stall. Without config (legacy caller) the
+      // threshold degrades to the documented 1 h default; without a finite
+      // `next` there is no horizon to reason about, so the transient path
+      // (retry_* only, no FSM change) is kept.
+      const thresholdMs = config?.paywallRetryThresholdMs ?? 60 * 60 * 1000
+      const longHorizon = next !== null && next - Date.now() > thresholdMs
+      if (longHorizon && member.status !== "throttled") {
+        db.run(
+          "UPDATE team_member SET status = 'throttled', time_updated = ? WHERE team_id = ? AND name = ?",
+          [Date.now(), entry.teamId, entry.memberName]
+        )
+        // ONE unique lead notification per throttle episode (dedup: this block
+        // only runs on the transition INTO 'throttled'). Persisted passively —
+        // under silentLead (default) the SQLite row IS the delivery channel and
+        // surfaces on the lead's next turn; the proactive wake stays suppressed
+        // (a paywall block is recoverable, not an unrecoverable failure).
+        if (client) {
+          const resumeAt = new Date(next).toISOString()
+          const detail = retryPayload.action?.message ?? retryPayload.message ?? "provider retry scheduled"
+          notifyLead(
+            client,
+            db,
+            entry.teamId,
+            `Teammate "${entry.memberName}" is THROTTLED by a paywall/long rate-limit — next retry not before ${resumeAt} (${detail}). ` +
+            "Nudges and delivery are suspended until the provider unblocks; the member resumes automatically on the next successful turn.",
+            config ? { config } : undefined,
+          )
+        }
+        log(`status:throttled member=${entry.memberName} team=${entry.teamId} next_retry_in_ms=${next - Date.now()} threshold_ms=${thresholdMs}`)
+        return { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: "throttled" }
+      }
     }
     return { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: "retry" }
   }
@@ -483,9 +560,18 @@ export function handleSessionErrorEvent(
   // TICKET-HARNESS-34 (A2) — abort/failover noise filter, BEFORE any notify.
   // The turn was stopped on purpose (failover, timeout, force shutdown):
   // persist nothing, wake nobody, only log the decision.
-  if (isAbortError(error)) {
+  //
+  // TICKET-RELEASE-17: `team_standby` / `team_task_handover` now end the
+  // caller's turn through `scheduleStandbyAbort()`, which marks the abort as
+  // plugin-intentional. The mark is consumed here as a second, wording-agnostic
+  // line of defence: even if the host surfaces the abort with a payload that
+  // does not match ABORT_ERROR_MESSAGE, a deliberate standby pause must never
+  // become a "teammate had a session error" alarm nor wake the lead.
+  const intentionalAbort = consumeIntentionalAbort(sessionId)
+  if (isAbortError(error) || intentionalAbort) {
     const abortMsg = error?.data?.message ?? error?.name ?? "aborted"
-    log(`session-error:aborted member=${teamInfo.memberName} team=${teamInfo.teamId} err=${abortMsg}`)
+    const origin = intentionalAbort ? "intentional" : "error-signature"
+    log(`session-error:aborted member=${teamInfo.memberName} team=${teamInfo.teamId} origin=${origin} err=${abortMsg}`)
     return
   }
 
@@ -955,6 +1041,101 @@ function collectDeadSelectors(
   return out
 }
 
+/* ------------------------------------------------------------------ *
+ * TICKET-RELEASE-11 (Frente B) — paywall / unusability ledger          *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Deterministic PAYWALL / out-of-quota signatures. A rung that answers with
+ * one of these is not transiently rate-limited — it is UNUSABLE for this
+ * billing window ("Subscribe to OpenCode Go" is the field wording) and must
+ * be ledgered as dead: never persisted as the effective model again and never
+ * re-selected by any subsequent failover pass of the session or the room.
+ *
+ * Kept conservative on purpose: generic words like "error"/"limit" alone do
+ * not qualify — every pattern names the paywall/quota mechanism explicitly,
+ * so a transient 429 ("rate limit exceeded, retry in Ns") never lands here.
+ */
+const PAYWALL_SIGNATURES: readonly RegExp[] = [
+  /subscribe to opencode go/i,
+  /\bpaywall\b/i,
+  /out of (?:quota|credits|capacity)/i,
+  /quota exceeded/i,
+  /insufficient (?:credit|quota)/i,
+  /upgrade (?:your|the) plan/i,
+  /plan (?:limit|exceeded|expired)/i,
+  /billing (?:required|issue|hold)/i,
+]
+
+/**
+ * True when the payload describes a DETERMINISTIC paywall / out-of-quota
+ * failure instead of a transient rate limit. Scans every text field the
+ * retry/session-error payload can carry the detail in (same coverage as
+ * `modelErrorTexts`). Never throws.
+ */
+export function isPaywallFailure(payload: unknown): boolean {
+  if (!payload) return false
+  const texts = modelErrorTexts(payload)
+  if (texts.length === 0 && typeof payload === "string") texts.push(payload)
+  return texts.some((text) => PAYWALL_SIGNATURES.some((rx) => rx.test(text)))
+}
+
+/**
+ * Persistent ledger of rungs proven dead by a paywall/unusability failure.
+ * Keyed by SCOPE: `${teamId}` for member sessions (ROOM scope — one billing
+ * quota is shared by the whole room, so every member's failover avoids the
+ * dead rung) and `isolated:${sessionId}` for isolated/lead sessions (SESSION
+ * scope — no team row exists to share a ledger across). Value: the set of
+ * MODEL IDENTITIES ("provider/model", variant ignored — a paywall names the
+ * model, not one thinking level, exactly like ProviderModelNotFound).
+ *
+ * Process-wide in-memory state, like `failoverCooldown`/`failoverActions` —
+ * exported so deterministic suites can inspect/clear it without sleeping.
+ * Entries never expire: a paywall is deterministic unutilizability, and the
+ * ledger is cleared only by an explicit config/respawn action (or test reset).
+ */
+export const paywallDeadRungs = new Map<string, Set<string>>()
+
+/** Ledger a selector as dead-for-this-scope. Idempotent per identity. */
+export function recordPaywallDeadRung(scopeKey: string, selector: string | null | undefined): void {
+  const identity = modelIdentity(selector)
+  if (!identity) return
+  let set = paywallDeadRungs.get(scopeKey)
+  if (!set) {
+    set = new Set()
+    paywallDeadRungs.set(scopeKey, set)
+  }
+  if (!set.has(identity)) {
+    set.add(identity)
+    log(`paywall:dead-rung:recorded scope=${scopeKey} model=${identity}`)
+  }
+}
+
+/** Dead rung identities ledgered for a scope (empty array when none). */
+export function getPaywallDeadRungs(scopeKey: string): string[] {
+  const set = paywallDeadRungs.get(scopeKey)
+  return set ? [...set] : []
+}
+
+/**
+ * Drop every chain entry whose MODEL IDENTITY is ledgered dead for the scope.
+ * The failover walk then runs over the USABLE chain only, so the switch can
+ * never select — and therefore never persist into `team_member.model` — a rung
+ * the paywall already proved unusable (the "NUNCA persistir / NUNCA
+ * re-selecionar" invariant of Frente B).
+ */
+function filterChainAgainstPaywallLedger(
+  chain: readonly ModelFallbackRef[],
+  deadIdentities: readonly string[],
+): ModelFallbackRef[] {
+  if (deadIdentities.length === 0) return [...chain]
+  const dead = new Set(deadIdentities)
+  return chain.filter((entry) => {
+    const identity = catalogKey(entry.model)
+    return !identity || !dead.has(identity)
+  })
+}
+
 /** Outcome of a rate-limit failover evaluation (see handleRetryModelFailover). */
 export interface ModelFailoverDecision {
   /**
@@ -982,9 +1163,12 @@ export interface ModelFailoverDecision {
   /**
    * Why the seam acted. "rate-limit" is the historical 429/retry path;
    * "model-not-found" is the DETERMINISTIC ProviderModelNotFound path, which
-   * bypasses the long cooldown (a nonexistent model never recovers).
+   * bypasses the long cooldown (a nonexistent model never recovers);
+   * "paywall" (TICKET-RELEASE-11 F2) is the DETERMINISTIC out-of-quota /
+   * "Subscribe to OpenCode Go" path — also cooldown-bypassing, also ledgered
+   * as a dead rung so it is never re-selected by the room or the session.
    */
-  reason?: "rate-limit" | "model-not-found"
+  reason?: "rate-limit" | "model-not-found" | "paywall"
 }
 
 /**
@@ -1067,10 +1251,23 @@ export async function handleRetryModelFailover(
   // can recover on retry — it must advance the chain even while the rate-limit
   // cooldown would otherwise suppress. The dedicated gate still dedupes one
   // burst and never restarts at chain[0] (§5.1 loop guard).
-  const deterministic = isModelResolutionFailure(retryPayload)
+  // TICKET-RELEASE-11 (Frente B): a PAYWALL / out-of-quota failure
+  // ("Subscribe to OpenCode Go") is likewise deterministic unutilizability —
+  // same cooldown-bypass, PLUS the rung is ledgered dead for the ROOM so no
+  // subsequent failover pass (this member's or any peer's) can select it.
+  const paywall = isPaywallFailure(retryPayload)
+  const deterministic = isModelResolutionFailure(retryPayload) || paywall
+  const failReason = paywall ? "paywall" : deterministic ? "model-not-found" : "rate-limit"
   const failedModel = deterministic
     ? (extractFailedModelSelector(retryPayload) ?? member.model)
     : member.model
+  // Frente B: ledger the dead rung BEFORE the walk (room scope = teamId — one
+  // billing quota is shared by the whole room). The switch below runs over the
+  // filtered chain, so the dead rung is never selected and never persisted into
+  // team_member.model again ("NUNCA persistir / NUNCA re-selecionar").
+  if (paywall) {
+    recordPaywallDeadRung(entry.teamId, failedModel ?? member.model)
+  }
   // TICKET-HARNESS-53: model-aware gate. A residual retry event of the burst
   // that was just aborted is suppressed (FAILOVER_BURST_DEBOUNCE_MS), but a
   // 429 on the fallback model that was JUST applied advances the ladder
@@ -1079,13 +1276,13 @@ export async function handleRetryModelFailover(
     ? evaluateDeterministicFailover(cooldownKey, failedModel, now)
     : evaluateFailoverCooldown(cooldownKey, member.model, now)
   if (gate.verdict === "suppressed") {
-    log(`failover:suppressed member=${entry.memberName} remaining_ms=${gate.remainingMs} reason=${deterministic ? "model-not-found" : "rate-limit"}`)
+    log(`failover:suppressed member=${entry.memberName} remaining_ms=${gate.remainingMs} reason=${failReason}`)
     return {
       action: "suppressed",
       memberName: entry.memberName,
       teamId: entry.teamId,
       fromModel: member.model,
-      reason: deterministic ? "model-not-found" : "rate-limit",
+      reason: failReason,
     }
   }
 
@@ -1093,15 +1290,19 @@ export async function handleRetryModelFailover(
   // selects its `fallbackModelsByAgent` override; agents without an override
   // fall back to the global chain (resolveFallbackChainForAgent delegates).
   const chain = resolveFallbackChainForAgent(config, member.agent)
+  // Frente B: the walk runs over the USABLE chain only — every rung whose
+  // model identity is ledgered dead for this room is dropped up front, so the
+  // ladder can neither restart at a dead rung nor land on one mid-walk.
+  const usableChain = filterChainAgainstPaywallLedger(chain, getPaywallDeadRungs(entry.teamId))
   // Deterministic failures use the strictly-forward, identity-aware walk: the
   // provider cites the base model while the applied rung carries a variant, so
   // the rate-limit walk (variant-carrying key) would re-pick the dead rung.
   const next = deterministic
     ? selectDeterministicNextFallback(
-      chain,
+      usableChain,
       collectDeadSelectors(failedModel, member.model, gate.walkFrom, failoverActions.get(cooldownKey)?.toModel ?? null),
     )
-    : selectNextFallback(chain, gate.walkFrom)
+    : selectNextFallback(usableChain, gate.walkFrom)
   if (!next) {
     // HARNESS-13 zero-noise: exhaustion does NOT wake the lead — no
     // notifyLead, no team_message. Log + decision only: the wiring layer
@@ -1110,23 +1311,26 @@ export async function handleRetryModelFailover(
     recordFailoverAction(cooldownKey, now, member.model, null, true)
     const detail = retryPayload?.action?.message ?? retryPayload?.message ?? "rate limited"
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty"
-    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}] reason=${deterministic ? "model-not-found" : "rate-limit"} detail=${detail}`)
+    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}] reason=${failReason} detail=${detail}`)
     return {
       action: "exhausted",
       memberName: entry.memberName,
       teamId: entry.teamId,
       fromModel: member.model,
-      reason: deterministic ? "model-not-found" : "rate-limit",
+      reason: failReason,
     }
   }
 
+  // `next` comes from `usableChain` (ledger-filtered) — the switch below can
+  // therefore NEVER persist a paywall-dead rung into team_member.model
+  // (Frente B invariant), regardless of which walk selected it.
   const toSelector = formatModelSelector(next)
   db.run(
     "UPDATE team_member SET model = ?, time_updated = ? WHERE team_id = ? AND name = ?",
     [toSelector, now, entry.teamId, entry.memberName],
   )
   recordFailoverAction(cooldownKey, now, member.model, toSelector, false)
-  log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} reason=${deterministic ? "model-not-found" : "rate-limit"} (silent — lead not woken)`)
+  log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} reason=${failReason} (silent — lead not woken)`)
 
   // 1. Cancel in-flight HTTP request controller
   const cancelled = abortInflight(sessionId)
@@ -1150,9 +1354,11 @@ export async function handleRetryModelFailover(
         parts: [
           {
             type: "text",
-            text: deterministic
-              ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]`
-              : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`,
+            text: paywall
+              ? `[System: Provider paywall/out-of-quota blocked "${failedModel ?? member.model ?? "the current model"}". Switched to ${toSelector}. Resume your assigned task.]`
+              : deterministic
+                ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]`
+                : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`,
           },
         ],
         // Agent EXPLICIT (Diana achado 2 — BLOCKING): omitting `agent` makes
@@ -1176,7 +1382,7 @@ export async function handleRetryModelFailover(
     teamId: entry.teamId,
     fromModel: member.model,
     toModel: toSelector,
-    reason: deterministic ? "model-not-found" : "rate-limit",
+    reason: failReason,
   }
 }
 
@@ -1297,10 +1503,18 @@ async function handleIsolatedSessionFailover(
   // the ladder through the dedicated gate (the rate-limit cooldown must never
   // freeze them). A lead/isolated session still requires the EXPLICIT
   // per-agent chain checked above — the global chain never sequesters it.
-  const deterministic = isModelResolutionFailure(retryPayload)
+  // TICKET-RELEASE-11 (Frente B): a PAYWALL / out-of-quota failure is likewise
+  // deterministic, and the dead rung is ledgered for the SESSION scope
+  // (`isolated:${sessionId}` — no team row exists to share a room ledger).
+  const paywall = isPaywallFailure(retryPayload)
+  const deterministic = isModelResolutionFailure(retryPayload) || paywall
+  const failReason = paywall ? "paywall" : deterministic ? "model-not-found" : "rate-limit"
   const failedModel = deterministic
     ? (extractFailedModelSelector(retryPayload) ?? currentModel)
     : currentModel
+  if (paywall) {
+    recordPaywallDeadRung(cooldownKey, failedModel ?? currentModel)
+  }
   // TICKET-HARNESS-53: same model-aware gate as the member path (this one
   // covers the Lead and Diana's isolated blind-review session — fixing only
   // the member path would leave both stuck on the second 429).
@@ -1311,40 +1525,46 @@ async function handleIsolatedSessionFailover(
     ? evaluateDeterministicFailover(cooldownKey, failedModel, now)
     : gate
   if (effectiveGate.verdict === "suppressed") {
-    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${effectiveGate.remainingMs} reason=${deterministic ? "model-not-found" : "rate-limit"}`)
+    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${effectiveGate.remainingMs} reason=${failReason}`)
     return {
       action: "suppressed",
       memberName: agent,
       teamId: "",
       fromModel: currentModel,
-      reason: deterministic ? "model-not-found" : "rate-limit",
+      reason: failReason,
     }
   }
 
+  // Frente B: the walk runs over the USABLE chain only — ledgered dead rungs
+  // are dropped up front, so the isolated/lead ladder can never re-select a
+  // rung the paywall already proved unusable for this session.
+  const usableChain = filterChainAgainstPaywallLedger(chain, getPaywallDeadRungs(cooldownKey))
   const next = deterministic
     ? selectDeterministicNextFallback(
-      chain,
+      usableChain,
       collectDeadSelectors(failedModel, currentModel, effectiveGate.walkFrom, failoverActions.get(cooldownKey)?.toModel ?? null),
     )
-    : selectNextFallback(chain, effectiveGate.walkFrom)
+    : selectNextFallback(usableChain, effectiveGate.walkFrom)
   if (!next) {
     // Chain exhausted — surface the decision so the wiring layer can toast.
     // HARNESS-13 zero-noise: the lead is NEVER woken from a failover path.
     recordFailoverAction(cooldownKey, now, currentModel, null, true)
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty"
-    log(`failover:exhausted ${scope} session=${sessionId} agent=${agent} model=${currentModel ?? "default"} chain=[${chainDesc}] reason=${deterministic ? "model-not-found" : "rate-limit"}`)
+    log(`failover:exhausted ${scope} session=${sessionId} agent=${agent} model=${currentModel ?? "default"} chain=[${chainDesc}] reason=${failReason}`)
     return {
       action: "exhausted",
       memberName: agent,
       teamId: "",
       fromModel: currentModel,
-      reason: deterministic ? "model-not-found" : "rate-limit",
+      reason: failReason,
     }
   }
 
+  // `next` comes from `usableChain` (ledger-filtered) — never a paywall-dead
+  // rung (Frente B invariant).
   const toSelector = formatModelSelector(next)
   recordFailoverAction(cooldownKey, now, currentModel, toSelector, false)
-  log(`failover:switched ${scope} session=${sessionId} agent=${agent} from=${currentModel ?? "default"} to=${toSelector} reason=${deterministic ? "model-not-found" : "rate-limit"} (silent — lead not woken)`)
+  log(`failover:switched ${scope} session=${sessionId} agent=${agent} from=${currentModel ?? "default"} to=${toSelector} reason=${failReason} (silent — lead not woken)`)
 
   // Same active cycle as the member path: cancel in-flight, abort the native
   // retry backoff, then relaunch the turn on the next model.
@@ -1367,9 +1587,11 @@ async function handleIsolatedSessionFailover(
         parts: [
           {
             type: "text",
-            text: deterministic
-              ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]`
-              : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`,
+            text: paywall
+              ? `[System: Provider paywall/out-of-quota blocked "${failedModel ?? currentModel ?? "the current model"}". Switched to ${toSelector}. Resume your assigned task.]`
+              : deterministic
+                ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]`
+                : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`,
           },
         ],
         // Agent EXPLICIT (Diana achado 2 — BLOCKING, HARNESS-15 A rule 1b):
@@ -1392,7 +1614,7 @@ async function handleIsolatedSessionFailover(
     teamId: "",
     fromModel: currentModel,
     toModel: toSelector,
-    reason: deterministic ? "model-not-found" : "rate-limit",
+    reason: failReason,
   }
 }
 

@@ -16,25 +16,80 @@ import { log } from "../log"
  *    The member voluntarily suspended execution at runtime. `spawn_context` is
  *    NULL so the wake delivery sends the bare unblock/message text directly.
  *
+ * TICKET-RELEASE-11 (Frente C) — SHARED-CHECKOUT SINGLE-WRITER GATE
+ * (OPT-IN, `config.sharedCheckoutSingleWriter`, default FALSE):
+ *
+ * The standby wake is a BLINDADA invariant (Blindagem 1 / AGENTS.md §2):
+ * a message is NEVER authorization-of-write, so the wake is NEVER blocked by
+ * another member being busy/running — that inference was vetoed by the
+ * Quality Gate (Clara) after it regressed three historical suites and could
+ * deadlock production wakes behind a lead that stays busy.
+ *
+ * With the OPT-IN flag ON, the gate defers ONLY on REAL, FORMAL write
+ * contention, measured exclusively by the persisted baton — the `assignee`
+ * of an `in_progress` card — never by `status='busy'`:
+ *   - the wake target must HOLD at least one `in_progress` card (a write
+ *     stakeholder: waking them means effective write is coming);
+ *   - AND another member of the SAME shared checkout (`worktree_dir IS NULL`)
+ *     must also HOLD `in_progress` card(s) — their baton was not released
+ *     (not completed, not handed over via team_task_handover, not returned
+ *     to the pool).
+ * When the gate trips, the wake is refused (`blocked: true`, no window
+ * consumption, no spawn_context prepend): the row stays `delivered=0` and is
+ * replayed by the MULTI-TRIGGER sweep (re-send of team_message/broadcast,
+ * the writer's idle event, card completion via team_tasks_complete, and the
+ * init recovery pass) — never dependent on the idle event alone.
+ * Members WITH a worktree and cardless (coordination) wakes bypass entirely.
+ *
  * Returns:
  * - `text`: `spawn_context` prepended to `baseText` when present, otherwise `baseText`;
  * - `woke`: true only for the atomic transition `standby` -> `starting`;
- * - `agent`: the member's agent type.
+ * - `agent`: the member's agent type;
+ * - `blocked`: true only when the OPT-IN gate refused the wake (callers MUST
+ *   skip `promptAsync` entirely and leave the row `delivered=0` — waking with
+ *   bare `baseText` would be an amnesia wake).
  */
 export function resolveStandbyWake(
   db: Database,
   teamId: string,
   memberName: string,
   baseText: string,
-): { text: string; woke: boolean; agent?: string } {
+  singleWriterGate = false,
+): { text: string; woke: boolean; agent?: string; blocked?: boolean } {
   const row = db.query(
-    "SELECT agent, execution_status, spawn_context FROM team_member WHERE team_id = ? AND name = ?"
-  ).get(teamId, memberName) as { agent: string; execution_status: string; spawn_context: string | null } | null
+    "SELECT agent, execution_status, spawn_context, worktree_dir FROM team_member WHERE team_id = ? AND name = ?"
+  ).get(teamId, memberName) as { agent: string; execution_status: string; spawn_context: string | null; worktree_dir: string | null } | null
 
   if (!row || row.execution_status !== "standby") {
     // Pass-through: no agent either, so callers keep their existing delivery
     // payload byte-identical for members that were spawned the normal way.
     return { text: baseText, woke: false }
+  }
+
+  // Frente C (OPT-IN): formal-baton contention — checked BEFORE the atomic
+  // window consumption so a refused wake leaves execution_status untouched.
+  // The baton is the persisted `assignee` of an `in_progress` card; member
+  // status is NEVER consulted (a busy member without a card never blocks).
+  if (singleWriterGate && row.worktree_dir === null) {
+    const targetHoldsCard = db.query(
+      "SELECT id FROM team_task WHERE team_id = ? AND assignee = ? AND status = 'in_progress' LIMIT 1"
+    ).get(teamId, memberName)
+    if (targetHoldsCard) {
+      const otherBatonHolder = db.query(
+        `SELECT tm.name FROM team_member tm
+         WHERE tm.team_id = ? AND tm.name != ?
+           AND tm.worktree_dir IS NULL
+           AND EXISTS (
+             SELECT 1 FROM team_task tt
+             WHERE tt.team_id = tm.team_id AND tt.assignee = tm.name AND tt.status = 'in_progress'
+           )
+         LIMIT 1`
+      ).get(teamId, memberName) as { name: string } | null
+      if (otherBatonHolder) {
+        log(`standby:wake:blocked-shared-checkout member=${memberName} team=${teamId} other_baton=${otherBatonHolder.name} — dual card-holder wake deferred (formal baton, opt-in gate)`)
+        return { text: baseText, woke: false, blocked: true }
+      }
+    }
   }
 
   const result = db.run(

@@ -4,8 +4,6 @@ import type { Database } from "./db"
 import type { PluginClient } from "./types"
 import type { MemberRegistry } from "./state"
 import type { ProgressTracker } from "./progress"
-import { preserveBranch, preservedBranchName } from "./tools/merge-helper"
-import { releaseMemberTasks } from "./tasks"
 import { hasReportedCompletion } from "./messaging"
 import { getMemberModel } from "./member-model"
 import { notifyLead } from "./notify"
@@ -18,20 +16,10 @@ interface WatchdogOpts {
   db: Database
   client: PluginClient
   registry: MemberRegistry
-  /** Maximum time a member can stay busy before being timed out. 0 disables. */
-  ttlMs: number
   /** How often to run the check. Defaults to 60s. */
   checkIntervalMs?: number
-  /** Progress tracker for stall detection. */
+  /** Progress tracker for peer-message (chatty) rate detection. */
   progressTracker?: ProgressTracker
-  /** Stall detection threshold in ms. 0 disables. */
-  stallThresholdMs?: number
-  /** Min steps before token-based stall check. */
-  stallMinSteps?: number
-  /** Output token threshold for stall detection. */
-  stallTokenThreshold?: number
-  /** Project directory for git operations. */
-  cwd?: string
   /** Max peer messages per agent per window before nudge. 0 disables. */
   peerMessageLimit?: number
   /** Time window for peer message rate limiting in ms. */
@@ -42,9 +30,9 @@ interface WatchdogOpts {
   roomInactivityCheckMs?: number
   /**
    * Plugin config — threaded into notifyLead's `{ config }` so every
-   * watchdog wake (stall/chatty/timeout) uses the model-aware ladder
-   * (HARNESS-15 B / F2): agent from team.lead_agent + fallback chain with
-   * step-down, instead of a modelless wake riding the rate-limited primary.
+   * watchdog wake (chatty) uses the model-aware ladder (HARNESS-15 B / F2):
+   * agent from team.lead_agent + fallback chain with step-down, instead of a
+   * modelless wake riding the rate-limited primary.
    */
   config?: Required<EnsembleConfig>
 }
@@ -124,9 +112,9 @@ export function isSessionCompacting(sessionId: string, env: Record<string, strin
 }
 
 /**
- * Row shape produced by the busy-member scans in checkStalled/checkChatty —
- * the identity columns every nudge needs to address `promptAsync` with an
- * explicit `agent` (HARNESS-17).
+ * Row shape produced by the busy-member scan in checkChatty — the identity
+ * columns the nudge needs to address `promptAsync` with an explicit `agent`
+ * (HARNESS-17).
  */
 interface NudgeTargetRow {
   session_id: string
@@ -158,20 +146,26 @@ function resolveWatchdogNudgeAgent(row: NudgeTargetRow): string {
 }
 
 /**
- * Periodic watchdog that times out teammates stuck in busy state.
- * Transitions them to error/timed_out, aborts their session, and fires a toast.
+ * Periodic watchdog for room supervision.
+ *
+ * TICKET-RELEASE-17 (F3): the TIME-BASED inactivity path is gone. There is no
+ * more TTL/`timed_out` sweep (`busy` + `time_updated < cutoff` → abort, release
+ * tasks, notifyLead) and no stall sweep (`checkStalled`): both counted time
+ * since the last `team_member` write — not real progress — and killed members
+ * doing legitimate long-running work (field evidence: a member aborted 19s into
+ * a deliberate 8.5-minute measurement wait). What remains is:
+ *
+ *   - `cleanupStaleWorktrees()` — GC for shutdown/error worktrees;
+ *   - `checkChatty()` — peer-message flood nudge (NOT inactivity);
+ *   - `checkRoomInactivity()` — the Clara alert for an idle room with open
+ *     tasks. Deliberately untouched.
  */
 export class Watchdog {
   private readonly db: Database
   private readonly client: PluginClient
   private readonly registry: MemberRegistry
-  private readonly ttlMs: number
   private readonly checkIntervalMs: number
   private readonly progressTracker?: ProgressTracker
-  private readonly stallThresholdMs: number
-  private readonly stallMinSteps: number
-  private readonly stallTokenThreshold: number
-  private readonly cwd?: string
   private readonly peerMessageLimit: number
   private readonly peerMessageWindowMs: number
   private readonly roomInactivityThresholdMs: number
@@ -184,13 +178,8 @@ export class Watchdog {
     this.db = opts.db
     this.client = opts.client
     this.registry = opts.registry
-    this.ttlMs = opts.ttlMs
     this.checkIntervalMs = opts.checkIntervalMs ?? 60_000
     this.progressTracker = opts.progressTracker
-    this.stallThresholdMs = opts.stallThresholdMs ?? 0
-    this.stallMinSteps = opts.stallMinSteps ?? 3
-    this.stallTokenThreshold = opts.stallTokenThreshold ?? 500
-    this.cwd = opts.cwd
     this.peerMessageLimit = opts.peerMessageLimit ?? 0
     this.peerMessageWindowMs = opts.peerMessageWindowMs ?? 300_000
     this.roomInactivityThresholdMs = opts.roomInactivityThresholdMs ?? 30_000
@@ -204,15 +193,14 @@ export class Watchdog {
    * step-down). Without a config (legacy construction / test harnesses) it
    * degrades to the exact legacy wake — signature-safe.
    *
-   * TICKET-HARNESS-34 (A1): `forceWake` is true ONLY for the timeout path — a
-   * member aborted by the watchdog is an unrecoverable failure the lead must
-   * act on. Stall/chatty nudges are non-fatal noise: their message row is
-   * persisted and the proactive wake stays suppressed under `silentLead`.
+   * TICKET-RELEASE-17: the only remaining caller is `checkChatty` — a
+   * non-fatal over-coordination nudge whose message row is persisted and whose
+   * proactive wake stays suppressed under `silentLead`. The old timeout path
+   * (which punched through with a forced wake) is gone with the TTL sweep.
    */
-  private notifyLead(teamId: string, message: string, forceWake = false): void {
+  private notifyLead(teamId: string, message: string): void {
     notifyLead(this.client, this.db, teamId, message, {
       ...(this.config ? { config: this.config } : {}),
-      ...(forceWake ? { forceWake: true } : {}),
     })
   }
 
@@ -245,121 +233,11 @@ export class Watchdog {
     }
   }
 
-  /** Check for stalled busy members and escalate to lead + nudge teammate. */
-  async checkStalled(): Promise<void> {
-    if (!this.progressTracker || this.stallThresholdMs === 0) return
-
-    // Identity columns ride along the scan so the nudge below can address
-    // promptAsync with an explicit `agent` (HARNESS-17) — see
-    // resolveWatchdogNudgeAgent.
-    const busy = this.db.query(
-      `SELECT tm.team_id, tm.name, tm.session_id, tm.agent, t.lead_agent, t.lead_session_id
-       FROM team_member tm
-       JOIN team t ON tm.team_id = t.id
-       WHERE t.status = 'active' AND tm.status = 'busy'`
-    ).all() as Array<{ team_id: string; name: string; session_id: string; agent: string; lead_agent: string | null; lead_session_id: string }>
-
-    for (const member of busy) {
-      if (this.progressTracker.isReported(member.session_id)) continue
-
-      const tokenStalled = this.progressTracker.isTokenStalled(member.session_id, this.stallMinSteps, this.stallTokenThreshold)
-      const timeStalled = this.progressTracker.isTimeStalled(member.session_id, this.stallThresholdMs)
-
-      if (!tokenStalled && !timeStalled) continue
-
-      // hasReportedCompletion() is the documented invariant every promptAsync delivery
-      // path must honor (see hooks.ts:63). The in-memory isReported() check above only
-      // catches this watchdog's own prior nudges — it doesn't know if the member reported
-      // completion by some other path while still transiently 'busy' in the DB.
-      if (hasReportedCompletion(this.db, member.team_id, member.name)) {
-        log(`watchdog:stall:skip member=${member.name} team=${member.team_id} reason=already-reported-completion`)
-        continue
-      }
-
-      const reason = tokenStalled ? "low output tokens" : "no communication"
-
-      // Re-nudge suppression: markReported is deferred until promptAsync delivery
-      // succeeds, so a persistently failing nudge (session deleted mid-run while the
-      // DB row stays busy, bad stored model) would otherwise re-fire this whole
-      // block on every tick — a fresh last_nudged_at write, lead wake, and toast
-      // forever. Skip while the previous nudge is recent AND the member has shown
-      // no activity since it; genuine activity after a nudge makes them eligible
-      // for a fresh evaluation (and a fresh stall verdict) immediately.
-      const recentNudgeRow = this.db.query(
-        "SELECT last_nudged_at FROM team_member WHERE team_id = ? AND name = ?"
-      ).get(member.team_id, member.name) as { last_nudged_at: number | null } | null
-      if (recentNudgeRow?.last_nudged_at) {
-        const nudgedAt = recentNudgeRow.last_nudged_at
-        // >= because Date.now() has ms resolution: activity recorded in the same
-        // tick as the nudge write must count as post-nudge, or a member that went
-        // idle, worked, and stalled again would stay suppressed forever.
-        const activeSinceNudge = (this.progressTracker?.lastActivityAt(member.session_id) ?? 0) >= nudgedAt
-        if (!activeSinceNudge && Date.now() - nudgedAt < this.stallThresholdMs) {
-          log(`watchdog:stall:skip member=${member.name} team=${member.team_id} reason=recently-nudged`)
-          continue
-        }
-      }
-
-      // Additive display-staleness signal (does not change team_member.status) — lets
-      // the dashboard/team_status annotate "busy, nudged Xs ago" so a soft nudge is
-      // visible without inventing a new status value.
-      this.db.run(
-        "UPDATE team_member SET last_nudged_at = ? WHERE team_id = ? AND name = ?",
-        [Date.now(), member.team_id, member.name]
-      )
-
-      // Nudge the teammate directly. markReported() only fires once delivery is
-      // confirmed — marking it before delivery is known would permanently and silently
-      // orphan the stall state if promptAsync throws (aborted session, invalid ID),
-      // since ProgressTracker.reported is in-memory and only cleared by new activity.
-      const stallModel = getMemberModel(this.db, member.team_id, member.name)
-      // HARNESS-17: `agent` is NEVER omitted — without it the server assumes
-      // the default agent (dante) and overwrites session.agent, stripping the
-      // member's persona and tool permissions (HARNESS-12(b) mechanism).
-      const stallAgent = resolveWatchdogNudgeAgent(member)
-      this.client.session.promptAsync({
-        sessionID: member.session_id,
-        // M1 (TICKET-HARNESS-37): under silentLead (config.silentLead !== false)
-        // the nudge steers to the task / board instead of demanding a lead-bound
-        // report; the legacy phrasing is preserved for silentLead: false.
-        parts: [{ type: "text", text: this.config?.silentLead !== false
-          ? "[System]: You appear stalled — no progress detected. Refocus on your current task and drive it forward; record progress on the shared board and coordinate with peers via team_message, or wrap up your work."
-          : "[System]: You appear stalled — no progress detected. Report your current status to the lead via team_message, or wrap up your work." }],
-        agent: stallAgent,
-        ...(stallModel ? { model: stallModel } : {}),
-      }).then(() => {
-        // Type guard: progressTracker is optional (constructed without one in
-        // legacy/test harnesses) — optional chaining keeps the nudge-ack from
-        // throwing into the .catch below when no tracker was threaded.
-        this.progressTracker?.markReported(member.session_id)
-      }).catch((err) => {
-        log(`watchdog:stall:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`)
-      })
-
-      // Notify the lead — model-aware wake when config is threaded (F2).
-      this.notifyLead(
-        member.team_id,
-        `Teammate "${member.name}" appears stalled (${reason}). Consider checking on them via team_message or shutting them down.`,
-      )
-
-      // Toast for the user
-      try {
-        await this.client.tui.showToast({
-          title: "Team",
-          message: `${member.name} appears stalled`,
-          variant: "warning",
-          duration: 5000,
-        })
-      } catch { /* TUI may not be available */ }
-    }
-  }
-
   /** Check for chatty agents sending too many peer messages. */
   async checkChatty(): Promise<void> {
     if (!this.progressTracker || this.peerMessageLimit === 0) return
 
-    // Identity columns for the explicit-`agent` nudge below (HARNESS-17) —
-    // same resolution rule as checkStalled.
+    // Identity columns for the explicit-`agent` nudge below (HARNESS-17).
     const busy = this.db.query(
       `SELECT tm.team_id, tm.name, tm.session_id, tm.agent, t.lead_agent, t.lead_session_id
        FROM team_member tm
@@ -371,7 +249,9 @@ export class Watchdog {
       if (this.progressTracker.isChattyReported(member.session_id)) continue
       if (!this.progressTracker.isChatty(member.session_id, this.peerMessageLimit, this.peerMessageWindowMs)) continue
 
-      // hasReportedCompletion() guard — same invariant/rationale as checkStalled() above.
+      // hasReportedCompletion() guard — the documented invariant every
+      // promptAsync delivery path must honor (see hooks.ts:63): never nudge a
+      // member that already reported completion.
       if (hasReportedCompletion(this.db, member.team_id, member.name)) {
         log(`watchdog:chatty:skip member=${member.name} team=${member.team_id} reason=already-reported-completion`)
         continue
@@ -382,7 +262,7 @@ export class Watchdog {
       // Nudge the agent
       const chattyModel = getMemberModel(this.db, member.team_id, member.name)
       // HARNESS-17: explicit `agent` — never omitted (persona sequester
-      // defence, see resolveWatchdogNudgeAgent / checkStalled above).
+      // defence, see resolveWatchdogNudgeAgent above).
       const chattyAgent = resolveWatchdogNudgeAgent(member)
       this.client.session.promptAsync({
         sessionID: member.session_id,
@@ -514,103 +394,22 @@ export class Watchdog {
     }
   }
 
-  /** Run a single check for stale busy members. */
+  /**
+   * Run a single supervision tick.
+   *
+   * TICKET-RELEASE-17: NO time-based abort exists anymore. A member that stays
+   * `busy` for hours (legitimate long task, instrumented wait, compaction) is
+   * never swept: its card is never released and the lead is never woken by a
+   * timeout that never happened. Room inactivity (Clara) and the chatty nudge
+   * are preserved exactly as before.
+   */
   async check(): Promise<void> {
     await this.cleanupStaleWorktrees()
-    await this.checkStalled()
     await this.checkChatty()
     await this.checkRoomInactivity()
-    if (this.ttlMs === 0) return
-
-    const cutoff = Date.now() - this.ttlMs
-    const stale = this.db.query(
-      `SELECT tm.team_id, tm.name, tm.session_id, tm.worktree_branch, t.name as team_name, p.name as project_name
-       FROM team_member tm
-       JOIN team t ON tm.team_id = t.id
-       JOIN project p ON t.project_id = p.id
-       WHERE t.status = 'active'
-         AND tm.status = 'busy'
-         AND tm.time_updated < ?`
-    ).all(cutoff) as Array<{ team_id: string; name: string; session_id: string; worktree_branch: string | null; team_name: string; project_name: string }>
-
-    for (const member of stale) {
-      // Active heartbeat: the team_member row went stale, but the progress
-      // tracker saw real work (message / task / step / busy-transition) after
-      // the cutoff. Renew the row from the tracker and skip this tick instead of
-      // aborting — a member inside a long tool call legitimately has an old
-      // time_updated, and aborting it mid-turn is what surfaces
-      // MessageAbortedError ("The running turn was stopped before OpenCode
-      // could send the next message.").
-      const lastActive = this.progressTracker?.lastActivityAt(member.session_id) ?? 0
-      if (lastActive > cutoff) {
-        this.db.run(
-          "UPDATE team_member SET time_updated = ? WHERE team_id = ? AND name = ?",
-          [lastActive, member.team_id, member.name]
-        )
-        log(`watchdog:heartbeat:renewed member=${member.name} team=${member.team_id} lastActive=${lastActive}`)
-        continue
-      }
-
-      // Compaction immunity: opencode is rewriting this session's context.
-      // The turn is alive — only the store is being reduced — so aborting here
-      // would race the compaction and kill the running turn. Grant immunity for
-      // this tick; the row stays stale and is re-evaluated on the next check.
-      if (isSessionCompacting(member.session_id)) {
-        log(`watchdog:heartbeat:compacting member=${member.name} team=${member.team_id} session=${member.session_id}`)
-        continue
-      }
-
-      // Preserve branch BEFORE abort — session.abort() may destroy the worktree + branch
-      if (this.cwd && member.worktree_branch && !member.worktree_branch.startsWith("ensemble/preserved/")) {
-        const safeBranch = preservedBranchName(member.project_name, member.team_name, member.team_id, member.name)
-        const ok = await preserveBranch(member.worktree_branch, safeBranch, this.cwd)
-        if (ok) {
-          this.db.run("UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
-            [safeBranch, member.team_id, member.name])
-          log(`watchdog:branch:preserved src=${member.worktree_branch} target=${safeBranch}`)
-        }
-      }
-
-      // Mark as timed out
-      this.db.run(
-        "UPDATE team_member SET status = 'error', execution_status = 'timed_out', time_updated = ? WHERE team_id = ? AND name = ?",
-        [Date.now(), member.team_id, member.name]
-      )
-
-      // Release the timed-out member's in_progress tasks back to the pool (issue #27)
-      const released = releaseMemberTasks(this.db, member.team_id, member.name)
-      if (released > 0) log(`watchdog:tasks:released name=${member.name} count=${released}`)
-
-      // Notify AND wake the lead — a timed-out teammate is otherwise a silent
-      // failure. This is the "leave recovery to the lead" path: we surface the
-      // timeout, we do not auto-resume the teammate.
-      // TICKET-HARNESS-34 (A1): unrecoverable failure → forceWake punches
-      // through silentLead (the member was just aborted; the lead must know).
-      // (stall/chatty above deliberately omit it — non-fatal noise.)
-      this.notifyLead(
-        member.team_id,
-        `Teammate "${member.name}" timed out after exceeding the busy time limit and was aborted. Their in-progress work has been released. Review their session, then re-spawn or reassign the task if needed.`,
-        true,
-      )
-
-      // Abort session (best effort)
-      try {
-        await this.client.session.abort({ sessionID: member.session_id })
-      } catch { /* best effort */ }
-
-      // Notify
-      try {
-        await this.client.tui.showToast({
-          title: "Team",
-          message: `${member.name} timed out`,
-          variant: "warning",
-          duration: 5000,
-        })
-      } catch { /* TUI may not be available */ }
-    }
   }
 
-  /** Start the periodic check. Runs stale worktree GC regardless of TTL setting. */
+  /** Start the periodic check. Stale-worktree GC runs on every tick. */
   start(): void {
     if (!this.timer) {
       // HARNESS-38 (M9): the tick body is async — an unhandled rejection inside

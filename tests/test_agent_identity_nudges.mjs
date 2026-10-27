@@ -88,7 +88,7 @@ const distRaw = readFileSync(DIST, "utf8");
 const SITES = [
   { id: "S1 in-review-tasks", marker: "nudgeAgent ? { agent: nudgeAgent }", token: "IN_REVIEW_NUDGE_MESSAGE" },
   { id: "S2 wake-peer", marker: "peerAgent ? { agent: peerAgent }", token: "new message(s) from teammates" },
-  { id: "S3 checkStalled", marker: "agent: stallAgent", token: "You appear stalled" },
+  // TICKET-RELEASE-17: S3 (checkStalled) foi removido com o watchdog de tempo.
   { id: "S4 checkChatty", marker: "agent: chattyAgent", token: "several messages" },
 ];
 
@@ -106,7 +106,7 @@ function siteBlock(text, marker) {
 
 for (const site of SITES) {
   for (const [label, text] of [
-    ["src", site.id.startsWith("S3") || site.id.startsWith("S4") ? srcWatchdog : srcIndex],
+    ["src", site.id.startsWith("S4") ? srcWatchdog : srcIndex],
     ["dist", distRaw],
   ]) {
     const { block, err } = siteBlock(text, site.marker);
@@ -254,14 +254,11 @@ async function runBehavior(label, mods) {
   const STALE = now - 120_000;
   const WAKE_PEER_TEXT = "[System: 1 new message(s) from teammates]";
 
-  /* ---------- 5A) WATCHDOG (checkStalled / checkChatty) ---------- */
+  /* ---------- 5A) WATCHDOG (checkChatty) ---------- */
 
-  // A1: checkStalled normal — alvo tem seu próprio agent (build); lead é outra sessão.
-  // A2: checkStalled alvo == lead_session_id → lead_agent (dante) vence.
+  // TICKET-RELEASE-17: checkStalled was removed with the time-based watchdog.
   // A3: checkChatty normal; A4: checkChatty alvo == lead_session_id.
   const WD = [
-    { id: "stall_n", kind: "stall", lead: "ses_wd_stall_n_lead", leadAgent: "dante", member: "ses_wd_stall_n_m", agent: "build", expectAgent: "build" },
-    { id: "stall_l", kind: "stall", lead: "ses_wd_stall_l_m", leadAgent: "dante", member: "ses_wd_stall_l_m", agent: "build", expectAgent: "dante" },
     { id: "chatty_n", kind: "chatty", lead: "ses_wd_chatty_n_lead", leadAgent: "dante", member: "ses_wd_chatty_n_m", agent: "build", expectAgent: "build" },
     { id: "chatty_l", kind: "chatty", lead: "ses_wd_chatty_l_m", leadAgent: "dante", member: "ses_wd_chatty_l_m", agent: "build", expectAgent: "dante" },
   ];
@@ -289,24 +286,17 @@ async function runBehavior(label, mods) {
       db: db2, client: makeWatchdogClient(calls), registry: new MemberRegistry(),
       ttlMs: 0, progressTracker: tracker, roomInactivityThresholdMs: 0,
     };
-    let wd;
-    if (sc.kind === "stall") {
-      for (let i = 0; i < 3; i++) tracker.recordStep(sc.member, 0);
-      wd = new Watchdog({ ...opts, stallThresholdMs: 300_000, stallMinSteps: 3, stallTokenThreshold: 500, peerMessageLimit: 0 });
-      await wd.checkStalled();
-    } else {
-      tracker.recordPeerMessage(sc.member);
-      tracker.recordPeerMessage(sc.member);
-      wd = new Watchdog({ ...opts, stallThresholdMs: 0, peerMessageLimit: 2, peerMessageWindowMs: 300_000 });
-      await wd.checkChatty();
-    }
+    tracker.recordPeerMessage(sc.member);
+    tracker.recordPeerMessage(sc.member);
+    const wd = new Watchdog({ ...opts, peerMessageLimit: 2, peerMessageWindowMs: 300_000 });
+    await wd.checkChatty();
     await tick();
-    const textMatch = sc.kind === "stall" ? "You appear stalled" : "several messages";
+    const textMatch = "several messages";
     const nudges = calls.filter((c) => c.sessionID === sc.member && String(c.parts?.[0]?.text).includes(textMatch));
     wdAgents[sc.id] = nudges;
     check(`[${label}] ${sc.id}: nudge disparado 1x ao alvo`, nudges.length === 1, `nudges=${nudges.length}`);
     check(
-      `[${label}] ${sc.id}: agent PRESENTE e = ${sc.expectAgent} (${sc.kind === "stall" && sc.expectAgent === "dante" ? "team.lead_agent, alvo é o lead" : "team_member.agent do alvo"})`,
+      `[${label}] ${sc.id}: agent PRESENTE e = ${sc.expectAgent} (${sc.expectAgent === "dante" ? "team.lead_agent, alvo é o lead" : "team_member.agent do alvo"})`,
       nudges.length === 1 && typeof nudges[0].agent === "string" && nudges[0].agent === sc.expectAgent,
       JSON.stringify(nudges[0]?.agent),
     );

@@ -376,10 +376,60 @@ export const MIGRATIONS: string[] = [
             CASE WHEN status = 'blocked' THEN 'pending' ELSE status END,
             priority, assignee, time_created, time_updated, rejection_count, review_notes
      FROM team_task_old_m19;
-   DROP TABLE team_task_old_m19;
+    DROP TABLE team_task_old_m19;
    CREATE INDEX IF NOT EXISTS team_task_team_idx ON team_task(team_id);
    CREATE INDEX IF NOT EXISTS team_task_assignee_idx ON team_task(assignee);
    CREATE INDEX IF NOT EXISTS team_task_status_idx ON team_task(team_id, status);`,
+  // Migration 20 (TICKET-RELEASE-11, Frente A): add the 'throttled' literal to
+  // team_member.status's CHECK constraint — the visible "blocked by paywall /
+  // long rate-limit" state. SQLite cannot ALTER a CHECK in place, so this
+  // rebuilds the table exactly the way Migrations 8/12/13/19 did (rename →
+  // create → copy → drop), carrying over every column added by Migrations
+  // 3-16 (worktree_*, plan_approval, workspace_id, reported_to_lead,
+  // last_nudged_at, retry_*, spawn_context, is_qa, role) and recreating the
+  // two indexes that die with the old table. Nudges already key on
+  // `status = 'ready'`, so a throttled member is naturally suppressed from
+  // shouldNudgeIdleMember / shouldNudgeInReviewTasks; the busy branch of
+  // handleSessionStatusEvent learns to release 'throttled' when the provider
+  // unblocks (a successful retry turns the session busy again).
+  `ALTER TABLE team_member RENAME TO team_member_old_m20;
+   CREATE TABLE IF NOT EXISTS team_member (
+     team_id          TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     name             TEXT NOT NULL,
+     session_id       TEXT NOT NULL,
+     agent            TEXT NOT NULL,
+     status           TEXT NOT NULL DEFAULT 'ready'
+                        CHECK(status IN ('ready', 'busy', 'shutdown_requested', 'shutdown', 'error', 'throttled')),
+     execution_status TEXT NOT NULL DEFAULT 'idle'
+                        CHECK(execution_status IN ('idle', 'starting', 'running',
+                          'cancel_requested', 'cancelling', 'cancelled',
+                          'completing', 'completed', 'failed', 'timed_out',
+                          'standby')),
+     model            TEXT,
+     prompt           TEXT,
+     time_created     INTEGER NOT NULL,
+     time_updated     INTEGER NOT NULL,
+     worktree_dir     TEXT,
+     worktree_branch  TEXT,
+     plan_approval    TEXT NOT NULL DEFAULT 'none'
+                        CHECK(plan_approval IN ('none', 'pending', 'approved', 'rejected')),
+     workspace_id     TEXT,
+     reported_to_lead INTEGER NOT NULL DEFAULT 0,
+     last_nudged_at   INTEGER,
+     retry_until      INTEGER,
+     retry_attempt    INTEGER,
+     retry_provider   TEXT,
+     retry_message    TEXT,
+     spawn_context    TEXT,
+     is_qa            INTEGER NOT NULL DEFAULT 0,
+     role             TEXT,
+     PRIMARY KEY (team_id, name)
+   );
+   INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, time_created, time_updated, worktree_dir, worktree_branch, plan_approval, workspace_id, reported_to_lead, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message, spawn_context, is_qa, role)
+     SELECT team_id, name, session_id, agent, status, execution_status, model, prompt, time_created, time_updated, worktree_dir, worktree_branch, plan_approval, workspace_id, reported_to_lead, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message, spawn_context, is_qa, role FROM team_member_old_m20;
+   DROP TABLE team_member_old_m20;
+   CREATE INDEX IF NOT EXISTS team_member_session_idx ON team_member(session_id);
+   CREATE INDEX IF NOT EXISTS team_member_status_idx ON team_member(team_id, status);`,
 ]
 
 /**

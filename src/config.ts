@@ -270,14 +270,33 @@ export function selectNextFallback(
 export interface EnsembleConfig {
   /** Auto-merge worktree branches on cleanup (default: true) */
   mergeOnCleanup?: boolean
-  /** Stall detection threshold in ms (default: 300000 = 5 min, 0 to disable) */
-  stallThresholdMs?: number
-  /** Min steps before token-based stall check (default: 5) */
-  stallMinSteps?: number
-  /** Output token threshold for stall detection (default: 200) */
-  stallTokenThreshold?: number
-  /** Hard timeout for busy members in ms (default: 1800000 = 30 min, 0 to disable) */
-  timeoutMs?: number
+  /**
+   * TICKET-RELEASE-17: the time-based inactivity watchdog (TTL/timeout + stall
+   * sweep) was REMOVED. `stallThresholdMs`, `stallMinSteps`,
+   * `stallTokenThreshold` and `timeoutMs` no longer exist: they counted time
+   * from the last `team_member` write (not real progress) and aborted members
+   * doing legitimate long-running work. Room-inactivity supervision
+   * (`roomInactivityThresholdMs` / `checkRoomInactivity`) is untouched.
+   */
+  /**
+   * Long-retry paywall threshold in ms (TICKET-RELEASE-11).
+   * A `session.status = retry` whose scheduled next attempt lies beyond this
+   * horizon is treated as a paywall/out-of-quota stall instead of a transient
+   * rate limit. Default: 3600000 = 1 hour.
+   */
+  paywallRetryThresholdMs?: number
+  /**
+   * TICKET-RELEASE-11 (Frente C) — OPT-IN do invariante de um-escritor em
+   * checkout compartilhado (worktree: false). Default FALSE: wakes de standby
+   * nunca são bloqueados (invariante blindada da Blindagem 1 — mensagem não é
+   * autorização de escrita). Quando TRUE, o deferimento de wake usa APENAS o
+   * bastão FORMAL persistido (assignee de card `in_progress`): o wake de um
+   * standby que TAMBÉM segura card é adiado enquanto OUTRO membro do mesmo
+   * checkout compartilhado segura card(s) in_progress — nunca inferido de
+   * status='busy'. Replay multi-gatilho (re-envio, idle, conclusão de card,
+   * recovery de init) — nunca depende só do evento idle.
+   */
+  sharedCheckoutSingleWriter?: boolean
   /** Rate limit capacity (default: 10, 0 to disable) */
   rateLimitCapacity?: number
   /** Dashboard server port (default: 4747, 0 to disable) */
@@ -357,10 +376,8 @@ export interface EnsembleConfig {
 /** Default configuration values. */
 export const DEFAULT_CONFIG: Required<EnsembleConfig> = {
   mergeOnCleanup: true,
-  stallThresholdMs: 300_000,
-  stallMinSteps: 5,
-  stallTokenThreshold: 200,
-  timeoutMs: 30 * 60 * 1000,
+  paywallRetryThresholdMs: 60 * 60 * 1000,
+  sharedCheckoutSingleWriter: false,
   rateLimitCapacity: 10,
   dashboardPort: 4747,
   peerMessageLimit: 5,
@@ -387,10 +404,8 @@ function readConfigFile(filePath: string): Partial<EnsembleConfig> {
     // Validate types — only accept numbers for numeric fields, booleans for boolean fields
     const result: Partial<EnsembleConfig> = {}
     if (typeof raw.mergeOnCleanup === "boolean") result.mergeOnCleanup = raw.mergeOnCleanup
-    if (typeof raw.stallThresholdMs === "number") result.stallThresholdMs = raw.stallThresholdMs
-    if (typeof raw.stallMinSteps === "number") result.stallMinSteps = raw.stallMinSteps
-    if (typeof raw.stallTokenThreshold === "number") result.stallTokenThreshold = raw.stallTokenThreshold
-    if (typeof raw.timeoutMs === "number") result.timeoutMs = raw.timeoutMs
+    if (typeof raw.paywallRetryThresholdMs === "number") result.paywallRetryThresholdMs = raw.paywallRetryThresholdMs
+    if (typeof raw.sharedCheckoutSingleWriter === "boolean") result.sharedCheckoutSingleWriter = raw.sharedCheckoutSingleWriter
     if (typeof raw.rateLimitCapacity === "number") result.rateLimitCapacity = raw.rateLimitCapacity
     if (typeof raw.dashboardPort === "number") result.dashboardPort = raw.dashboardPort
     if (typeof raw.peerMessageLimit === "number") result.peerMessageLimit = raw.peerMessageLimit
@@ -474,15 +489,16 @@ export function loadConfig(projectDir: string): Required<EnsembleConfig> {
     ...(project.fallbackModelsByAgent ?? {}),
   }
 
-  // Env vars override everything
-  const timeout = process.env.OPENCODE_ENSEMBLE_TIMEOUT
-  if (timeout !== undefined) merged.timeoutMs = timeout === "0" ? 0 : (parseInt(timeout, 10) || merged.timeoutMs)
+  // Env vars override everything.
+  // TICKET-RELEASE-17: OPENCODE_ENSEMBLE_TIMEOUT and STALL_THRESHOLD_MS were
+  // retired together with the time-based watchdog they configured.
+  const paywallRetry = process.env.OPENCODE_ENSEMBLE_PAYWALL_RETRY_THRESHOLD_MS
+  if (paywallRetry !== undefined) {
+    merged.paywallRetryThresholdMs = parseInt(paywallRetry, 10) || merged.paywallRetryThresholdMs
+  }
 
   const rateLimit = process.env.OPENCODE_ENSEMBLE_RATE_LIMIT
   if (rateLimit !== undefined) merged.rateLimitCapacity = rateLimit === "0" ? 0 : (parseInt(rateLimit, 10) || merged.rateLimitCapacity)
-
-  const stall = process.env.STALL_THRESHOLD_MS
-  if (stall !== undefined) merged.stallThresholdMs = stall === "0" ? 0 : (parseInt(stall, 10) || merged.stallThresholdMs)
 
   const roomInactivityThreshold = process.env.ROOM_INACTIVITY_THRESHOLD_MS ?? process.env.OPENCODE_ENSEMBLE_ROOM_INACTIVITY_THRESHOLD_MS
   if (roomInactivityThreshold !== undefined) {

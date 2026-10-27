@@ -95,7 +95,12 @@ const distRaw = readFileSync(DIST, "utf8")
   writeFileSync(HARNESS, distRaw + (need.length ? `\nexport { ${need.join(", ")} };\n` : ""))
   check(
     "dist carrega as âncoras da F2 (reason model-not-found + exaustão acionável)",
-    /reason=\$\{deterministic \? "model-not-found" : "rate-limit"\}/.test(distRaw)
+    // TICKET-RELEASE-11 (Frente B) realinhou o reason num derivador único
+    // `failReason` (paywall ? "paywall" : deterministic ? "model-not-found" :
+    // "rate-limit") — os literais "model-not-found"/"rate-limit" continuam
+    // alcançáveis byte-a-byte para os caminhos pré-existentes, e o behavioral
+    // stack deste arquivo prova os valores nos decisions (linhas ~323+).
+    /paywall \? "paywall" : deterministic \? "model-not-found" : "rate-limit"/.test(distRaw)
       && /Fix ensemble\.json and respawn/.test(distRaw)
       && /skip-dead-rungs/.test(distRaw),
   )

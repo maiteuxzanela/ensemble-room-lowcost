@@ -193,14 +193,105 @@ export async function recoverOrphanedWorktrees(db: Database, client: PluginClien
 }
 
 /**
+ * Deliver the undelivered messages of ONE team (delivered=0) via promptAsync.
+ * Shared by the init sweep (`recoverUndeliveredMessages`) and the
+ * shared-checkout baton-release flush (`deliverDeferredStandbyWakes`).
+ *
+ * TICKET-RELEASE-11 (Frente C): a wake refused by the single-writer guard
+ * (`resolveStandbyWake` → `blocked: true`) leaves its row `delivered=0` and is
+ * skipped here — it is replayed by the NEXT pass once the active writer
+ * releases the checkout. Never throws: per-message failures leave the row
+ * pending for the next recovery.
+ */
+async function recoverTeamUndeliveredMessages(
+  db: Database,
+  client: PluginClient,
+  registry: MemberRegistry,
+  teamId: string,
+  singleWriterGate = false,
+): Promise<{ redelivered: number; blocked: number }> {
+  const messages = getUndeliveredMessages(db, teamId)
+
+  let redelivered = 0
+  let blocked = 0
+
+  for (const msg of messages) {
+    // Resolve recipient session ID
+    let recipientSessionId: string | undefined
+    // Bound once: every non-`continue` path below proves `toName` is a real
+    // string, so the delivery calls no longer need non-null assertions.
+    const toName = msg.to_name
+
+    if (toName === "lead") {
+      // Skip lead-bound messages — the system prompt transform delivers them
+      continue
+    } else if (toName) {
+      const entry = registry.getByName(teamId, toName)
+      recipientSessionId = entry?.sessionId
+    } else {
+      // Broadcast — skip for now, broadcasts are best-effort
+      continue
+    }
+
+    if (!recipientSessionId || !toName) continue
+
+    // Skip delivery to teammates who have already reported completion (issue #3)
+    if (hasReportedCompletion(db, teamId, toName)) {
+      markDelivered(db, msg.id)
+      continue
+    }
+
+    try {
+      const recipientModel = getMemberModel(db, teamId, toName)
+      // TICKET-HARNESS-36 (P3): a recovered message must be able to wake a
+      // member that is still in standby WITHOUT amnesia. resolveStandbyWake
+      // prepends the member's spawn_context and atomically flips
+      // execution_status 'standby' -> 'starting' (returning the member's own
+      // agent) — a bare promptAsync would otherwise deliver the recovered text
+      // as the member's first prompt, losing its role/peers context.
+      const wake = resolveStandbyWake(
+        db,
+        teamId,
+        toName,
+        `[Recovered team message from ${msg.from_name}]: ${msg.content}`,
+        singleWriterGate,
+      )
+      // Frente C (opt-in): the formal-baton gate refused the wake — do NOT
+      // prompt (an amnesia wake) and do NOT mark delivered; a later replay
+      // trigger (re-send, idle, card completion, next recovery) delivers it.
+      if (wake.blocked) {
+        blocked++
+        continue
+      }
+      await client.session.promptAsync({
+        sessionID: recipientSessionId,
+        parts: [{ type: "text", text: wake.text }],
+        ...(wake.agent ? { agent: wake.agent } : {}),
+        ...(recipientModel ? { model: recipientModel } : {}),
+      })
+      markDelivered(db, msg.id)
+      redelivered++
+    } catch {
+      // Continue on failure — message stays undelivered for next recovery
+    }
+  }
+
+  return { redelivered, blocked }
+}
+
+/**
  * Redeliver undelivered messages (delivered=0) via promptAsync.
  * Resolves recipient session IDs from the member registry or team lead.
  * Continues on partial failure — logs but doesn't abort.
+ *
+ * `singleWriterGate` (TICKET-RELEASE-11 Frente C, OPT-IN) threads the
+ * formal-baton wake gate; default false keeps the legacy delivery byte-for-byte.
  */
 export async function recoverUndeliveredMessages(
   db: Database,
   client: PluginClient,
   registry: MemberRegistry,
+  singleWriterGate = false,
 ): Promise<{ redelivered: number }> {
   // Get all active teams
   const teams = db.query("SELECT id, lead_session_id FROM team WHERE status = 'active'")
@@ -209,63 +300,39 @@ export async function recoverUndeliveredMessages(
   let redelivered = 0
 
   for (const team of teams) {
-    const messages = getUndeliveredMessages(db, team.id)
-
-    for (const msg of messages) {
-      // Resolve recipient session ID
-      let recipientSessionId: string | undefined
-      // Bound once: every non-`continue` path below proves `toName` is a real
-      // string, so the delivery calls no longer need non-null assertions.
-      const toName = msg.to_name
-
-      if (toName === "lead") {
-        // Skip lead-bound messages — the system prompt transform delivers them
-        continue
-      } else if (toName) {
-        const entry = registry.getByName(team.id, toName)
-        recipientSessionId = entry?.sessionId
-      } else {
-        // Broadcast — skip for now, broadcasts are best-effort
-        continue
-      }
-
-      if (!recipientSessionId || !toName) continue
-
-      // Skip delivery to teammates who have already reported completion (issue #3)
-      if (hasReportedCompletion(db, team.id, toName)) {
-        markDelivered(db, msg.id)
-        continue
-      }
-
-      try {
-        const recipientModel = getMemberModel(db, team.id, toName)
-        // TICKET-HARNESS-36 (P3): a recovered message must be able to wake a
-        // member that is still in standby WITHOUT amnesia. resolveStandbyWake
-        // prepends the member's spawn_context and atomically flips
-        // execution_status 'standby' -> 'starting' (returning the member's own
-        // agent) — a bare promptAsync would otherwise deliver the recovered text
-        // as the member's first prompt, losing its role/peers context.
-        const wake = resolveStandbyWake(
-          db,
-          team.id,
-          toName,
-          `[Recovered team message from ${msg.from_name}]: ${msg.content}`,
-        )
-        await client.session.promptAsync({
-          sessionID: recipientSessionId,
-          parts: [{ type: "text", text: wake.text }],
-          ...(wake.agent ? { agent: wake.agent } : {}),
-          ...(recipientModel ? { model: recipientModel } : {}),
-        })
-        markDelivered(db, msg.id)
-        redelivered++
-      } catch {
-        // Continue on failure — message stays undelivered for next recovery
-      }
-    }
+    const result = await recoverTeamUndeliveredMessages(db, client, registry, team.id, singleWriterGate)
+    redelivered += result.redelivered
   }
 
   return { redelivered }
+}
+
+/**
+ * TICKET-RELEASE-11 (Frente C) — BATON-RELEASE FLUSH (multi-trigger replay,
+ * OPT-IN): one of the FOUR replay triggers for wakes deferred by the
+ * formal-baton gate (the others: re-send of team_message/broadcast, the
+ * holder's idle event in handleSessionStatusEvent, and the init recovery
+ * pass) — so the defer never depends on the idle event alone. Callers fire it
+ * when the baton landscape may have changed (card completed/handed over,
+ * writer released). Re-evaluates the gate per recipient: exactly one deferred
+ * card-holder is released per pass while another holder remains.
+ */
+export async function deliverDeferredStandbyWakes(
+  db: Database,
+  client: PluginClient,
+  registry: MemberRegistry,
+  teamId: string,
+  singleWriterGate = false,
+): Promise<{ redelivered: number; blocked: number }> {
+  // Cheap standby probe first: no standby member → no-op (the flush must not
+  // turn every idle transition into a full undelivered sweep).
+  const standby = db.query(
+    "SELECT name FROM team_member WHERE team_id = ? AND execution_status = 'standby' LIMIT 1"
+  ).get(teamId) as { name: string } | null
+  if (!standby) return { redelivered: 0, blocked: 0 }
+
+  log(`shared-checkout:baton-release-flush team=${teamId} gate=${singleWriterGate}`)
+  return recoverTeamUndeliveredMessages(db, client, registry, teamId, singleWriterGate)
 }
 
 /**

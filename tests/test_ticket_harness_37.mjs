@@ -168,33 +168,24 @@ const run = (fn) => { try { return fn(); } catch (e) { return { __err: e instanc
 // ===========================================================================
 // CENÁRIO M1 — prompts do lead (silentLead) + nudges de watchdog.
 // ===========================================================================
-function nudgeText(mod, kind, silentLead) {
-  const base = mkScratch(`nudge-${kind}-${silentLead ? "on" : "off"}`);
+function nudgeText(mod, silentLead) {
+  const base = mkScratch(`nudge-chatty-${silentLead ? "on" : "off"}`);
   const db = mod.createDb(path.join(base, "e.db"));
   try {
     seedProjectAndTeam(db, { teamId: "TN", lead: "sesLeadN", leadAgent: "dante" });
-    const sess = `ses_nudge_${kind}_${silentLead ? "on" : "off"}`;
+    const sess = `ses_nudge_chatty_${silentLead ? "on" : "off"}`;
     const stale = NOW() - 120_000;
     insertMember(db, { teamId: "TN", name: "tales", session: sess, agent: "build", status: "busy", exec: "running", updated: stale });
     const { calls, client } = makeClient();
     const tracker = new mod.ProgressTracker();
+    // TICKET-RELEASE-17: stall sweep deleted — only the chatty nudge survives.
     const opts = {
-      db, client, registry: new mod.MemberRegistry(), ttlMs: 0, progressTracker: tracker,
+      db, client, registry: new mod.MemberRegistry(), progressTracker: tracker,
       roomInactivityThresholdMs: 0, config: { ...mod.DEFAULT_CONFIG, silentLead },
     };
-    let wd;
-    if (kind === "stall") {
-      for (let i = 0; i < 3; i++) tracker.recordStep(sess, 0);
-      wd = new mod.Watchdog({ ...opts, stallThresholdMs: 300_000, stallMinSteps: 3, stallTokenThreshold: 500, peerMessageLimit: 0 });
-      return wd.checkStalled().then(async () => {
-        await tick();
-        const token = kind === "stall" ? "appear stalled" : "several messages";
-        return String(calls.promptAsync.find((c) => c.sessionID === sess && String(c.parts?.[0]?.text).includes(token))?.parts?.[0]?.text ?? "");
-      });
-    }
     tracker.recordPeerMessage(sess);
     tracker.recordPeerMessage(sess);
-    wd = new mod.Watchdog({ ...opts, stallThresholdMs: 0, peerMessageLimit: 2, peerMessageWindowMs: 300_000 });
+    const wd = new mod.Watchdog({ ...opts, peerMessageLimit: 2, peerMessageWindowMs: 300_000 });
     return wd.checkChatty().then(async () => {
       await tick();
       return String(calls.promptAsync.find((c) => c.sessionID === sess && String(c.parts?.[0]?.text).includes("several messages"))?.parts?.[0]?.text ?? "");
@@ -222,16 +213,13 @@ async function scnM1(mod) {
   } finally {
     cleanup(base, db);
   }
-  const stallSilent = await nudgeText(mod, "stall", true);
-  R("m1.stall-nudge-silent-task-focus", stallSilent.includes("Refocus on your current task and drive it forward"));
-  R("m1.stall-nudge-silent-board", stallSilent.includes("record progress on the shared board"));
-  R("m1.stall-nudge-silent-no-lead-dm", !stallSilent.includes("Report your current status to the lead"));
-  const chattySilent = await nudgeText(mod, "chatty", true);
+  // TICKET-RELEASE-17: the stall sweep (and its silentLead-aware nudge) was
+  // removed with the time-based watchdog. Only chatty remains.
+  R("m1.stall-sweep-removed", typeof mod.Watchdog.prototype.checkStalled === "undefined");
+  const chattySilent = await nudgeText(mod, true);
   R("m1.chatty-nudge-silent-board", chattySilent.includes("advancing it on the shared board rather than over-coordinating"));
   R("m1.chatty-nudge-silent-no-lead-dm", !chattySilent.includes("send your results to the lead"));
-  const stallLegacy = await nudgeText(mod, "stall", false);
-  R("m1.stall-nudge-legacy-byte-stable", stallLegacy.includes("Report your current status to the lead via team_message"));
-  const chattyLegacy = await nudgeText(mod, "chatty", false);
+  const chattyLegacy = await nudgeText(mod, false);
   R("m1.chatty-nudge-legacy-byte-stable", chattyLegacy.includes("Focus on completing your task and send your results to the lead via team_message."));
   return got;
 }
@@ -674,13 +662,15 @@ check(
   `dist=${countOf(distRaw, "under silentLead they do not wake you on each completion")}`,
 );
 check(
-  "paridade M1: prompt do lead + nudges silentLead-aware (src e dist)",
+  // TICKET-RELEASE-17: stall nudge wording removed with checkStalled; the
+  // silentLead-aware chatty nudge and the lead prompt remain intact.
+  "paridade M1: prompt do lead + nudge chatty silentLead-aware (src e dist)",
   srcSystemPrompt.includes("under silentLead you are NOT woken for each individual completion.") &&
     srcSystemPrompt.includes("Progress lives on the shared board and in team_results") &&
-    srcWatchdog.includes("Refocus on your current task and drive it forward") &&
+    !srcWatchdog.includes("Refocus on your current task and drive it forward") &&
     srcWatchdog.includes("advancing it on the shared board rather than over-coordinating") &&
     distRaw.includes("under silentLead you are NOT woken for each individual completion.") &&
-    distRaw.includes("Refocus on your current task and drive it forward") &&
+    !distRaw.includes("Refocus on your current task and drive it forward") &&
     distRaw.includes("advancing it on the shared board rather than over-coordinating"),
   "",
 );
@@ -758,15 +748,8 @@ const MUTATIONS = [
     detect: ["m1.lead-prompt-silent-wording", "m1.lead-prompt-board-first", "m1.lead-prompt-no-message-you-when-done"],
     unaffected: ["m1.lead-prompt-legacy-byte-stable", "m1.lead-prompt-legacy-no-silent-line"],
   },
-  {
-    id: "H37-2",
-    desc: "M1: nudge de stall volta a coagir DM ao lead",
-    from: '"[System]: You appear stalled \\u2014 no progress detected. Refocus on your current task and drive it forward; record progress on the shared board and coordinate with peers via team_message, or wrap up your work."',
-    to: '"[System]: You appear stalled \\u2014 no progress detected. Report your current status to the lead via team_message, or wrap up your work."',
-    scenarios: ["m1"],
-    detect: ["m1.stall-nudge-silent-task-focus", "m1.stall-nudge-silent-no-lead-dm"],
-    unaffected: ["m1.stall-nudge-legacy-byte-stable", "m1.chatty-nudge-silent-board"],
-  },
+  // H37-2 (nudge de stall) foi removido junto com checkStalled no
+  // TICKET-RELEASE-17 — não há mais caminho de produção a mutar.
   {
     id: "H37-3",
     desc: "M2: implementador volta a fazer handoff manual ao SDET",

@@ -1,6 +1,7 @@
 import type { Database } from "../db"
 import type { ToolDeps } from "../types"
 import { requireTeamMember } from "./shared"
+import { incrementStandbyLoop, resetStandbyLoop, scheduleStandbyAbort, STANDBY_LOOP_LIMIT } from "../standby-guard"
 import { log } from "../log"
 
 export interface TeamStandbyArgs {
@@ -47,8 +48,34 @@ export async function executeTeamStandby(
     throw new Error("Unknown member name for session")
   }
 
+  // TICKET-RELEASE-17 (F2): consecutive-call alarm, strictly scoped to
+  // team_standby. Every other tool call (and every new turn) resets this count
+  // via noteToolCall()/resetStandbyLoop() — see src/standby-guard.ts.
+  const consecutive = incrementStandbyLoop(sessionId)
+  const loopBroken = consecutive >= STANDBY_LOOP_LIMIT
+
   setMemberStandby(deps.db, teamInfo.teamId, memberName, args.reason)
 
+  if (loopBroken) {
+    log(`standby:loop-breaker member=${memberName} team=${teamInfo.teamId} count=${consecutive}`)
+    // Re-arm: the next legitimate wake starts a fresh chain (and the aborted
+    // session must not be killed again on its very next call).
+    resetStandbyLoop(sessionId)
+  }
+
+  // TICKET-RELEASE-17 (F1): the runtime — not the model — ends the caller's
+  // turn. Deferred to the next macrotask so the tool result is already
+  // persisted; the abort is marked intentional and absorbed by the
+  // anti-abort filter in hooks.ts (member stays ready/standby, never error).
+  scheduleStandbyAbort(
+    deps.client,
+    sessionId,
+    loopBroken ? `loop-breaker count=${consecutive}` : "team_standby",
+  )
+
   const reasonStr = args.reason ? ` (reason: ${args.reason})` : ""
+  if (loopBroken) {
+    return `Entered standby mode${reasonStr}. Repetition breaker fired after ${consecutive} consecutive team_standby calls — the runtime has aborted this turn.`
+  }
   return `Entered standby mode${reasonStr}. Execution suspended until a new message arrives.`
 }

@@ -160,10 +160,15 @@ check("1.M11 src e dist: V2 poda no shutdown de membro e limpa no teardown do ha
     `callerTeam@${callerIdx} result@${resultIdx} (esperado caller < result)`);
 }
 
-/* ---- M12 — defaults endurecidos ---- */
-check("1.M12 src e dist: DEFAULT_CONFIG endurecido (300s / 5 steps / 200 tokens)",
-  srcConfig.includes("stallThresholdMs: 300_000") && srcConfig.includes("stallMinSteps: 5") && srcConfig.includes("stallTokenThreshold: 200") &&
-    distRaw.includes("stallThresholdMs: 3e5") && distRaw.includes("stallMinSteps: 5") && distRaw.includes("stallTokenThreshold: 200"));
+/* ---- M12 — TICKET-RELEASE-17: watchdog de tempo removido do config ---- */
+check("1.M12 src e dist: campos de stall/timeout AUSENTES do config e do bundle",
+  !srcConfig.includes("stallThresholdMs:") && !srcConfig.includes("stallMinSteps:") &&
+    !srcConfig.includes("stallTokenThreshold:") && !srcConfig.includes("timeoutMs:") &&
+    !distRaw.includes("stallMinSteps:") && !distRaw.includes("stallTokenThreshold:") &&
+    !distRaw.includes("stallThresholdMs:"));
+check("1.M12b src e dist: DEFAULT_CONFIG mantém a supervisão de sala (Clara) e o campo do paywall",
+  srcConfig.includes("roomInactivityThresholdMs: 30_000") && srcConfig.includes("roomInactivityCheckMs: 5_000") &&
+    srcConfig.includes("paywallRetryThresholdMs:") && distRaw.includes("roomInactivityThresholdMs: 3e4"));
 
 /* ---- package.json: files sem "tests" + exports íntegros ---- */
 const pkg = JSON.parse(readFileSync(path.join(PKG, "package.json"), "utf8"));

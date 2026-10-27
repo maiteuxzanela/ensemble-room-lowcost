@@ -2,6 +2,7 @@ import type { ToolDeps } from "../types"
 import { requireTeamMember, resolveStandbyWake } from "./shared"
 import { getMemberModel } from "../member-model"
 import { setMemberStandby } from "./team-standby"
+import { scheduleStandbyAbort } from "../standby-guard"
 import { log } from "../log"
 
 export interface TeamTaskHandoverArgs {
@@ -139,6 +140,11 @@ export async function executeTeamTaskHandover(
   let standbySuffix = ""
   if (teamInfo.role !== "lead" && teamInfo.memberName) {
     setMemberStandby(deps.db, teamInfo.teamId, teamInfo.memberName, `handover of ${taskId} to ${to}`)
+    // TICKET-RELEASE-17 (F1.3): the transmitter side gets the same deterministic
+    // pause as team_standby — the runtime aborts the caller's turn after the
+    // tool result is persisted, instead of trusting the model to stop. The abort
+    // is marked intentional so hooks.ts absorbs the MessageAbortedError noise.
+    scheduleStandbyAbort(deps.client, sessionId, `task-handover ${taskId} to ${to}`)
     standbySuffix = " You have entered standby (execution suspended) with a clean context window until the baton returns."
   }
 

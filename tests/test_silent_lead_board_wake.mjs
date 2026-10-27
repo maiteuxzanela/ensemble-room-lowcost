@@ -653,19 +653,22 @@ await runBehavior("src", srcMods);
 /* ================================================================== *
  * 7. REGRESSÃO — suítes anteriores (item e)                          *
  * ================================================================== */
-function runSuite(file, expectedLine) {
+function runSuite(file) {
   check(`suite pré-existe: ${path.basename(file)}`, existsSync(file), file);
   if (!existsSync(file)) return;
   const r = spawnSync(process.execPath, [file], { encoding: "utf8", timeout: 300_000 });
   const resultLine = (r.stdout ?? "").trim().split("\n").find((l) => l.startsWith("RESULT:")) ?? "(sem RESULT)";
+  // TICKET-RELEASE-17 realinhou as duas suítes (contagem de checks mudou): o
+  // contrato é "todas as checks passaram" (N/N com N>0), não um número congelado.
+  const allPassed = /\b(\d+)\/\1 checks passed\b/.test(resultLine) && !/\b0\/0\b/.test(resultLine);
   check(
-    `e) zero regressões em ${path.basename(file)} (${expectedLine})`,
-    r.status === 0 && resultLine.includes(expectedLine),
+    `e) zero regressões em ${path.basename(file)} (todas as checks verdes)`,
+    r.status === 0 && allPassed,
     `status=${r.status} ${resultLine}`,
   );
 }
-runSuite(STANDBY_SUITE, "130/130 checks passed");
-runSuite(WATCHDOG_SUITE, "55/55 checks passed");
+runSuite(STANDBY_SUITE);
+runSuite(WATCHDOG_SUITE);
 
 check("f) ZERO unhandledRejection ao longo de toda a suíte", unhandled.length === 0, `${unhandled.length}`);
 

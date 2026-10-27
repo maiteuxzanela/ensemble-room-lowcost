@@ -17,6 +17,15 @@ export { shouldNudgeIdleMember, shouldAlarmFastIdle, shouldNudgeInReviewTasks, i
 // Silent rate-limit failover (zero-noise) — exported for the deterministic
 // suites to drive and inspect the cooldown map without wall-clock sleeps.
 export { handleRetryModelFailover, failoverCooldown, FAILOVER_COOLDOWN_MS } from "./hooks"
+// TICKET-RELEASE-11 (Frente B) — paywall/unusability ledger: the predicate,
+// the dead-rung map and the record/read helpers are exported so the suites can
+// drive a paywall retry and inspect the ledger without wall-clock sleeps.
+export { isPaywallFailure, paywallDeadRungs, recordPaywallDeadRung, getPaywallDeadRungs } from "./hooks"
+// TICKET-RELEASE-11 (Frente C) — shared-checkout single-writer guard: the
+// standby-wake seam (now returning `blocked`) and the baton-release flush are
+// exported so the suites can prove the deferral/replay cycle end to end.
+export { resolveStandbyWake } from "./tools/shared"
+export { deliverDeferredStandbyWakes } from "./recovery"
 export { trackPrompt, abortInflight, endTracked } from "./v2-session"
 export { executeTeamTasksReview, executeTeamTasksReject } from "./tools/team-tasks-complete"
 export { executeTeamStandby, setMemberStandby } from "./tools/team-standby"
@@ -85,6 +94,11 @@ import { resolveStandbyWake } from "./tools/shared"
 import type { ToolDeps, } from "./types"
 import { TokenBucket } from "./rate-limit"
 import { Watchdog } from "./watchdog"
+// TICKET-RELEASE-17: the compaction probe is no longer consumed by the removed
+// time-based abort, but it stays a public, read-only diagnostic (used by
+// deterministic suites and available to hosts). Re-export keeps it in the bundle.
+export { isSessionCompacting } from "./watchdog"
+import { noteToolCall, resetStandbyLoop } from "./standby-guard"
 
 const DEFAULT_RATE_LIMIT_REFILL = 2
 const DEFAULT_RATE_LIMIT_INTERVAL_MS = 1000
@@ -187,7 +201,10 @@ const plugin: Plugin = async (input) => {
     const rehydrated = rehydrateRegistry(db, registry)
     if (rehydrated > 0) log(`init:registry:rehydrated members=${rehydrated}`)
 
-    recoverUndeliveredMessages(db, client, registry).catch((err) => {
+    // TICKET-RELEASE-11 (Frente C): thread the OPT-IN formal-baton gate so a
+    // wake deferred by it is honored by the init sweep too (a card-holder
+    // whose contention persists stays queued; released batons deliver now).
+    recoverUndeliveredMessages(db, client, registry, config.sharedCheckoutSingleWriter === true).catch((err) => {
       log(`init:recover-messages:failed err=${err instanceof Error ? err.message : String(err)}`)
     })
     recoverOrphanedWorktrees(db, client).catch((err) => {
@@ -225,13 +242,8 @@ const plugin: Plugin = async (input) => {
   if (!isWorktreeInstance(input.directory)) {
     watchdog = new Watchdog({
       db, client, registry,
-      ttlMs: config.timeoutMs,
       checkIntervalMs: DEFAULT_WATCHDOG_CHECK_MS,
       progressTracker,
-      stallThresholdMs: config.stallThresholdMs,
-      stallMinSteps: config.stallMinSteps,
-      stallTokenThreshold: config.stallTokenThreshold,
-      cwd: input.directory,
       peerMessageLimit: config.peerMessageLimit,
       peerMessageWindowMs: config.peerMessageWindowMs,
       roomInactivityThresholdMs: config.roomInactivityThresholdMs,
@@ -254,7 +266,12 @@ const plugin: Plugin = async (input) => {
         const retryPayload = statusType === "retry"
           ? (status as { attempt: number; message: string; action?: { reason: string; provider: string; title: string; message: string; label: string; link?: string }; next: number })
           : undefined
-        const transition = handleSessionStatusEvent(db, registry, sessionID, statusType, retryPayload)
+        // TICKET-RELEASE-11 (Frente A): client/config threaded so the retry
+        // branch can flip a long-horizon (paywall) retry into the visible
+        // 'throttled' state and fire the single lead notification. Both params
+        // are OPTIONAL on the hook — legacy/test callers without them keep the
+        // transient retry_* behaviour.
+        const transition = handleSessionStatusEvent(db, registry, sessionID, statusType, retryPayload, client, config)
 
         // Fire toast notifications for meaningful transitions
         if (transition) {
@@ -350,15 +367,21 @@ const plugin: Plugin = async (input) => {
           } else if (transition.to === "error") {
             notifyTeamEvent(client, "error", { memberName: transition.memberName })
           } else if (transition.to === "busy") {
-            // Fresh busy period (ready/error -> busy) — give checkStalled a baseline
-            // that doesn't depend on a step-finish event having landed yet. Without
-            // this, a member whose first action is one long-running tool call is
-            // never detected as stalled until that call itself returns.
+            // Fresh busy period (ready/error -> busy).
             progressTracker.recordBusyStart(sessionID)
-          } else if (transition.to === "retry") {
+            // TICKET-RELEASE-17: a new turn (message wake / spawn) breaks any
+            // consecutive-`team_standby` chain, so the loop-breaker only ever
+            // counts repetitions inside the SAME turn.
+            resetStandbyLoop(sessionID)
+          } else if (transition.to === "retry" || transition.to === "throttled") {
             // Teammate is being rate-limited — evaluate SILENT model failover
             // FIRST (zero-noise per HARNESS-13: "switched"/"suppressed"/
             // "exhausted" never wake the lead; exhaustion only toasts).
+            // TICKET-RELEASE-11 (Frente A+B): the SAME evaluation also runs on
+            // the event that flips the member to 'throttled' (long-horizon
+            // paywall retry) — the next retry event may only fire hours later,
+            // so the paywall-dead rung must be ledgered and the chain advanced
+            // NOW, not on some future burst.
             const failover = await handleRetryModelFailover(
               db,
               registry,
@@ -378,7 +401,9 @@ const plugin: Plugin = async (input) => {
             try {
               await client.tui.showToast({
                 title: "Team",
-                message: `${transition.memberName} is being rate-limited${failoverInfo}`,
+                message: transition.to === "throttled"
+                  ? `${transition.memberName} is THROTTLED by a paywall/long rate-limit${failoverInfo}`
+                  : `${transition.memberName} is being rate-limited${failoverInfo}`,
                 variant: "warning",
                 duration: 3000,
               })
@@ -575,6 +600,10 @@ const plugin: Plugin = async (input) => {
     // Sub-agent isolation + rate limiting hook
     "tool.execute.before": async (input, _output) => {
       checkToolIsolation(registry, tracker, input.tool, input.sessionID, db)
+      // TICKET-RELEASE-17 (F2): only `team_standby` increments the loop counter
+      // (the executor is the single writer); ANY other tool call resets the
+      // chain. Searches, reads and bash never trip the alarm.
+      noteToolCall(input.sessionID, input.tool)
       // Rate limit team tools that trigger LLM inference
       if (input.tool.startsWith("team_")) {
         if (!rateLimiter.tryConsume()) {
@@ -957,7 +986,7 @@ const plugin: Plugin = async (input) => {
         args: {},
         async execute(_args, ctx) {
           const result = await executeTeamStatus(deps, ctx.sessionID)
-          const statusMap: Record<string, string> = { busy: "working", ready: "idle", shutdown_requested: "stopping", shutdown: "done", error: "error" }
+          const statusMap: Record<string, string> = { busy: "working", ready: "idle", throttled: "throttled", shutdown_requested: "stopping", shutdown: "done", error: "error" }
           const members = deps.db.query("SELECT name, status FROM team_member WHERE team_id IN (SELECT id FROM team WHERE lead_session_id = ? OR id IN (SELECT team_id FROM team_member WHERE session_id = ?))").all(ctx.sessionID, ctx.sessionID) as Array<{ name: string; status: string }>
           const summary = members.map(m => `${m.name}: ${statusMap[m.status] ?? m.status}`).join(", ")
           ctx.metadata({ title: summary || "No teammates" })

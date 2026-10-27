@@ -2,10 +2,10 @@
 /**
  * Runner determinístico das suítes do ensemble-room-lowcost.
  *
- * Executa as 52 suítes determinísticas do repositório em sequência estrita
+ * Executa as 54 suítes determinísticas do repositório em sequência estrita
  * (fail-report, sem aborte antecipado): cada arquivo listado em SUITES roda
  * até o fim mesmo que um anterior falhe, e o relatório consolidado final
- * agrega PASS/FAIL de todas elas. Total atual: 52 arquivos de teste
+ * agrega PASS/FAIL de todas elas. Total atual: 54 arquivos de teste
  * (milhares de verificações, zero mocks).
  *
  * As 3 suítes históricas seguem sendo o núcleo das 5 blindagens e re-executam
@@ -17,9 +17,9 @@
  *   3. test_silent_lead_board_wake.mjs — Silent lead + despertar sistemático por board (151 checks,
  *                                        re-executa as suítes 1 e 2 como regressão)
  *
- * As demais 48 suítes cobrem standby/auto-wake, failover model-aware e cooldown,
+ * As demais 50 suítes cobrem standby/auto-wake, failover model-aware e cooldown,
  * Quality Gate/SDET/handover, dashboard HTTP, auto-commit multi-repo, pausa de
- * emergência e saneamento de schema (HARNESS-16 … HARNESS-57). A lista canônica
+ * emergência e saneamento de schema (HARNESS-16 … HARNESS-57, RELEASE-03 … RELEASE-17). A lista canônica
  * é o array SUITES abaixo — ele é a fonte da verdade da cobertura.
  *
  * Regras:
@@ -92,6 +92,8 @@ const SUITES = [
   { file: "test_release_10_pre_spawn_model_validation.mjs", label: "RELEASE-10/F1 (Validação pré-spawn contra o catálogo vivo: modelo configurado ausente avança fallbackModels até o primeiro servido, exaustão falha ANTES de worktree/session com mensagem acionável + Did you mean, fail-open sem catálogo, enabled:false, variant §5.1 e paridade src↔dist)" },
   { file: "test_release_10_deterministic_failover.mjs", label: "RELEASE-10/F2 (Failover reativo determinístico: erro de resolução avança a cadeia com cooldown ativo, anti-loop §5.1/#default e rung com variante, exaustão acionável delivered=0 sem wake de lead, cadeia resolvida pelo AGENTE, memória de rung morta no promptModelAwareWake; SQLite real e paridade src↔dist)" },
   { file: "test_release_15_wake_model_binding.mjs", label: "RELEASE-15 (Wake de lead com modelo BOUND explícito: board closure agent+model via session.get, variante default normalizada, decision_lead idêntico, mensagem durável consumida pelo system prompt após falha do wake, ladder sem chain[0] como rung 0 + prova de mutação M1-M3; SQLite real, dist+src)" },
+  { file: "test_release_11_standby_lifecycle.mjs", label: "RELEASE-11 (Ciclo de vida Standby/Wake: retry longo → 'throttled' Migration 20 com 1 aviso ao lead e liberação busy/idle, ledger de rungs mortos por paywall nunca re-selecionados (sala+isolado) — inclui B7 de restart de cadeia —, guarda de um-escritor em checkout compartilhado com deferred delivered=0 e flush no release do bastão; SQLite real, dist+src)" },
+  { file: "test_release_17_standby_pause.mjs", label: "RELEASE-17 (Standby que pausa: abort determinístico pós-resultado via setImmediate no caller, absorção wording-agnostic do abort intencional em handleSessionErrorEvent, loop-breaker estreito no 3º team_standby com reset por qualquer outra tool, pausa do transmissor no handover sem perder o wake do receptor, abort fire-and-forget, watchdog sem checkStalled/TTL e checkRoomInactivity intacto; SQLite real, dist+src, prova de mutação M17a-M17f)" },
 ];
 const SUITE_TIMEOUT_MS = 600_000;
 

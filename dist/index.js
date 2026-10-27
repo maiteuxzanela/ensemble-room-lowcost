@@ -559,10 +559,60 @@ var MIGRATIONS = [
             CASE WHEN status = 'blocked' THEN 'pending' ELSE status END,
             priority, assignee, time_created, time_updated, rejection_count, review_notes
      FROM team_task_old_m19;
-   DROP TABLE team_task_old_m19;
+    DROP TABLE team_task_old_m19;
    CREATE INDEX IF NOT EXISTS team_task_team_idx ON team_task(team_id);
    CREATE INDEX IF NOT EXISTS team_task_assignee_idx ON team_task(assignee);
-   CREATE INDEX IF NOT EXISTS team_task_status_idx ON team_task(team_id, status);`
+   CREATE INDEX IF NOT EXISTS team_task_status_idx ON team_task(team_id, status);`,
+  // Migration 20 (TICKET-RELEASE-11, Frente A): add the 'throttled' literal to
+  // team_member.status's CHECK constraint — the visible "blocked by paywall /
+  // long rate-limit" state. SQLite cannot ALTER a CHECK in place, so this
+  // rebuilds the table exactly the way Migrations 8/12/13/19 did (rename →
+  // create → copy → drop), carrying over every column added by Migrations
+  // 3-16 (worktree_*, plan_approval, workspace_id, reported_to_lead,
+  // last_nudged_at, retry_*, spawn_context, is_qa, role) and recreating the
+  // two indexes that die with the old table. Nudges already key on
+  // `status = 'ready'`, so a throttled member is naturally suppressed from
+  // shouldNudgeIdleMember / shouldNudgeInReviewTasks; the busy branch of
+  // handleSessionStatusEvent learns to release 'throttled' when the provider
+  // unblocks (a successful retry turns the session busy again).
+  `ALTER TABLE team_member RENAME TO team_member_old_m20;
+   CREATE TABLE IF NOT EXISTS team_member (
+     team_id          TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     name             TEXT NOT NULL,
+     session_id       TEXT NOT NULL,
+     agent            TEXT NOT NULL,
+     status           TEXT NOT NULL DEFAULT 'ready'
+                        CHECK(status IN ('ready', 'busy', 'shutdown_requested', 'shutdown', 'error', 'throttled')),
+     execution_status TEXT NOT NULL DEFAULT 'idle'
+                        CHECK(execution_status IN ('idle', 'starting', 'running',
+                          'cancel_requested', 'cancelling', 'cancelled',
+                          'completing', 'completed', 'failed', 'timed_out',
+                          'standby')),
+     model            TEXT,
+     prompt           TEXT,
+     time_created     INTEGER NOT NULL,
+     time_updated     INTEGER NOT NULL,
+     worktree_dir     TEXT,
+     worktree_branch  TEXT,
+     plan_approval    TEXT NOT NULL DEFAULT 'none'
+                        CHECK(plan_approval IN ('none', 'pending', 'approved', 'rejected')),
+     workspace_id     TEXT,
+     reported_to_lead INTEGER NOT NULL DEFAULT 0,
+     last_nudged_at   INTEGER,
+     retry_until      INTEGER,
+     retry_attempt    INTEGER,
+     retry_provider   TEXT,
+     retry_message    TEXT,
+     spawn_context    TEXT,
+     is_qa            INTEGER NOT NULL DEFAULT 0,
+     role             TEXT,
+     PRIMARY KEY (team_id, name)
+   );
+   INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, time_created, time_updated, worktree_dir, worktree_branch, plan_approval, workspace_id, reported_to_lead, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message, spawn_context, is_qa, role)
+     SELECT team_id, name, session_id, agent, status, execution_status, model, prompt, time_created, time_updated, worktree_dir, worktree_branch, plan_approval, workspace_id, reported_to_lead, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message, spawn_context, is_qa, role FROM team_member_old_m20;
+   DROP TABLE team_member_old_m20;
+   CREATE INDEX IF NOT EXISTS team_member_session_idx ON team_member(session_id);
+   CREATE INDEX IF NOT EXISTS team_member_status_idx ON team_member(team_id, status);`
 ];
 function applyMigrations(db) {
   const { user_version: current } = db.query("PRAGMA user_version").get();
@@ -916,10 +966,8 @@ function selectNextFallback(chain, current) {
 }
 var DEFAULT_CONFIG = {
   mergeOnCleanup: true,
-  stallThresholdMs: 3e5,
-  stallMinSteps: 5,
-  stallTokenThreshold: 200,
-  timeoutMs: 30 * 60 * 1e3,
+  paywallRetryThresholdMs: 60 * 60 * 1e3,
+  sharedCheckoutSingleWriter: false,
   rateLimitCapacity: 10,
   dashboardPort: 4747,
   peerMessageLimit: 5,
@@ -943,10 +991,8 @@ function readConfigFile(filePath) {
     const raw = JSON.parse(text);
     const result = {};
     if (typeof raw.mergeOnCleanup === "boolean") result.mergeOnCleanup = raw.mergeOnCleanup;
-    if (typeof raw.stallThresholdMs === "number") result.stallThresholdMs = raw.stallThresholdMs;
-    if (typeof raw.stallMinSteps === "number") result.stallMinSteps = raw.stallMinSteps;
-    if (typeof raw.stallTokenThreshold === "number") result.stallTokenThreshold = raw.stallTokenThreshold;
-    if (typeof raw.timeoutMs === "number") result.timeoutMs = raw.timeoutMs;
+    if (typeof raw.paywallRetryThresholdMs === "number") result.paywallRetryThresholdMs = raw.paywallRetryThresholdMs;
+    if (typeof raw.sharedCheckoutSingleWriter === "boolean") result.sharedCheckoutSingleWriter = raw.sharedCheckoutSingleWriter;
     if (typeof raw.rateLimitCapacity === "number") result.rateLimitCapacity = raw.rateLimitCapacity;
     if (typeof raw.dashboardPort === "number") result.dashboardPort = raw.dashboardPort;
     if (typeof raw.peerMessageLimit === "number") result.peerMessageLimit = raw.peerMessageLimit;
@@ -1001,12 +1047,12 @@ function loadConfig(projectDir) {
     ...global.fallbackModelsByAgent ?? {},
     ...project.fallbackModelsByAgent ?? {}
   };
-  const timeout = process.env.OPENCODE_ENSEMBLE_TIMEOUT;
-  if (timeout !== void 0) merged.timeoutMs = timeout === "0" ? 0 : parseInt(timeout, 10) || merged.timeoutMs;
+  const paywallRetry = process.env.OPENCODE_ENSEMBLE_PAYWALL_RETRY_THRESHOLD_MS;
+  if (paywallRetry !== void 0) {
+    merged.paywallRetryThresholdMs = parseInt(paywallRetry, 10) || merged.paywallRetryThresholdMs;
+  }
   const rateLimit = process.env.OPENCODE_ENSEMBLE_RATE_LIMIT;
   if (rateLimit !== void 0) merged.rateLimitCapacity = rateLimit === "0" ? 0 : parseInt(rateLimit, 10) || merged.rateLimitCapacity;
-  const stall = process.env.STALL_THRESHOLD_MS;
-  if (stall !== void 0) merged.stallThresholdMs = stall === "0" ? 0 : parseInt(stall, 10) || merged.stallThresholdMs;
   const roomInactivityThreshold = process.env.ROOM_INACTIVITY_THRESHOLD_MS ?? process.env.OPENCODE_ENSEMBLE_ROOM_INACTIVITY_THRESHOLD_MS;
   if (roomInactivityThreshold !== void 0) {
     merged.roomInactivityThresholdMs = roomInactivityThreshold === "0" ? 0 : parseInt(roomInactivityThreshold, 10) || merged.roomInactivityThresholdMs;
@@ -1551,6 +1597,322 @@ function resolveRecipientSession(db, registry, teamId, recipientName) {
   return memberRow.session_id;
 }
 
+// src/tools/shared.ts
+init_process();
+init_log();
+function resolveStandbyWake(db, teamId, memberName, baseText, singleWriterGate = false) {
+  const row = db.query(
+    "SELECT agent, execution_status, spawn_context, worktree_dir FROM team_member WHERE team_id = ? AND name = ?"
+  ).get(teamId, memberName);
+  if (!row || row.execution_status !== "standby") {
+    return { text: baseText, woke: false };
+  }
+  if (singleWriterGate && row.worktree_dir === null) {
+    const targetHoldsCard = db.query(
+      "SELECT id FROM team_task WHERE team_id = ? AND assignee = ? AND status = 'in_progress' LIMIT 1"
+    ).get(teamId, memberName);
+    if (targetHoldsCard) {
+      const otherBatonHolder = db.query(
+        `SELECT tm.name FROM team_member tm
+         WHERE tm.team_id = ? AND tm.name != ?
+           AND tm.worktree_dir IS NULL
+           AND EXISTS (
+             SELECT 1 FROM team_task tt
+             WHERE tt.team_id = tm.team_id AND tt.assignee = tm.name AND tt.status = 'in_progress'
+           )
+         LIMIT 1`
+      ).get(teamId, memberName);
+      if (otherBatonHolder) {
+        log(`standby:wake:blocked-shared-checkout member=${memberName} team=${teamId} other_baton=${otherBatonHolder.name} \u2014 dual card-holder wake deferred (formal baton, opt-in gate)`);
+        return { text: baseText, woke: false, blocked: true };
+      }
+    }
+  }
+  const result = db.run(
+    "UPDATE team_member SET execution_status = 'starting', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'standby'",
+    [Date.now(), teamId, memberName]
+  );
+  if (!result.changes) {
+    log(`standby:wake:lost-race member=${memberName} team=${teamId} \u2014 delivering without prepend`);
+    return { text: baseText, woke: false };
+  }
+  const context = row.spawn_context?.trim();
+  log(`standby:wake member=${memberName} team=${teamId} context=${context ? `${context.length} chars` : "none"} runtime=${!context}`);
+  return {
+    text: context ? `${context}
+
+${baseText}` : baseText,
+    woke: true,
+    agent: row.agent
+  };
+}
+async function countBranchCommits(branch, cwd) {
+  try {
+    const result = await runCommand(["git", "rev-list", "--count", `HEAD..${branch}`], { cwd });
+    if (result.exitCode !== 0) return -1;
+    const n = Number.parseInt(result.stdout.trim(), 10);
+    return Number.isNaN(n) ? -1 : n;
+  } catch {
+    return -1;
+  }
+}
+async function checkWorktreeDirty(dir) {
+  try {
+    const result = await runCommand(["git", "-C", dir, "status", "--porcelain"]);
+    if (result.exitCode !== 0) return false;
+    return result.stdout.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+function requireLead(deps, sessionId) {
+  const teamInfo = findTeamBySession(deps.db, deps.registry, sessionId);
+  if (!teamInfo) throw new Error("This session is not in a team. Use team_create first.");
+  if (teamInfo.role !== "lead") throw new Error("Only the team lead can use this tool.");
+  return { teamId: teamInfo.teamId, teamName: teamInfo.teamName };
+}
+function requireTeamMember(deps, sessionId) {
+  const teamInfo = findTeamBySession(deps.db, deps.registry, sessionId);
+  if (!teamInfo) throw new Error("This session is not in a team.");
+  return teamInfo;
+}
+function requireCanPurgeArchivedTeams(deps, sessionId) {
+  const activeMembers = deps.db.query(
+    `SELECT tm.session_id
+     FROM team_member tm
+     JOIN team t ON tm.team_id = t.id
+     WHERE t.status = 'active'`
+  ).all();
+  if (activeMembers.some((member) => member.session_id === sessionId)) {
+    throw new Error("Team members cannot purge archived teams");
+  }
+  const activeLeads = deps.db.query("SELECT lead_session_id FROM team WHERE status = 'active'").all();
+  if (deps.tracker.getParent(sessionId)) {
+    throw new Error("Sub-agents cannot purge archived teams");
+  }
+  if (activeLeads.some((team) => team.lead_session_id === sessionId)) return;
+  const activeTeamSessions = /* @__PURE__ */ new Set([
+    ...activeMembers.map((member) => member.session_id),
+    ...activeLeads.map((team) => team.lead_session_id)
+  ]);
+  if (deps.tracker.isDescendantOf(sessionId, activeTeamSessions)) {
+    throw new Error("Sub-agents cannot purge archived teams");
+  }
+}
+
+// src/recovery.ts
+init_merge_helper();
+init_log();
+init_process();
+async function isSessionAlive(client, sessionId, timeoutMs = 5e3) {
+  try {
+    await Promise.race([
+      client.session.get({ sessionID: sessionId }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("isSessionAlive timed out")), timeoutMs))
+    ]);
+    return true;
+  } catch (err) {
+    if (err instanceof Error && err.message === "isSessionAlive timed out") {
+      log(`recovery:team:liveness-check-timeout session=${sessionId}`);
+      return true;
+    }
+    return false;
+  }
+}
+async function recoverOrphanedTeams(db, client, cwd, registry) {
+  const active = db.query(
+    `SELECT id, lead_session_id FROM team
+     WHERE status = 'active' AND (? IS NULL OR project_id = ? OR project_id = 'default')`
+  ).all(cwd ?? null, cwd ?? null);
+  let archived = 0;
+  for (const team of active) {
+    if (await isSessionAlive(client, team.lead_session_id)) continue;
+    db.run("UPDATE team SET status = 'archived', time_updated = ? WHERE id = ?", [Date.now(), team.id]);
+    registry?.unregisterTeam(team.id);
+    archived++;
+    log(`recovery:team:orphaned team_id=${team.id} lead_session=${team.lead_session_id}`);
+  }
+  return { archived };
+}
+async function recoverStaleMembers(db, client, cwd, abortTimeoutMs = 5e3) {
+  const stale = db.query(
+    `SELECT tm.session_id, tm.worktree_branch, tm.name, tm.team_id, t.name as team_name, p.name as project_name
+      FROM team_member tm
+      JOIN team t ON tm.team_id = t.id
+      JOIN project p ON t.project_id = p.id
+      WHERE tm.status = 'busy' AND t.status = 'active'
+        AND (? IS NULL OR t.project_id = ? OR t.project_id = 'default')`
+  ).all(cwd ?? null, cwd ?? null);
+  const result = db.run(
+    `UPDATE team_member SET status = 'error', execution_status = 'idle', time_updated = ?
+      WHERE status = 'busy'
+        AND team_id IN (SELECT id FROM team WHERE status = 'active' AND (? IS NULL OR project_id = ? OR project_id = 'default'))`,
+    [Date.now(), cwd ?? null, cwd ?? null]
+  );
+  for (const member of stale) {
+    const released = releaseMemberTasks(db, member.team_id, member.name);
+    if (released > 0) log(`recovery:tasks:released name=${member.name} count=${released}`);
+  }
+  if (client) {
+    for (const member of stale) {
+      if (cwd && member.worktree_branch && !member.worktree_branch.startsWith("ensemble/preserved/")) {
+        const safeBranch = preservedBranchName(member.project_name, member.team_name, member.team_id, member.name);
+        const ok = await preserveBranch(member.worktree_branch, safeBranch, cwd);
+        if (ok) {
+          db.run(
+            "UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
+            [safeBranch, member.team_id, member.name]
+          );
+          log(`recovery:branch:preserved src=${member.worktree_branch} target=${safeBranch}`);
+        }
+      }
+      try {
+        await Promise.race([
+          client.session.abort({ sessionID: member.session_id }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("session.abort timed out")), abortTimeoutMs))
+        ]);
+      } catch (err) {
+        if (err instanceof Error && err.message === "session.abort timed out") {
+          log(`recovery:stale-members:abort-timeout session=${member.session_id}`);
+        }
+      }
+    }
+  }
+  return { interrupted: result.changes };
+}
+async function recoverOrphanedWorktrees(db, client) {
+  let removed = 0;
+  try {
+    const worktrees = await client.worktree.list();
+    if (!worktrees.data) return { removed: 0 };
+    const activeWorktrees = new Set(
+      db.query(
+        `SELECT tm.worktree_dir FROM team_member tm
+         JOIN team t ON tm.team_id = t.id
+         WHERE tm.worktree_dir IS NOT NULL AND t.status = 'active'`
+      ).all().map((r) => r.worktree_dir)
+    );
+    for (const wt of worktrees.data) {
+      if (!wt.name.startsWith("ensemble-")) continue;
+      if (activeWorktrees.has(wt.directory)) continue;
+      try {
+        await client.worktree.remove({ worktreeRemoveInput: { directory: wt.directory } });
+        removed++;
+      } catch {
+      }
+    }
+  } catch {
+  }
+  return { removed };
+}
+async function recoverTeamUndeliveredMessages(db, client, registry, teamId, singleWriterGate = false) {
+  const messages = getUndeliveredMessages(db, teamId);
+  let redelivered = 0;
+  let blocked = 0;
+  for (const msg of messages) {
+    let recipientSessionId;
+    const toName = msg.to_name;
+    if (toName === "lead") {
+      continue;
+    } else if (toName) {
+      const entry = registry.getByName(teamId, toName);
+      recipientSessionId = entry?.sessionId;
+    } else {
+      continue;
+    }
+    if (!recipientSessionId || !toName) continue;
+    if (hasReportedCompletion(db, teamId, toName)) {
+      markDelivered(db, msg.id);
+      continue;
+    }
+    try {
+      const recipientModel = getMemberModel(db, teamId, toName);
+      const wake = resolveStandbyWake(
+        db,
+        teamId,
+        toName,
+        `[Recovered team message from ${msg.from_name}]: ${msg.content}`,
+        singleWriterGate
+      );
+      if (wake.blocked) {
+        blocked++;
+        continue;
+      }
+      await client.session.promptAsync({
+        sessionID: recipientSessionId,
+        parts: [{ type: "text", text: wake.text }],
+        ...wake.agent ? { agent: wake.agent } : {},
+        ...recipientModel ? { model: recipientModel } : {}
+      });
+      markDelivered(db, msg.id);
+      redelivered++;
+    } catch {
+    }
+  }
+  return { redelivered, blocked };
+}
+async function recoverUndeliveredMessages(db, client, registry, singleWriterGate = false) {
+  const teams = db.query("SELECT id, lead_session_id FROM team WHERE status = 'active'").all();
+  let redelivered = 0;
+  for (const team of teams) {
+    const result = await recoverTeamUndeliveredMessages(db, client, registry, team.id, singleWriterGate);
+    redelivered += result.redelivered;
+  }
+  return { redelivered };
+}
+async function deliverDeferredStandbyWakes(db, client, registry, teamId, singleWriterGate = false) {
+  const standby = db.query(
+    "SELECT name FROM team_member WHERE team_id = ? AND execution_status = 'standby' LIMIT 1"
+  ).get(teamId);
+  if (!standby) return { redelivered: 0, blocked: 0 };
+  log(`shared-checkout:baton-release-flush team=${teamId} gate=${singleWriterGate}`);
+  return recoverTeamUndeliveredMessages(db, client, registry, teamId, singleWriterGate);
+}
+function rehydrateRegistry(db, registry) {
+  const members = db.query(
+    `SELECT tm.team_id, tm.name, tm.session_id
+     FROM team_member tm
+     JOIN team t ON tm.team_id = t.id
+     WHERE t.status = 'active' AND tm.status NOT IN ('shutdown', 'error')`
+  ).all();
+  for (const m of members) {
+    registry.register(m.team_id, m.name, m.session_id);
+  }
+  return members.length;
+}
+async function recoverOrphanedBranches(db, cwd) {
+  let removed = 0;
+  const archivedTeams = db.query(
+    `SELECT t.id, t.name, p.name as project_name FROM team t
+     JOIN project p ON t.project_id = p.id
+     WHERE t.status = 'archived'
+      AND t.project_id = ?
+     AND NOT EXISTS (
+        SELECT 1 FROM team_member tm
+        WHERE tm.team_id = t.id AND tm.status NOT IN ('shutdown', 'error')
+      )`
+  ).all(cwd);
+  if (archivedTeams.length === 0) return { removed: 0 };
+  const archivedPrefixes = archivedTeams.flatMap((t) => [
+    `ensemble/preserved/${t.project_name}/${teamResourceSegment(t.name, t.id)}/`,
+    `ensemble/preserved/${t.name}/`
+  ]);
+  const result = await runCommand(["git", "branch", "--list", "ensemble/preserved/*"], { cwd });
+  const branches = result.stdout.split("\n").map((b) => b.trim().replace(/^\* /, "")).filter(Boolean);
+  for (const branch of branches) {
+    if (!archivedPrefixes.some((prefix) => branch.startsWith(prefix))) continue;
+    try {
+      const deleteResult = await runCommand(["git", "branch", "-D", branch], { cwd });
+      if (deleteResult.exitCode === 0) {
+        removed++;
+        log(`recovery:branch:deleted branch=${branch}`);
+      }
+    } catch {
+    }
+  }
+  return { removed };
+}
+
 // src/qa-role.ts
 function resolveBasePersona2(memberName) {
   return (memberName.split(/[-_]/)[0] ?? memberName).toLowerCase();
@@ -1649,10 +2011,54 @@ function getTeamSDETMember(db, teamId) {
   return null;
 }
 
+// src/standby-guard.ts
+init_log();
+var STANDBY_LOOP_LIMIT = 3;
+var INTENTIONAL_ABORT_TTL_MS = 3e4;
+var standbyLoopCounts = /* @__PURE__ */ new Map();
+var intentionalAborts = /* @__PURE__ */ new Map();
+function resetStandbyLoop(sessionId) {
+  if (!sessionId) return;
+  standbyLoopCounts.delete(sessionId);
+}
+function incrementStandbyLoop(sessionId) {
+  if (!sessionId) return 0;
+  const next = (standbyLoopCounts.get(sessionId) ?? 0) + 1;
+  standbyLoopCounts.set(sessionId, next);
+  return next;
+}
+function noteToolCall(sessionId, tool2) {
+  if (!sessionId) return;
+  if (tool2 === "team_standby") return;
+  standbyLoopCounts.delete(sessionId);
+}
+function markIntentionalAbort(sessionId) {
+  if (!sessionId) return;
+  intentionalAborts.set(sessionId, Date.now());
+}
+function consumeIntentionalAbort(sessionId) {
+  if (!sessionId) return false;
+  const at = intentionalAborts.get(sessionId);
+  if (at === void 0) return false;
+  intentionalAborts.delete(sessionId);
+  return Date.now() - at <= INTENTIONAL_ABORT_TTL_MS;
+}
+function scheduleStandbyAbort(client, sessionId, reason) {
+  if (!sessionId) return;
+  markIntentionalAbort(sessionId);
+  const fire = () => {
+    Promise.resolve().then(() => client.session.abort({ sessionID: sessionId })).catch((err) => {
+      log(`standby:abort-failed session=${sessionId} reason=${reason} err=${err instanceof Error ? err.message : String(err)}`);
+    });
+  };
+  if (typeof setImmediate === "function") setImmediate(fire);
+  else setTimeout(fire, 0);
+}
+
 // src/hooks.ts
 init_log();
 var TEAM_TOOL_PREFIX = "team_";
-function handleSessionStatusEvent(db, registry, sessionId, status, retryPayload) {
+function handleSessionStatusEvent(db, registry, sessionId, status, retryPayload, client, config) {
   const entry = registry.getBySession(sessionId);
   if (!entry) return void 0;
   const team = db.query("SELECT status FROM team WHERE id = ?").get(entry.teamId);
@@ -1669,6 +2075,11 @@ function handleSessionStatusEvent(db, registry, sessionId, status, retryPayload)
     if (newStatus === "shutdown") {
       releaseMemberTasks(db, entry.teamId, entry.memberName);
     }
+    if (client) {
+      void deliverDeferredStandbyWakes(db, client, registry, entry.teamId, config?.sharedCheckoutSingleWriter === true).catch((err) => {
+        log(`status:baton-release-flush:failed team=${entry.teamId} err=${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
     if (member.status === "busy" && newStatus === "ready") {
       const leadMsgCount = db.query(
         "SELECT COUNT(*) as c FROM team_message WHERE team_id = ? AND from_name = ? AND to_name = 'lead'"
@@ -1682,7 +2093,7 @@ function handleSessionStatusEvent(db, registry, sessionId, status, retryPayload)
     }
     return { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: newStatus };
   } else if (status === "busy") {
-    if (member.status === "ready" || member.status === "error") {
+    if (member.status === "ready" || member.status === "error" || member.status === "throttled") {
       db.run(
         "UPDATE team_member SET status = 'busy', execution_status = 'running', reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
         [Date.now(), entry.teamId, entry.memberName]
@@ -1714,6 +2125,27 @@ function handleSessionStatusEvent(db, registry, sessionId, status, retryPayload)
           entry.memberName
         ]
       );
+      const thresholdMs = config?.paywallRetryThresholdMs ?? 60 * 60 * 1e3;
+      const longHorizon = next !== null && next - Date.now() > thresholdMs;
+      if (longHorizon && member.status !== "throttled") {
+        db.run(
+          "UPDATE team_member SET status = 'throttled', time_updated = ? WHERE team_id = ? AND name = ?",
+          [Date.now(), entry.teamId, entry.memberName]
+        );
+        if (client) {
+          const resumeAt = new Date(next).toISOString();
+          const detail = retryPayload.action?.message ?? retryPayload.message ?? "provider retry scheduled";
+          notifyLead(
+            client,
+            db,
+            entry.teamId,
+            `Teammate "${entry.memberName}" is THROTTLED by a paywall/long rate-limit \u2014 next retry not before ${resumeAt} (${detail}). Nudges and delivery are suspended until the provider unblocks; the member resumes automatically on the next successful turn.`,
+            config ? { config } : void 0
+          );
+        }
+        log(`status:throttled member=${entry.memberName} team=${entry.teamId} next_retry_in_ms=${next - Date.now()} threshold_ms=${thresholdMs}`);
+        return { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: "throttled" };
+      }
     }
     return { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: "retry" };
   }
@@ -1820,9 +2252,11 @@ function handleSessionErrorEvent(db, registry, client, sessionId, error, config)
   if (!sessionId) return;
   const teamInfo = findTeamBySession(db, registry, sessionId);
   if (!teamInfo || teamInfo.role !== "member" || !teamInfo.memberName) return;
-  if (isAbortError(error)) {
+  const intentionalAbort = consumeIntentionalAbort(sessionId);
+  if (isAbortError(error) || intentionalAbort) {
     const abortMsg = error?.data?.message ?? error?.name ?? "aborted";
-    log(`session-error:aborted member=${teamInfo.memberName} team=${teamInfo.teamId} err=${abortMsg}`);
+    const origin = intentionalAbort ? "intentional" : "error-signature";
+    log(`session-error:aborted member=${teamInfo.memberName} team=${teamInfo.teamId} origin=${origin} err=${abortMsg}`);
     return;
   }
   const errMsg = error?.data?.message ?? error?.name ?? "unknown error";
@@ -2000,6 +2434,48 @@ function collectDeadSelectors(failedModel, boundModel, gateWalkFrom, lastApplied
   }
   return out;
 }
+var PAYWALL_SIGNATURES = [
+  /subscribe to opencode go/i,
+  /\bpaywall\b/i,
+  /out of (?:quota|credits|capacity)/i,
+  /quota exceeded/i,
+  /insufficient (?:credit|quota)/i,
+  /upgrade (?:your|the) plan/i,
+  /plan (?:limit|exceeded|expired)/i,
+  /billing (?:required|issue|hold)/i
+];
+function isPaywallFailure(payload) {
+  if (!payload) return false;
+  const texts = modelErrorTexts(payload);
+  if (texts.length === 0 && typeof payload === "string") texts.push(payload);
+  return texts.some((text) => PAYWALL_SIGNATURES.some((rx) => rx.test(text)));
+}
+var paywallDeadRungs = /* @__PURE__ */ new Map();
+function recordPaywallDeadRung(scopeKey, selector) {
+  const identity = modelIdentity(selector);
+  if (!identity) return;
+  let set = paywallDeadRungs.get(scopeKey);
+  if (!set) {
+    set = /* @__PURE__ */ new Set();
+    paywallDeadRungs.set(scopeKey, set);
+  }
+  if (!set.has(identity)) {
+    set.add(identity);
+    log(`paywall:dead-rung:recorded scope=${scopeKey} model=${identity}`);
+  }
+}
+function getPaywallDeadRungs(scopeKey) {
+  const set = paywallDeadRungs.get(scopeKey);
+  return set ? [...set] : [];
+}
+function filterChainAgainstPaywallLedger(chain, deadIdentities) {
+  if (deadIdentities.length === 0) return [...chain];
+  const dead = new Set(deadIdentities);
+  return chain.filter((entry) => {
+    const identity = catalogKey(entry.model);
+    return !identity || !dead.has(identity);
+  });
+}
 async function handleRetryModelFailover(db, registry, client, config, sessionId, retryPayload) {
   const entry = registry.getBySession(sessionId);
   if (!entry) {
@@ -2014,35 +2490,41 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
   }
   const cooldownKey = `${entry.teamId}:${entry.memberName}`;
   const now = Date.now();
-  const deterministic = isModelResolutionFailure(retryPayload);
+  const paywall = isPaywallFailure(retryPayload);
+  const deterministic = isModelResolutionFailure(retryPayload) || paywall;
+  const failReason = paywall ? "paywall" : deterministic ? "model-not-found" : "rate-limit";
   const failedModel = deterministic ? extractFailedModelSelector(retryPayload) ?? member.model : member.model;
+  if (paywall) {
+    recordPaywallDeadRung(entry.teamId, failedModel ?? member.model);
+  }
   const gate = deterministic ? evaluateDeterministicFailover(cooldownKey, failedModel, now) : evaluateFailoverCooldown(cooldownKey, member.model, now);
   if (gate.verdict === "suppressed") {
-    log(`failover:suppressed member=${entry.memberName} remaining_ms=${gate.remainingMs} reason=${deterministic ? "model-not-found" : "rate-limit"}`);
+    log(`failover:suppressed member=${entry.memberName} remaining_ms=${gate.remainingMs} reason=${failReason}`);
     return {
       action: "suppressed",
       memberName: entry.memberName,
       teamId: entry.teamId,
       fromModel: member.model,
-      reason: deterministic ? "model-not-found" : "rate-limit"
+      reason: failReason
     };
   }
   const chain = resolveFallbackChainForAgent(config, member.agent);
+  const usableChain = filterChainAgainstPaywallLedger(chain, getPaywallDeadRungs(entry.teamId));
   const next = deterministic ? selectDeterministicNextFallback(
-    chain,
+    usableChain,
     collectDeadSelectors(failedModel, member.model, gate.walkFrom, failoverActions.get(cooldownKey)?.toModel ?? null)
-  ) : selectNextFallback(chain, gate.walkFrom);
+  ) : selectNextFallback(usableChain, gate.walkFrom);
   if (!next) {
     recordFailoverAction(cooldownKey, now, member.model, null, true);
     const detail = retryPayload?.action?.message ?? retryPayload?.message ?? "rate limited";
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty";
-    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}] reason=${deterministic ? "model-not-found" : "rate-limit"} detail=${detail}`);
+    log(`failover:exhausted member=${entry.memberName} model=${member.model ?? "default"} chain=[${chainDesc}] reason=${failReason} detail=${detail}`);
     return {
       action: "exhausted",
       memberName: entry.memberName,
       teamId: entry.teamId,
       fromModel: member.model,
-      reason: deterministic ? "model-not-found" : "rate-limit"
+      reason: failReason
     };
   }
   const toSelector = formatModelSelector(next);
@@ -2051,7 +2533,7 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
     [toSelector, now, entry.teamId, entry.memberName]
   );
   recordFailoverAction(cooldownKey, now, member.model, toSelector, false);
-  log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} reason=${deterministic ? "model-not-found" : "rate-limit"} (silent \u2014 lead not woken)`);
+  log(`failover:switched member=${entry.memberName} from=${member.model ?? "default"} to=${toSelector} reason=${failReason} (silent \u2014 lead not woken)`);
   const cancelled = abortInflight(sessionId);
   log(`failover:abort-inflight member=${entry.memberName} session=${sessionId} cancelled=${cancelled}`);
   if (typeof client.session?.abort === "function") {
@@ -2069,7 +2551,7 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
         parts: [
           {
             type: "text",
-            text: deterministic ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]` : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`
+            text: paywall ? `[System: Provider paywall/out-of-quota blocked "${failedModel ?? member.model ?? "the current model"}". Switched to ${toSelector}. Resume your assigned task.]` : deterministic ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]` : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`
           }
         ],
         // Agent EXPLICIT (Diana achado 2 — BLOCKING): omitting `agent` makes
@@ -2092,7 +2574,7 @@ async function handleRetryModelFailover(db, registry, client, config, sessionId,
     teamId: entry.teamId,
     fromModel: member.model,
     toModel: toSelector,
-    reason: deterministic ? "model-not-found" : "rate-limit"
+    reason: failReason
   };
 }
 async function handleIsolatedSessionFailover(db, client, config, sessionId, retryPayload) {
@@ -2125,39 +2607,45 @@ async function handleIsolatedSessionFailover(db, client, config, sessionId, retr
   if (chain.length === 0) return void 0;
   const cooldownKey = `isolated:${sessionId}`;
   const now = Date.now();
-  const deterministic = isModelResolutionFailure(retryPayload);
+  const paywall = isPaywallFailure(retryPayload);
+  const deterministic = isModelResolutionFailure(retryPayload) || paywall;
+  const failReason = paywall ? "paywall" : deterministic ? "model-not-found" : "rate-limit";
   const failedModel = deterministic ? extractFailedModelSelector(retryPayload) ?? currentModel : currentModel;
+  if (paywall) {
+    recordPaywallDeadRung(cooldownKey, failedModel ?? currentModel);
+  }
   const gate = evaluateFailoverCooldown(cooldownKey, currentModel, now);
   const effectiveGate = deterministic ? evaluateDeterministicFailover(cooldownKey, failedModel, now) : gate;
   if (effectiveGate.verdict === "suppressed") {
-    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${effectiveGate.remainingMs} reason=${deterministic ? "model-not-found" : "rate-limit"}`);
+    log(`failover:suppressed ${scope} session=${sessionId} agent=${agent} remaining_ms=${effectiveGate.remainingMs} reason=${failReason}`);
     return {
       action: "suppressed",
       memberName: agent,
       teamId: "",
       fromModel: currentModel,
-      reason: deterministic ? "model-not-found" : "rate-limit"
+      reason: failReason
     };
   }
+  const usableChain = filterChainAgainstPaywallLedger(chain, getPaywallDeadRungs(cooldownKey));
   const next = deterministic ? selectDeterministicNextFallback(
-    chain,
+    usableChain,
     collectDeadSelectors(failedModel, currentModel, effectiveGate.walkFrom, failoverActions.get(cooldownKey)?.toModel ?? null)
-  ) : selectNextFallback(chain, effectiveGate.walkFrom);
+  ) : selectNextFallback(usableChain, effectiveGate.walkFrom);
   if (!next) {
     recordFailoverAction(cooldownKey, now, currentModel, null, true);
     const chainDesc = chain.map(formatModelSelector).join(" -> ") || "empty";
-    log(`failover:exhausted ${scope} session=${sessionId} agent=${agent} model=${currentModel ?? "default"} chain=[${chainDesc}] reason=${deterministic ? "model-not-found" : "rate-limit"}`);
+    log(`failover:exhausted ${scope} session=${sessionId} agent=${agent} model=${currentModel ?? "default"} chain=[${chainDesc}] reason=${failReason}`);
     return {
       action: "exhausted",
       memberName: agent,
       teamId: "",
       fromModel: currentModel,
-      reason: deterministic ? "model-not-found" : "rate-limit"
+      reason: failReason
     };
   }
   const toSelector = formatModelSelector(next);
   recordFailoverAction(cooldownKey, now, currentModel, toSelector, false);
-  log(`failover:switched ${scope} session=${sessionId} agent=${agent} from=${currentModel ?? "default"} to=${toSelector} reason=${deterministic ? "model-not-found" : "rate-limit"} (silent \u2014 lead not woken)`);
+  log(`failover:switched ${scope} session=${sessionId} agent=${agent} from=${currentModel ?? "default"} to=${toSelector} reason=${failReason} (silent \u2014 lead not woken)`);
   const cancelled = abortInflight(sessionId);
   log(`failover:abort-inflight ${scope} session=${sessionId} cancelled=${cancelled}`);
   if (typeof client.session?.abort === "function") {
@@ -2175,7 +2663,7 @@ async function handleIsolatedSessionFailover(db, client, config, sessionId, retr
         parts: [
           {
             type: "text",
-            text: deterministic ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]` : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`
+            text: paywall ? `[System: Provider paywall/out-of-quota blocked "${failedModel ?? currentModel ?? "the current model"}". Switched to ${toSelector}. Resume your assigned task.]` : deterministic ? `[System: Model "${failedModel ?? "unknown"}" was not found by the provider. Switched to ${toSelector}. Resume your assigned task.]` : `[System: Rate limit encountered on previous model. Switched to ${toSelector}. Resume your assigned task.]`
           }
         ],
         // Agent EXPLICIT (Diana achado 2 — BLOCKING, HARNESS-15 A rule 1b):
@@ -2197,7 +2685,7 @@ async function handleIsolatedSessionFailover(db, client, config, sessionId, retr
     teamId: "",
     fromModel: currentModel,
     toModel: toSelector,
-    reason: deterministic ? "model-not-found" : "rate-limit"
+    reason: failReason
   };
 }
 async function handleModelNotFoundSessionError(db, registry, client, config, sessionId, error) {
@@ -2483,281 +2971,6 @@ function createV2Client(ctx, deps = {}) {
   };
 }
 
-// src/tools/shared.ts
-init_process();
-init_log();
-function resolveStandbyWake(db, teamId, memberName, baseText) {
-  const row = db.query(
-    "SELECT agent, execution_status, spawn_context FROM team_member WHERE team_id = ? AND name = ?"
-  ).get(teamId, memberName);
-  if (!row || row.execution_status !== "standby") {
-    return { text: baseText, woke: false };
-  }
-  const result = db.run(
-    "UPDATE team_member SET execution_status = 'starting', time_updated = ? WHERE team_id = ? AND name = ? AND execution_status = 'standby'",
-    [Date.now(), teamId, memberName]
-  );
-  if (!result.changes) {
-    log(`standby:wake:lost-race member=${memberName} team=${teamId} \u2014 delivering without prepend`);
-    return { text: baseText, woke: false };
-  }
-  const context = row.spawn_context?.trim();
-  log(`standby:wake member=${memberName} team=${teamId} context=${context ? `${context.length} chars` : "none"} runtime=${!context}`);
-  return {
-    text: context ? `${context}
-
-${baseText}` : baseText,
-    woke: true,
-    agent: row.agent
-  };
-}
-async function countBranchCommits(branch, cwd) {
-  try {
-    const result = await runCommand(["git", "rev-list", "--count", `HEAD..${branch}`], { cwd });
-    if (result.exitCode !== 0) return -1;
-    const n = Number.parseInt(result.stdout.trim(), 10);
-    return Number.isNaN(n) ? -1 : n;
-  } catch {
-    return -1;
-  }
-}
-async function checkWorktreeDirty(dir) {
-  try {
-    const result = await runCommand(["git", "-C", dir, "status", "--porcelain"]);
-    if (result.exitCode !== 0) return false;
-    return result.stdout.trim().length > 0;
-  } catch {
-    return false;
-  }
-}
-function requireLead(deps, sessionId) {
-  const teamInfo = findTeamBySession(deps.db, deps.registry, sessionId);
-  if (!teamInfo) throw new Error("This session is not in a team. Use team_create first.");
-  if (teamInfo.role !== "lead") throw new Error("Only the team lead can use this tool.");
-  return { teamId: teamInfo.teamId, teamName: teamInfo.teamName };
-}
-function requireTeamMember(deps, sessionId) {
-  const teamInfo = findTeamBySession(deps.db, deps.registry, sessionId);
-  if (!teamInfo) throw new Error("This session is not in a team.");
-  return teamInfo;
-}
-function requireCanPurgeArchivedTeams(deps, sessionId) {
-  const activeMembers = deps.db.query(
-    `SELECT tm.session_id
-     FROM team_member tm
-     JOIN team t ON tm.team_id = t.id
-     WHERE t.status = 'active'`
-  ).all();
-  if (activeMembers.some((member) => member.session_id === sessionId)) {
-    throw new Error("Team members cannot purge archived teams");
-  }
-  const activeLeads = deps.db.query("SELECT lead_session_id FROM team WHERE status = 'active'").all();
-  if (deps.tracker.getParent(sessionId)) {
-    throw new Error("Sub-agents cannot purge archived teams");
-  }
-  if (activeLeads.some((team) => team.lead_session_id === sessionId)) return;
-  const activeTeamSessions = /* @__PURE__ */ new Set([
-    ...activeMembers.map((member) => member.session_id),
-    ...activeLeads.map((team) => team.lead_session_id)
-  ]);
-  if (deps.tracker.isDescendantOf(sessionId, activeTeamSessions)) {
-    throw new Error("Sub-agents cannot purge archived teams");
-  }
-}
-
-// src/recovery.ts
-init_merge_helper();
-init_log();
-init_process();
-async function isSessionAlive(client, sessionId, timeoutMs = 5e3) {
-  try {
-    await Promise.race([
-      client.session.get({ sessionID: sessionId }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("isSessionAlive timed out")), timeoutMs))
-    ]);
-    return true;
-  } catch (err) {
-    if (err instanceof Error && err.message === "isSessionAlive timed out") {
-      log(`recovery:team:liveness-check-timeout session=${sessionId}`);
-      return true;
-    }
-    return false;
-  }
-}
-async function recoverOrphanedTeams(db, client, cwd, registry) {
-  const active = db.query(
-    `SELECT id, lead_session_id FROM team
-     WHERE status = 'active' AND (? IS NULL OR project_id = ? OR project_id = 'default')`
-  ).all(cwd ?? null, cwd ?? null);
-  let archived = 0;
-  for (const team of active) {
-    if (await isSessionAlive(client, team.lead_session_id)) continue;
-    db.run("UPDATE team SET status = 'archived', time_updated = ? WHERE id = ?", [Date.now(), team.id]);
-    registry?.unregisterTeam(team.id);
-    archived++;
-    log(`recovery:team:orphaned team_id=${team.id} lead_session=${team.lead_session_id}`);
-  }
-  return { archived };
-}
-async function recoverStaleMembers(db, client, cwd, abortTimeoutMs = 5e3) {
-  const stale = db.query(
-    `SELECT tm.session_id, tm.worktree_branch, tm.name, tm.team_id, t.name as team_name, p.name as project_name
-      FROM team_member tm
-      JOIN team t ON tm.team_id = t.id
-      JOIN project p ON t.project_id = p.id
-      WHERE tm.status = 'busy' AND t.status = 'active'
-        AND (? IS NULL OR t.project_id = ? OR t.project_id = 'default')`
-  ).all(cwd ?? null, cwd ?? null);
-  const result = db.run(
-    `UPDATE team_member SET status = 'error', execution_status = 'idle', time_updated = ?
-      WHERE status = 'busy'
-        AND team_id IN (SELECT id FROM team WHERE status = 'active' AND (? IS NULL OR project_id = ? OR project_id = 'default'))`,
-    [Date.now(), cwd ?? null, cwd ?? null]
-  );
-  for (const member of stale) {
-    const released = releaseMemberTasks(db, member.team_id, member.name);
-    if (released > 0) log(`recovery:tasks:released name=${member.name} count=${released}`);
-  }
-  if (client) {
-    for (const member of stale) {
-      if (cwd && member.worktree_branch && !member.worktree_branch.startsWith("ensemble/preserved/")) {
-        const safeBranch = preservedBranchName(member.project_name, member.team_name, member.team_id, member.name);
-        const ok = await preserveBranch(member.worktree_branch, safeBranch, cwd);
-        if (ok) {
-          db.run(
-            "UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
-            [safeBranch, member.team_id, member.name]
-          );
-          log(`recovery:branch:preserved src=${member.worktree_branch} target=${safeBranch}`);
-        }
-      }
-      try {
-        await Promise.race([
-          client.session.abort({ sessionID: member.session_id }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("session.abort timed out")), abortTimeoutMs))
-        ]);
-      } catch (err) {
-        if (err instanceof Error && err.message === "session.abort timed out") {
-          log(`recovery:stale-members:abort-timeout session=${member.session_id}`);
-        }
-      }
-    }
-  }
-  return { interrupted: result.changes };
-}
-async function recoverOrphanedWorktrees(db, client) {
-  let removed = 0;
-  try {
-    const worktrees = await client.worktree.list();
-    if (!worktrees.data) return { removed: 0 };
-    const activeWorktrees = new Set(
-      db.query(
-        `SELECT tm.worktree_dir FROM team_member tm
-         JOIN team t ON tm.team_id = t.id
-         WHERE tm.worktree_dir IS NOT NULL AND t.status = 'active'`
-      ).all().map((r) => r.worktree_dir)
-    );
-    for (const wt of worktrees.data) {
-      if (!wt.name.startsWith("ensemble-")) continue;
-      if (activeWorktrees.has(wt.directory)) continue;
-      try {
-        await client.worktree.remove({ worktreeRemoveInput: { directory: wt.directory } });
-        removed++;
-      } catch {
-      }
-    }
-  } catch {
-  }
-  return { removed };
-}
-async function recoverUndeliveredMessages(db, client, registry) {
-  const teams = db.query("SELECT id, lead_session_id FROM team WHERE status = 'active'").all();
-  let redelivered = 0;
-  for (const team of teams) {
-    const messages = getUndeliveredMessages(db, team.id);
-    for (const msg of messages) {
-      let recipientSessionId;
-      const toName = msg.to_name;
-      if (toName === "lead") {
-        continue;
-      } else if (toName) {
-        const entry = registry.getByName(team.id, toName);
-        recipientSessionId = entry?.sessionId;
-      } else {
-        continue;
-      }
-      if (!recipientSessionId || !toName) continue;
-      if (hasReportedCompletion(db, team.id, toName)) {
-        markDelivered(db, msg.id);
-        continue;
-      }
-      try {
-        const recipientModel = getMemberModel(db, team.id, toName);
-        const wake = resolveStandbyWake(
-          db,
-          team.id,
-          toName,
-          `[Recovered team message from ${msg.from_name}]: ${msg.content}`
-        );
-        await client.session.promptAsync({
-          sessionID: recipientSessionId,
-          parts: [{ type: "text", text: wake.text }],
-          ...wake.agent ? { agent: wake.agent } : {},
-          ...recipientModel ? { model: recipientModel } : {}
-        });
-        markDelivered(db, msg.id);
-        redelivered++;
-      } catch {
-      }
-    }
-  }
-  return { redelivered };
-}
-function rehydrateRegistry(db, registry) {
-  const members = db.query(
-    `SELECT tm.team_id, tm.name, tm.session_id
-     FROM team_member tm
-     JOIN team t ON tm.team_id = t.id
-     WHERE t.status = 'active' AND tm.status NOT IN ('shutdown', 'error')`
-  ).all();
-  for (const m of members) {
-    registry.register(m.team_id, m.name, m.session_id);
-  }
-  return members.length;
-}
-async function recoverOrphanedBranches(db, cwd) {
-  let removed = 0;
-  const archivedTeams = db.query(
-    `SELECT t.id, t.name, p.name as project_name FROM team t
-     JOIN project p ON t.project_id = p.id
-     WHERE t.status = 'archived'
-      AND t.project_id = ?
-     AND NOT EXISTS (
-        SELECT 1 FROM team_member tm
-        WHERE tm.team_id = t.id AND tm.status NOT IN ('shutdown', 'error')
-      )`
-  ).all(cwd);
-  if (archivedTeams.length === 0) return { removed: 0 };
-  const archivedPrefixes = archivedTeams.flatMap((t) => [
-    `ensemble/preserved/${t.project_name}/${teamResourceSegment(t.name, t.id)}/`,
-    `ensemble/preserved/${t.name}/`
-  ]);
-  const result = await runCommand(["git", "branch", "--list", "ensemble/preserved/*"], { cwd });
-  const branches = result.stdout.split("\n").map((b) => b.trim().replace(/^\* /, "")).filter(Boolean);
-  for (const branch of branches) {
-    if (!archivedPrefixes.some((prefix) => branch.startsWith(prefix))) continue;
-    try {
-      const deleteResult = await runCommand(["git", "branch", "-D", branch], { cwd });
-      if (deleteResult.exitCode === 0) {
-        removed++;
-        log(`recovery:branch:deleted branch=${branch}`);
-      }
-    } catch {
-    }
-  }
-  return { removed };
-}
-
 // src/result-parser.ts
 function parseTaskResult(content) {
   const match = content.match(/<task-result>([\s\S]*?)<\/task-result>/);
@@ -2805,6 +3018,7 @@ function leadTopologySizingReminder() {
 var STATUS_DISPLAY = {
   busy: "working",
   ready: "idle",
+  throttled: "throttled (paywall/long rate-limit)",
   shutdown_requested: "shutting down",
   shutdown: "shut down",
   error: "error"
@@ -3858,8 +4072,22 @@ async function executeTeamStandby(deps, args, sessionId) {
   if (!memberName) {
     throw new Error("Unknown member name for session");
   }
+  const consecutive = incrementStandbyLoop(sessionId);
+  const loopBroken = consecutive >= STANDBY_LOOP_LIMIT;
   setMemberStandby(deps.db, teamInfo.teamId, memberName, args.reason);
+  if (loopBroken) {
+    log(`standby:loop-breaker member=${memberName} team=${teamInfo.teamId} count=${consecutive}`);
+    resetStandbyLoop(sessionId);
+  }
+  scheduleStandbyAbort(
+    deps.client,
+    sessionId,
+    loopBroken ? `loop-breaker count=${consecutive}` : "team_standby"
+  );
   const reasonStr = args.reason ? ` (reason: ${args.reason})` : "";
+  if (loopBroken) {
+    return `Entered standby mode${reasonStr}. Repetition breaker fired after ${consecutive} consecutive team_standby calls \u2014 the runtime has aborted this turn.`;
+  }
   return `Entered standby mode${reasonStr}. Execution suspended until a new message arrives.`;
 }
 
@@ -4118,8 +4346,13 @@ async function executeTeamMessage(deps, args, sessionId) {
     deps.db,
     teamInfo.teamId,
     args.to,
-    `[Team message from ${senderName}]: ${messageText}`
+    `[Team message from ${senderName}]: ${messageText}`,
+    deps.config?.sharedCheckoutSingleWriter === true
   );
+  if (wake.blocked) {
+    log(`team_message:deferred-shared-checkout from=${senderName} to=${args.to} (formal dual card-holder \u2014 opt-in single-writer gate)`);
+    return `Message queued for ${args.to} \u2014 deferred by the shared-checkout single-writer gate (another member holds the formal baton: an in_progress card in this checkout). It will be delivered when the baton is released (card completed, handed over, or returned to the pool).`;
+  }
   const recipientModel = getMemberModel(deps.db, teamInfo.teamId, args.to);
   const controller = trackPrompt(recipientSessionId);
   deps.client.session.promptAsync({
@@ -4179,12 +4412,18 @@ async function executeTeamBroadcast(deps, args, sessionId) {
   const idByRecipient = new Map(rows.map((r) => [r.recipient, r.id]));
   const baseText = `[Team broadcast from ${senderName}]: ${args.text}`;
   let skipped = 0;
+  let deferred = 0;
   for (const recipient of recipients) {
     if (!recipient.prompt) {
       skipped++;
       continue;
     }
-    const wake = recipient.name !== "lead" ? resolveStandbyWake(deps.db, teamInfo.teamId, recipient.name, baseText) : { text: baseText, woke: false };
+    const wake = recipient.name !== "lead" ? resolveStandbyWake(deps.db, teamInfo.teamId, recipient.name, baseText, deps.config?.sharedCheckoutSingleWriter === true) : { text: baseText, woke: false };
+    if (wake.blocked) {
+      deferred++;
+      log(`team_broadcast:deferred-shared-checkout to=${recipient.name} (formal dual card-holder \u2014 opt-in single-writer gate)`);
+      continue;
+    }
     const memberModel = recipient.name !== "lead" ? getMemberModel(deps.db, teamInfo.teamId, recipient.name) : void 0;
     const msgId = idByRecipient.get(recipient.name);
     deps.client.session.promptAsync({
@@ -4205,8 +4444,9 @@ async function executeTeamBroadcast(deps, args, sessionId) {
       }
     });
   }
-  const sent = recipients.length - skipped;
-  return `Broadcast sent to ${sent} recipient${sent !== 1 ? "s" : ""}.`;
+  const sent = recipients.length - skipped - deferred;
+  const deferredNote = deferred > 0 ? ` (${deferred} deferred by the shared-checkout single-writer gate \u2014 delivered when the formal baton is released)` : "";
+  return `Broadcast sent to ${sent} recipient${sent !== 1 ? "s" : ""}${deferredNote}.`;
 }
 
 // src/tools/team-tasks-list.ts
@@ -5132,6 +5372,7 @@ async function executeTeamTaskHandover(deps, args, sessionId) {
   let standbySuffix = "";
   if (teamInfo.role !== "lead" && teamInfo.memberName) {
     setMemberStandby(deps.db, teamInfo.teamId, teamInfo.memberName, `handover of ${taskId} to ${to}`);
+    scheduleStandbyAbort(deps.client, sessionId, `task-handover ${taskId} to ${to}`);
     standbySuffix = " You have entered standby (execution suspended) with a clean context window until the baton returns.";
   }
   log(`task-handover:ok task=${taskId} from=${caller} to=${to} notified=${notified}`);
@@ -6775,6 +7016,7 @@ const ST={
   busy:{c:'border-blue-500 bg-blue-500/[0.04]',d:'bg-blue-500',t:'text-blue-400',l:'working',dim:false},
   standby:{c:'border-violet-500 bg-violet-500/[0.04]',d:'bg-violet-500',t:'text-violet-400',l:'standby',dim:true},
   ready:{c:'border-base-700 bg-base-950/50',d:'bg-txt-400',t:'text-txt-400',l:'idle',dim:true},
+  throttled:{c:'border-amber-500/50 bg-amber-500/[0.04]',d:'bg-amber-500',t:'text-amber-400',l:'throttled',dim:false},
   shutdown_requested:{c:'border-amber-500/50 bg-amber-500/[0.04]',d:'bg-amber-500',t:'text-amber-400',l:'stopping',dim:false},
   shutdown:{c:'border-base-800 bg-base-950/30',d:'bg-base-700',t:'text-txt-500',l:'done',dim:true},
   error:{c:'border-red-500/50 bg-red-500/[0.04]',d:'bg-red-500',t:'text-red-400',l:'error',dim:false},
@@ -6784,7 +7026,7 @@ const ST={
 // otherwise fall back to the status key with the 'ready' styling as default.
 const si=(s,es)=>((s==='standby'||es==='standby')?ST.standby:(ST[s]||ST.ready));
 // Chip colour for the status/execution_status badge (keep in sync with si()).
-const sx=(m)=>((m.status==='standby'||m.executionStatus==='standby')?'violet':(m.status==='busy'?'blue':m.status==='error'?'red':'muted'));
+const sx=(m)=>((m.status==='standby'||m.executionStatus==='standby')?'violet':(m.status==='busy'?'blue':m.status==='error'?'red':m.status==='throttled'?'amber':'muted'));
 const PR={high:'text-red-400 bg-red-500/10 border border-red-500/20',medium:'text-amber-400 bg-amber-500/10 border border-amber-500/20',low:'text-txt-400 bg-base-800 border border-base-700'};
 
 function parseR(c){const m=c.match(/<task-result>([\\s\\S]*?)<\\/task-result>/);if(!m)return null;const i=m[1],s=(i.match(/<status>([\\s\\S]*?)<\\/status>/)||[])[1]?.trim(),u=(i.match(/<summary>([\\s\\S]*?)<\\/summary>/)||[])[1]?.trim(),d=(i.match(/<details>([\\s\\S]*?)<\\/details>/)||[])[1]?.trim();return s&&u?{status:s,summary:u,details:d||''}:null}
@@ -8311,7 +8553,6 @@ async function emitNoticeEvent(registration, data) {
 }
 
 // src/watchdog.ts
-init_merge_helper();
 import { createRequire as createRequire2 } from "node:module";
 import path6 from "node:path";
 init_log();
@@ -8356,13 +8597,8 @@ var Watchdog = class _Watchdog {
   db;
   client;
   registry;
-  ttlMs;
   checkIntervalMs;
   progressTracker;
-  stallThresholdMs;
-  stallMinSteps;
-  stallTokenThreshold;
-  cwd;
   peerMessageLimit;
   peerMessageWindowMs;
   roomInactivityThresholdMs;
@@ -8374,13 +8610,8 @@ var Watchdog = class _Watchdog {
     this.db = opts.db;
     this.client = opts.client;
     this.registry = opts.registry;
-    this.ttlMs = opts.ttlMs;
     this.checkIntervalMs = opts.checkIntervalMs ?? 6e4;
     this.progressTracker = opts.progressTracker;
-    this.stallThresholdMs = opts.stallThresholdMs ?? 0;
-    this.stallMinSteps = opts.stallMinSteps ?? 3;
-    this.stallTokenThreshold = opts.stallTokenThreshold ?? 500;
-    this.cwd = opts.cwd;
     this.peerMessageLimit = opts.peerMessageLimit ?? 0;
     this.peerMessageWindowMs = opts.peerMessageWindowMs ?? 3e5;
     this.roomInactivityThresholdMs = opts.roomInactivityThresholdMs ?? 3e4;
@@ -8393,15 +8624,14 @@ var Watchdog = class _Watchdog {
    * step-down). Without a config (legacy construction / test harnesses) it
    * degrades to the exact legacy wake — signature-safe.
    *
-   * TICKET-HARNESS-34 (A1): `forceWake` is true ONLY for the timeout path — a
-   * member aborted by the watchdog is an unrecoverable failure the lead must
-   * act on. Stall/chatty nudges are non-fatal noise: their message row is
-   * persisted and the proactive wake stays suppressed under `silentLead`.
+   * TICKET-RELEASE-17: the only remaining caller is `checkChatty` — a
+   * non-fatal over-coordination nudge whose message row is persisted and whose
+   * proactive wake stays suppressed under `silentLead`. The old timeout path
+   * (which punched through with a forced wake) is gone with the TTL sweep.
    */
-  notifyLead(teamId, message, forceWake = false) {
+  notifyLead(teamId, message) {
     notifyLead(this.client, this.db, teamId, message, {
-      ...this.config ? { config: this.config } : {},
-      ...forceWake ? { forceWake: true } : {}
+      ...this.config ? { config: this.config } : {}
     });
   }
   static STALE_THRESHOLD_MS = Number(process.env.STALE_WORKTREE_THRESHOLD_MS) || 3e5;
@@ -8427,70 +8657,6 @@ var Watchdog = class _Watchdog {
           "UPDATE team_member SET worktree_dir = NULL, worktree_branch = NULL, workspace_id = NULL WHERE team_id = ? AND name = ?",
           [m.team_id, m.name]
         );
-      } catch {
-      }
-    }
-  }
-  /** Check for stalled busy members and escalate to lead + nudge teammate. */
-  async checkStalled() {
-    if (!this.progressTracker || this.stallThresholdMs === 0) return;
-    const busy = this.db.query(
-      `SELECT tm.team_id, tm.name, tm.session_id, tm.agent, t.lead_agent, t.lead_session_id
-       FROM team_member tm
-       JOIN team t ON tm.team_id = t.id
-       WHERE t.status = 'active' AND tm.status = 'busy'`
-    ).all();
-    for (const member of busy) {
-      if (this.progressTracker.isReported(member.session_id)) continue;
-      const tokenStalled = this.progressTracker.isTokenStalled(member.session_id, this.stallMinSteps, this.stallTokenThreshold);
-      const timeStalled = this.progressTracker.isTimeStalled(member.session_id, this.stallThresholdMs);
-      if (!tokenStalled && !timeStalled) continue;
-      if (hasReportedCompletion(this.db, member.team_id, member.name)) {
-        log(`watchdog:stall:skip member=${member.name} team=${member.team_id} reason=already-reported-completion`);
-        continue;
-      }
-      const reason = tokenStalled ? "low output tokens" : "no communication";
-      const recentNudgeRow = this.db.query(
-        "SELECT last_nudged_at FROM team_member WHERE team_id = ? AND name = ?"
-      ).get(member.team_id, member.name);
-      if (recentNudgeRow?.last_nudged_at) {
-        const nudgedAt = recentNudgeRow.last_nudged_at;
-        const activeSinceNudge = (this.progressTracker?.lastActivityAt(member.session_id) ?? 0) >= nudgedAt;
-        if (!activeSinceNudge && Date.now() - nudgedAt < this.stallThresholdMs) {
-          log(`watchdog:stall:skip member=${member.name} team=${member.team_id} reason=recently-nudged`);
-          continue;
-        }
-      }
-      this.db.run(
-        "UPDATE team_member SET last_nudged_at = ? WHERE team_id = ? AND name = ?",
-        [Date.now(), member.team_id, member.name]
-      );
-      const stallModel = getMemberModel(this.db, member.team_id, member.name);
-      const stallAgent = resolveWatchdogNudgeAgent(member);
-      this.client.session.promptAsync({
-        sessionID: member.session_id,
-        // M1 (TICKET-HARNESS-37): under silentLead (config.silentLead !== false)
-        // the nudge steers to the task / board instead of demanding a lead-bound
-        // report; the legacy phrasing is preserved for silentLead: false.
-        parts: [{ type: "text", text: this.config?.silentLead !== false ? "[System]: You appear stalled \u2014 no progress detected. Refocus on your current task and drive it forward; record progress on the shared board and coordinate with peers via team_message, or wrap up your work." : "[System]: You appear stalled \u2014 no progress detected. Report your current status to the lead via team_message, or wrap up your work." }],
-        agent: stallAgent,
-        ...stallModel ? { model: stallModel } : {}
-      }).then(() => {
-        this.progressTracker?.markReported(member.session_id);
-      }).catch((err) => {
-        log(`watchdog:stall:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`);
-      });
-      this.notifyLead(
-        member.team_id,
-        `Teammate "${member.name}" appears stalled (${reason}). Consider checking on them via team_message or shutting them down.`
-      );
-      try {
-        await this.client.tui.showToast({
-          title: "Team",
-          message: `${member.name} appears stalled`,
-          variant: "warning",
-          duration: 5e3
-        });
       } catch {
       }
     }
@@ -8603,75 +8769,21 @@ var Watchdog = class _Watchdog {
       log(`watchdog:room-inactivity:wake-clara team=${team.id} inactiveMs=${inactiveMs}`);
     }
   }
-  /** Run a single check for stale busy members. */
+  /**
+   * Run a single supervision tick.
+   *
+   * TICKET-RELEASE-17: NO time-based abort exists anymore. A member that stays
+   * `busy` for hours (legitimate long task, instrumented wait, compaction) is
+   * never swept: its card is never released and the lead is never woken by a
+   * timeout that never happened. Room inactivity (Clara) and the chatty nudge
+   * are preserved exactly as before.
+   */
   async check() {
     await this.cleanupStaleWorktrees();
-    await this.checkStalled();
     await this.checkChatty();
     await this.checkRoomInactivity();
-    if (this.ttlMs === 0) return;
-    const cutoff = Date.now() - this.ttlMs;
-    const stale = this.db.query(
-      `SELECT tm.team_id, tm.name, tm.session_id, tm.worktree_branch, t.name as team_name, p.name as project_name
-       FROM team_member tm
-       JOIN team t ON tm.team_id = t.id
-       JOIN project p ON t.project_id = p.id
-       WHERE t.status = 'active'
-         AND tm.status = 'busy'
-         AND tm.time_updated < ?`
-    ).all(cutoff);
-    for (const member of stale) {
-      const lastActive = this.progressTracker?.lastActivityAt(member.session_id) ?? 0;
-      if (lastActive > cutoff) {
-        this.db.run(
-          "UPDATE team_member SET time_updated = ? WHERE team_id = ? AND name = ?",
-          [lastActive, member.team_id, member.name]
-        );
-        log(`watchdog:heartbeat:renewed member=${member.name} team=${member.team_id} lastActive=${lastActive}`);
-        continue;
-      }
-      if (isSessionCompacting(member.session_id)) {
-        log(`watchdog:heartbeat:compacting member=${member.name} team=${member.team_id} session=${member.session_id}`);
-        continue;
-      }
-      if (this.cwd && member.worktree_branch && !member.worktree_branch.startsWith("ensemble/preserved/")) {
-        const safeBranch = preservedBranchName(member.project_name, member.team_name, member.team_id, member.name);
-        const ok = await preserveBranch(member.worktree_branch, safeBranch, this.cwd);
-        if (ok) {
-          this.db.run(
-            "UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
-            [safeBranch, member.team_id, member.name]
-          );
-          log(`watchdog:branch:preserved src=${member.worktree_branch} target=${safeBranch}`);
-        }
-      }
-      this.db.run(
-        "UPDATE team_member SET status = 'error', execution_status = 'timed_out', time_updated = ? WHERE team_id = ? AND name = ?",
-        [Date.now(), member.team_id, member.name]
-      );
-      const released = releaseMemberTasks(this.db, member.team_id, member.name);
-      if (released > 0) log(`watchdog:tasks:released name=${member.name} count=${released}`);
-      this.notifyLead(
-        member.team_id,
-        `Teammate "${member.name}" timed out after exceeding the busy time limit and was aborted. Their in-progress work has been released. Review their session, then re-spawn or reassign the task if needed.`,
-        true
-      );
-      try {
-        await this.client.session.abort({ sessionID: member.session_id });
-      } catch {
-      }
-      try {
-        await this.client.tui.showToast({
-          title: "Team",
-          message: `${member.name} timed out`,
-          variant: "warning",
-          duration: 5e3
-        });
-      } catch {
-      }
-    }
   }
-  /** Start the periodic check. Runs stale worktree GC regardless of TTL setting. */
+  /** Start the periodic check. Stale-worktree GC runs on every tick. */
   start() {
     if (!this.timer) {
       this.timer = setInterval(() => {
@@ -8778,6 +8890,10 @@ async function setupEnsemble(ctx, options = {}) {
   let failoverCtx;
   const dispatch = async (event) => {
     const transition = dispatchV2Event(db, registry, tracker, event, failoverCtx);
+    if (transition?.to === "busy") {
+      const busyEntry = registry.getByName(transition.teamId, transition.memberName);
+      if (busyEntry) resetStandbyLoop(busyEntry.sessionId);
+    }
     if (transition && transition.to === "ready" && transition.from === "busy") {
       const entry = registry.getByName(transition.teamId, transition.memberName);
       if (entry) {
@@ -8861,6 +8977,7 @@ async function setupEnsemble(ctx, options = {}) {
   await ctx.tool.hook("execute.before", (raw) => {
     const input = raw;
     checkToolIsolation(registry, tracker, input.tool, input.sessionID, db);
+    noteToolCall(input.sessionID, input.tool);
     if (input.tool.startsWith("team_")) {
       if (!rateLimiter.tryConsume()) {
         return rateLimiter.waitForToken().then(() => void 0);
@@ -8945,13 +9062,8 @@ async function setupEnsemble(ctx, options = {}) {
       db,
       client,
       registry,
-      ttlMs: config.timeoutMs,
       checkIntervalMs: 60 * 1e3,
       progressTracker,
-      stallThresholdMs: config.stallThresholdMs,
-      stallMinSteps: config.stallMinSteps,
-      stallTokenThreshold: config.stallTokenThreshold,
-      cwd: ctx.location.directory,
       peerMessageLimit: config.peerMessageLimit,
       peerMessageWindowMs: config.peerMessageWindowMs,
       roomInactivityThresholdMs: config.roomInactivityThresholdMs,
@@ -9193,7 +9305,7 @@ var plugin = async (input) => {
     }
     const rehydrated = rehydrateRegistry(db, registry);
     if (rehydrated > 0) log(`init:registry:rehydrated members=${rehydrated}`);
-    recoverUndeliveredMessages(db, client, registry).catch((err) => {
+    recoverUndeliveredMessages(db, client, registry, config.sharedCheckoutSingleWriter === true).catch((err) => {
       log(`init:recover-messages:failed err=${err instanceof Error ? err.message : String(err)}`);
     });
     recoverOrphanedWorktrees(db, client).catch((err) => {
@@ -9222,13 +9334,8 @@ var plugin = async (input) => {
       db,
       client,
       registry,
-      ttlMs: config.timeoutMs,
       checkIntervalMs: DEFAULT_WATCHDOG_CHECK_MS,
       progressTracker,
-      stallThresholdMs: config.stallThresholdMs,
-      stallMinSteps: config.stallMinSteps,
-      stallTokenThreshold: config.stallTokenThreshold,
-      cwd: input.directory,
       peerMessageLimit: config.peerMessageLimit,
       peerMessageWindowMs: config.peerMessageWindowMs,
       roomInactivityThresholdMs: config.roomInactivityThresholdMs,
@@ -9248,7 +9355,7 @@ var plugin = async (input) => {
         const { sessionID, status } = event.properties;
         const statusType = status.type;
         const retryPayload = statusType === "retry" ? status : void 0;
-        const transition = handleSessionStatusEvent(db, registry, sessionID, statusType, retryPayload);
+        const transition = handleSessionStatusEvent(db, registry, sessionID, statusType, retryPayload, client, config);
         if (transition) {
           if (transition.to === "shutdown") {
             notifyTeamEvent(client, "shutdown", { memberName: transition.memberName });
@@ -9322,7 +9429,8 @@ var plugin = async (input) => {
             notifyTeamEvent(client, "error", { memberName: transition.memberName });
           } else if (transition.to === "busy") {
             progressTracker.recordBusyStart(sessionID);
-          } else if (transition.to === "retry") {
+            resetStandbyLoop(sessionID);
+          } else if (transition.to === "retry" || transition.to === "throttled") {
             const failover = await handleRetryModelFailover(
               db,
               registry,
@@ -9338,7 +9446,7 @@ var plugin = async (input) => {
             try {
               await client.tui.showToast({
                 title: "Team",
-                message: `${transition.memberName} is being rate-limited${failoverInfo}`,
+                message: transition.to === "throttled" ? `${transition.memberName} is THROTTLED by a paywall/long rate-limit${failoverInfo}` : `${transition.memberName} is being rate-limited${failoverInfo}`,
                 variant: "warning",
                 duration: 3e3
               });
@@ -9479,6 +9587,7 @@ var plugin = async (input) => {
     // Sub-agent isolation + rate limiting hook
     "tool.execute.before": async (input2, _output) => {
       checkToolIsolation(registry, tracker, input2.tool, input2.sessionID, db);
+      noteToolCall(input2.sessionID, input2.tool);
       if (input2.tool.startsWith("team_")) {
         if (!rateLimiter.tryConsume()) {
           await rateLimiter.waitForToken();
@@ -9776,7 +9885,7 @@ var plugin = async (input) => {
         args: {},
         async execute(_args, ctx) {
           const result = await executeTeamStatus(deps, ctx.sessionID);
-          const statusMap = { busy: "working", ready: "idle", shutdown_requested: "stopping", shutdown: "done", error: "error" };
+          const statusMap = { busy: "working", ready: "idle", throttled: "throttled", shutdown_requested: "stopping", shutdown: "done", error: "error" };
           const members = deps.db.query("SELECT name, status FROM team_member WHERE team_id IN (SELECT id FROM team WHERE lead_session_id = ? OR id IN (SELECT team_id FROM team_member WHERE session_id = ?))").all(ctx.sessionID, ctx.sessionID);
           const summary = members.map((m) => `${m.name}: ${statusMap[m.status] ?? m.status}`).join(", ");
           ctx.metadata({ title: summary || "No teammates" });
@@ -9834,6 +9943,7 @@ export {
   claimTask,
   clearAwaitingLeadDecision,
   index_default as default,
+  deliverDeferredStandbyWakes,
   describeModelNotFound,
   endTracked,
   executeDecisionLead,
@@ -9847,6 +9957,7 @@ export {
   extractModelSelectorFromError,
   failoverCooldown,
   fetchModelCatalog,
+  getPaywallDeadRungs,
   getTeamQAMember,
   getTeamSDETMember,
   handleRetryModelFailover,
@@ -9857,12 +9968,17 @@ export {
   hasPendingBoardTasks,
   inReviewNudges,
   isModelNotFoundError,
+  isPaywallFailure,
   isQAMember,
   isSDETMEmber,
   isSelectorAvailable,
+  isSessionCompacting,
   lastRoomActivity,
   markAwaitingLeadDecision,
+  paywallDeadRungs,
+  recordPaywallDeadRung,
   resolveSpawnModelFromCatalog,
+  resolveStandbyWake,
   setMemberStandby,
   shouldAlarmFastIdle,
   shouldNudgeIdleMember,

@@ -43,6 +43,7 @@ export function leadTopologySizingReminder(): string {
 const STATUS_DISPLAY: Record<string, string> = {
   busy: "working",
   ready: "idle",
+  throttled: "throttled (paywall/long rate-limit)",
   shutdown_requested: "shutting down",
   shutdown: "shut down",
   error: "error",

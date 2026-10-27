@@ -216,10 +216,25 @@ export async function executeTeamMessage(
   // payload stays byte-identical — and on wake we also pass `agent`, which
   // spawn normally hands to the first promptAsync and which a standby member
   // never received.
+  //
+  // TICKET-RELEASE-11 (Frente C, OPT-IN sharedCheckoutSingleWriter): in rooms
+  // that explicitly enable the single-writer gate, a wake whose target HOLDS
+  // an in_progress card is refused (`blocked: true`) while ANOTHER shared
+  // checkout member also holds in_progress card(s) — the FORMAL persisted
+  // baton, never a busy-status inference. The row above was already persisted
+  // with delivered=0, so NOTHING is lost: replay is multi-trigger (re-send,
+  // the holder's idle event, card completion, init recovery) — never a bare
+  // amnesia wake, and never two card-holding writers on one checkout. With
+  // the default flag OFF this is a byte-identical pass-through.
   const wake = resolveStandbyWake(
     deps.db, teamInfo.teamId, args.to,
     `[Team message from ${senderName}]: ${messageText}`,
+    deps.config?.sharedCheckoutSingleWriter === true,
   )
+  if (wake.blocked) {
+    log(`team_message:deferred-shared-checkout from=${senderName} to=${args.to} (formal dual card-holder — opt-in single-writer gate)`)
+    return `Message queued for ${args.to} — deferred by the shared-checkout single-writer gate (another member holds the formal baton: an in_progress card in this checkout). It will be delivered when the baton is released (card completed, handed over, or returned to the pool).`
+  }
   const recipientModel = getMemberModel(deps.db, teamInfo.teamId, args.to)
   // Register this delivery's AbortController so a later forced model switch
   // (model + force) can tear down the HTTP request if it gets stuck. The

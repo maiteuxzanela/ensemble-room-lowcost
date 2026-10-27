@@ -20,6 +20,8 @@ function glyph(status: string): string {
       return "●"
     case "ready":
       return "○"
+    case "throttled":
+      return "◌"
     case "shutdown_requested":
       return "◐"
     case "shutdown":

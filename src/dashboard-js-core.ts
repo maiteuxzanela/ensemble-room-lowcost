@@ -85,6 +85,7 @@ const ST={
   busy:{c:'border-blue-500 bg-blue-500/[0.04]',d:'bg-blue-500',t:'text-blue-400',l:'working',dim:false},
   standby:{c:'border-violet-500 bg-violet-500/[0.04]',d:'bg-violet-500',t:'text-violet-400',l:'standby',dim:true},
   ready:{c:'border-base-700 bg-base-950/50',d:'bg-txt-400',t:'text-txt-400',l:'idle',dim:true},
+  throttled:{c:'border-amber-500/50 bg-amber-500/[0.04]',d:'bg-amber-500',t:'text-amber-400',l:'throttled',dim:false},
   shutdown_requested:{c:'border-amber-500/50 bg-amber-500/[0.04]',d:'bg-amber-500',t:'text-amber-400',l:'stopping',dim:false},
   shutdown:{c:'border-base-800 bg-base-950/30',d:'bg-base-700',t:'text-txt-500',l:'done',dim:true},
   error:{c:'border-red-500/50 bg-red-500/[0.04]',d:'bg-red-500',t:'text-red-400',l:'error',dim:false},
@@ -94,7 +95,7 @@ const ST={
 // otherwise fall back to the status key with the 'ready' styling as default.
 const si=(s,es)=>((s==='standby'||es==='standby')?ST.standby:(ST[s]||ST.ready));
 // Chip colour for the status/execution_status badge (keep in sync with si()).
-const sx=(m)=>((m.status==='standby'||m.executionStatus==='standby')?'violet':(m.status==='busy'?'blue':m.status==='error'?'red':'muted'));
+const sx=(m)=>((m.status==='standby'||m.executionStatus==='standby')?'violet':(m.status==='busy'?'blue':m.status==='error'?'red':m.status==='throttled'?'amber':'muted'));
 const PR={high:'text-red-400 bg-red-500/10 border border-red-500/20',medium:'text-amber-400 bg-amber-500/10 border border-amber-500/20',low:'text-txt-400 bg-base-800 border border-base-700'};
 
 function parseR(c){const m=c.match(/<task-result>([\\s\\S]*?)<\\/task-result>/);if(!m)return null;const i=m[1],s=(i.match(/<status>([\\s\\S]*?)<\\/status>/)||[])[1]?.trim(),u=(i.match(/<summary>([\\s\\S]*?)<\\/summary>/)||[])[1]?.trim(),d=(i.match(/<details>([\\s\\S]*?)<\\/details>/)||[])[1]?.trim();return s&&u?{status:s,summary:u,details:d||''}:null}
